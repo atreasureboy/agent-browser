@@ -36,6 +36,23 @@ class ControlInfo:
     label: str
     placeholder: str = ""
     role: str = ""
+    # T39: 所在表单的 metadata (默认 detail_level="normal" 时填充 — 注入测试 / 安全审计关键).
+    # 在 detail_level="deep" 时还会填充 raw_attrs (HTML 属性全集) + outerHTML 前 200 字符.
+    form_action: str = ""     # 所在 <form action>, 截断到 200 字符
+    form_method: str = ""     # 所在 <form method>, 默认 "get"
+    input_name: str = ""      # <input name="..."> — 提交时字段名
+    input_type: str = ""      # <input type="...">
+    form_id: str = ""         # <form id="...">
+    raw_attrs: dict[str, str] = field(default_factory=dict)  # deep 模式: 所有 HTML 属性
+    outer_html: str = ""      # deep 模式: 元素 outerHTML (截断到 500 字符)
+
+
+@dataclass
+class ScriptInfo:
+    """T39: <script> 标签信息. normal=只列 src; deep=也抓源码."""
+    src: str = ""            # <script src="..."> 绝对 URL
+    inline: str = ""         # 内联 JS 内容 (deep 模式, 截断)
+    has_src: bool = False
 
 
 @dataclass
@@ -58,6 +75,10 @@ class PageSnapshot:
     controls: list[ControlInfo] = field(default_factory=list)
     meta: dict[str, str] = field(default_factory=dict)
     raw_aria: str = ""  # 原始 aria snapshot 文本
+    # T39: scripts — normal 模式只列 src; deep 模式也抓内联源码
+    scripts: list[ScriptInfo] = field(default_factory=list)
+    # T39: detail_level 标记 ("normal" | "deep"), 让 caller 知道信息丰富度
+    detail_level: str = "normal"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -103,16 +124,22 @@ class SnapshotEngine:
     def __init__(self, page: Page) -> None:
         self.page = page
 
-    async def capture(self, base_url: str = "") -> PageSnapshot:
-        """捕获当前页面的语义快照。"""
+    async def capture(self, base_url: str = "", detail_level: str = "normal") -> PageSnapshot:
+        """捕获当前页面的语义快照。
+
+        T39: detail_level="normal" (默认) — 轻量, 省 token.
+              detail_level="deep"   — 抓 JS 源码 + 完整 outerHTML + 所有 HTML 属性.
+                                   agent 在需要审计 / 调试时显式打开.
+        """
         url = self.page.url
         title = await self.page.title()
         domain = urlparse(url).netloc
 
         meta = await self._extract_meta()
         text_blocks = await self._extract_text_blocks()
-        links, controls = await self._extract_interactive(base_url or url)
+        links, controls = await self._extract_interactive(base_url or url, detail_level)
         raw_aria = await self._get_raw_aria()
+        scripts = await self._extract_scripts(detail_level)
 
         snapshot = PageSnapshot(
             url=url,
@@ -121,6 +148,8 @@ class SnapshotEngine:
             text_blocks=text_blocks,
             links=links,
             controls=controls,
+            scripts=scripts,
+            detail_level=detail_level,
             meta=meta,
             raw_aria=raw_aria,
         )
@@ -175,15 +204,20 @@ class SnapshotEngine:
             for b in raw
         ]
 
-    async def _extract_interactive(self, base_url: str) -> tuple[list[LinkInfo], list[ControlInfo]]:
+    async def _extract_interactive(self, base_url: str, detail_level: str = "normal") -> tuple[list[LinkInfo], list[ControlInfo]]:
         """提取可操作元素并写入稳定 ref。
 
         Playwright Python 的 accessibility snapshot 不稳定携带 ref，
         因此这里在 DOM 元素上打 `data-sb-ref=eN`，controller 使用同一属性定位。
         这样 agent 看到的 ref 与 click/type 消费的 ref 是同一套编号。
+
+        T39: 同时收集 form metadata (action/method/input_name) — default 模式.
+              detail_level="deep" 时还填 raw_attrs + outerHTML.
         """
         base_domain = urlparse(base_url).netloc
-        raw = await self.page.evaluate("""(baseDomain) => {
+        raw = await self.page.evaluate(
+            """(args) => {
+            const [baseDomain, deep] = args;
             const links = [];
             const controls = [];
             const seenLinks = new Set();
@@ -260,14 +294,40 @@ class SnapshotEngine:
                     kind = 'switch';
                 }
 
+                // T39: form metadata — 找最近的 <form> ancestor.
+                let form = el.closest('form');
+                let formAction = '', formMethod = '', formId = '';
+                if (form) {
+                    formAction = (form.getAttribute('action') || '').substring(0, 200);
+                    formMethod = (form.getAttribute('method') || 'get').toLowerCase();
+                    formId = form.getAttribute('id') || '';
+                }
+
+                // T39: deep 模式填 raw_attrs + outerHTML
+                let rawAttrs = {}, outerHtml = '';
+                if (deep) {
+                    const attrs = el.attributes;
+                    for (let i = 0; i < attrs.length; i++) {
+                        rawAttrs[attrs[i].name] = (attrs[i].value || '').substring(0, 200);
+                    }
+                    outerHtml = (el.outerHTML || '').substring(0, 500);
+                }
+
                 controls.push({
                     ref: assignRef(el),
                     kind, label, role,
                     placeholder: el.getAttribute('placeholder') || '',
+                    form_action: formAction,
+                    form_method: formMethod,
+                    form_id: formId,
+                    input_name: el.getAttribute('name') || '',
+                    input_type: el.getAttribute('type') || '',
+                    raw_attrs: rawAttrs,
+                    outer_html: outerHtml,
                 });
             }
             return {links, controls};
-        }""", base_domain)
+        }""", [base_domain, detail_level == "deep"])
 
         links = []
         for link in raw.get("links", []):
@@ -286,6 +346,14 @@ class SnapshotEngine:
                 label=c["label"],
                 placeholder=c.get("placeholder", ""),
                 role=c.get("role", ""),
+                # T39: form metadata — 默认 detail_level="normal" 时也填 (这是常态需求)
+                form_action=c.get("form_action", ""),
+                form_method=c.get("form_method", ""),
+                form_id=c.get("form_id", ""),
+                input_name=c.get("input_name", ""),
+                input_type=c.get("input_type", ""),
+                raw_attrs=c.get("raw_attrs", {}),
+                outer_html=c.get("outer_html", ""),
             )
             for c in raw.get("controls", [])
         ]
@@ -297,3 +365,39 @@ class SnapshotEngine:
             return await self.page.aria_snapshot()
         except Exception:
             return ""
+
+    async def _extract_scripts(self, detail_level: str = "normal") -> list[ScriptInfo]:
+        """T39: 抓 <script> 标签.
+
+        normal: 只列 src (让 agent 知道页面加载了哪些 JS — fingerprint 用).
+        deep:   也抓 inline 源码 (deep 模式, agent 审计时开).
+                src 不抓内容 (太大), 让 agent 用 sb_get_script_source 单独按 URL 抓.
+        """
+        try:
+            scripts_raw = await self.page.evaluate(
+                """(deep) => {
+                    const out = [];
+                    for (const s of document.querySelectorAll('script')) {
+                        const src = s.getAttribute('src') || '';
+                        const absSrc = src ? new URL(src, location.href).href : '';
+                        let inline = '';
+                        if (deep && !src) {
+                            inline = (s.textContent || '').substring(0, 2000);
+                        }
+                        out.push({src: absSrc, inline, has_src: !!src});
+                    }
+                    return out;
+                }""",
+                detail_level == "deep",
+            )
+            return [
+                ScriptInfo(
+                    src=s.get("src", ""),
+                    inline=s.get("inline", ""),
+                    has_src=s.get("has_src", False),
+                )
+                for s in scripts_raw
+            ]
+        except Exception as e:
+            logger.warning("_extract_scripts failed: %s", e)
+            return []

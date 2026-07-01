@@ -67,6 +67,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({"action": {"type": "string", "enum": ["open", "click", "type", "drag"]},
                              "text": {"type": "string"},
                              "ref_label": {"type": "string"}}, ["action"])},
+    # T39: 信息密度工具 — 默认 normal, deep 模式拿更多细节
+    {"name": "sb_snapshot_deep", "description": "Deep snapshot: 表单 metadata + 所有 JS src + outerHTML + 完整 HTML attrs.",
+     "inputSchema": _schema({})},
+    {"name": "sb_get_response_headers", "description": "按 URL 拿最近一次响应的 HTTP headers (CSP/HSTS/Set-Cookie 等).",
+     "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    {"name": "sb_get_dom_diff", "description": "DOM diff: 报告当前页面 ref 与 before_refs 比的 appeared/disappeared.",
+     "inputSchema": _schema({"before_refs": {"type": "string",
+                                "description": "逗号分隔的 ref 集合 (之前 snapshot 看到的)"}})},
+    {"name": "sb_get_script_source", "description": "Deep 模式: 按 URL 抓 JS 源码 (httpx 绕过 CORS, 50K 上限).",
+     "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
 ]
 
 
@@ -234,6 +244,27 @@ class MCPServer:
                 "reason": check.reason,
                 "risk_level": check.risk_level,
             }
+        # T39: 深度信息工具 — 让 agent 按需拿更深细节
+        if name == "sb_snapshot_deep":
+            engine = await self._ensure_started()
+            page = engine.controller.current_page
+            if page is None:
+                raise RuntimeError("No active page")
+            snap = await SnapshotEngine(page).capture(
+                base_url=page.url, detail_level="deep",
+            )
+            return snap.to_dict()
+        if name == "sb_get_response_headers":
+            engine = await self._ensure_started()
+            return await engine.controller.get_response_headers(args["url"])
+        if name == "sb_get_dom_diff":
+            engine = await self._ensure_started()
+            refs_param = args.get("before_refs", "")
+            before_refs = set(refs_param.split(",")) if refs_param else set()
+            return await engine.controller.get_dom_diff(before_refs)
+        if name == "sb_get_script_source":
+            engine = await self._ensure_started()
+            return {"source": await engine.controller.fetch_script_source(args["url"])}
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

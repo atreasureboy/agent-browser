@@ -130,7 +130,9 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/open":
             return self.owner.run(self._open(args["url"]))
         if method == "GET" and path == "/snapshot":
-            return self.owner.run(self._snapshot())
+            return self.owner.run(self._snapshot(
+                detail_level=args.get("detail_level", "normal"),
+            ))
         if method == "GET" and path == "/read":
             return self.owner.run(self._read(format=args.get("format", "markdown")))
         if method == "POST" and path == "/click":
@@ -214,6 +216,23 @@ class TransparentBrowserDaemon:
             return self.owner.browser.controller.get_network_requests(
                 only_failed=only_failed, method=method_filter, limit=limit,
             )
+        # T39: response headers 查询 (从 network 缓冲里按 URL 取最近一次响应)
+        if method == "GET" and path == "/response-headers":
+            url = args.get("url", "")
+            if not url:
+                raise ValueError("url required")
+            return self.owner.run(self.owner.browser.controller.get_response_headers(url))
+        # T39: DOM diff — 当前 snapshot vs 传入 ref 集合
+        if method == "GET" and path == "/dom-diff":
+            refs_param = args.get("before_refs", "")
+            before_refs = set(refs_param.split(",")) if refs_param else set()
+            return self.owner.run(self.owner.browser.controller.get_dom_diff(before_refs))
+        # T39: 按 URL 抓 JS 源码 (deep 模式)
+        if method == "GET" and path == "/script-source":
+            url = args.get("url", "")
+            if not url:
+                raise ValueError("url required")
+            return self.owner.run(self.owner.browser.controller.fetch_script_source(url))
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)
@@ -366,11 +385,13 @@ class TransparentBrowserDaemon:
         result = await self.owner.browser.browse(url)
         return {"url": result.snapshot.url, "title": result.snapshot.title, "type": result.classification.page_type}
 
-    async def _snapshot(self) -> dict[str, Any]:
+    async def _snapshot(self, detail_level: str = "normal") -> dict[str, Any]:
         page = self.owner.browser.controller.current_page
         if page is None:
             raise ValueError("no active page; call /open first")
-        return (await SnapshotEngine(page).capture(base_url=page.url)).to_dict()
+        return (await SnapshotEngine(page).capture(
+            base_url=page.url, detail_level=detail_level,
+        )).to_dict()
 
     async def _read(self, format: str = "markdown") -> dict[str, Any]:
         page = self.owner.browser.controller.current_page

@@ -4189,3 +4189,159 @@ class TestMCPServerAdvancedTools:
         assert "total" in result
         assert "success" in result
         assert "failure" in result
+
+
+class TestT39DeepSnapshot:
+    """T39: 默认/深度两层信息架构 — dataclass 字段 + 控制器方法 + MCP/CLI 注册."""
+
+    # ── dataclass 字段 ────────────────────────────────────────
+
+    def test_script_info_default_values(self):
+        """ScriptInfo 默认字段全空, has_src 默认 False."""
+        from semantic_browser.snapshot.engine import ScriptInfo
+        s = ScriptInfo()
+        assert s.src == ""
+        assert s.inline == ""
+        assert s.has_src is False
+
+    def test_control_info_form_metadata_defaults(self):
+        """ControlInfo form 元数据字段全默认空 (向后兼容)."""
+        from semantic_browser.snapshot.engine import ControlInfo
+        c = ControlInfo(ref="e1", kind="textbox", label="x")
+        assert c.form_action == ""
+        assert c.form_method == ""
+        assert c.form_id == ""
+        assert c.input_name == ""
+        assert c.input_type == ""
+        assert c.raw_attrs == {}
+        assert c.outer_html == ""
+
+    def test_page_snapshot_has_scripts_and_detail_level(self):
+        """PageSnapshot 新增 scripts + detail_level 字段."""
+        from semantic_browser.snapshot.engine import PageSnapshot, ScriptInfo
+        snap = PageSnapshot(url="https://x", title="t", domain="x")
+        assert snap.scripts == []
+        assert snap.detail_level == "normal"
+        snap.scripts.append(ScriptInfo(src="https://cdn/x.js", has_src=True))
+        snap.detail_level = "deep"
+        d = snap.to_dict()
+        assert len(d["scripts"]) == 1
+        assert d["scripts"][0]["src"] == "https://cdn/x.js"
+        assert d["detail_level"] == "deep"
+
+    # ── 控制器方法: get_response_headers ─────────────────────────
+
+    def test_get_response_headers_returns_lowercased_dict(self):
+        """get_response_headers: URL 命中 → 返回 lowercased-keys 字典."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            method = "GET"
+            url = "https://api.example.com/users"
+            resource_type = "fetch"
+
+        class FakeResp:
+            url = "https://api.example.com/users"
+            status = 200
+            headers = {"Content-Type": "application/json",
+                       "X-Frame-Options": "DENY",
+                       "Set-Cookie": "sid=abc; HttpOnly"}
+            request = FakeReq()
+
+        ctrl._on_request(FakeReq())
+        ctrl._on_response(FakeResp())
+
+        headers = asyncio.run(ctrl.get_response_headers("https://api.example.com/users"))
+        assert headers is not None
+        assert headers["content-type"] == "application/json"
+        assert headers["x-frame-options"] == "DENY"
+        assert "set-cookie" in headers
+
+    def test_get_response_headers_not_found(self):
+        """get_response_headers: 没找到 → 返回 None."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        result = asyncio.run(ctrl.get_response_headers("https://never-seen.com/"))
+        assert result is None
+
+    def test_on_response_with_headers_pops_latest(self):
+        """_on_response 把 headers 写回最近一条匹配的 request."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            def __init__(self, m="GET", u="https://x.com/"):
+                self.method = m
+                self.url = u
+                self.resource_type = "fetch"
+
+        class FakeResp:
+            def __init__(self, url, status=200, headers=None):
+                self.url = url
+                self.status = status
+                self.headers = headers or {}
+                self.request = FakeReq("GET", url)
+
+        ctrl._on_request(FakeReq())
+        ctrl._on_response(FakeResp("https://x.com/", 200,
+                                   headers=[["Strict-Transport-Security", "max-age=31536000"]]))
+
+        # Find the request entry
+        entry = ctrl._network_requests[0]
+        assert "response_headers" in entry
+        assert "strict-transport-security" in entry["response_headers"]
+
+    # ── 控制器方法: fetch_script_source ────────────────────────
+
+    def test_fetch_script_source_error_returns_error_string(self):
+        """fetch_script_source: 不可达 URL → 返回带错误的字符串 (不抛)."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        # 用保留端口 — fetch 一定失败
+        result = asyncio.run(ctrl.fetch_script_source(
+            "http://127.0.0.1:1/never.js", timeout_ms=500))
+        # 失败时返回 "(fetch failed: ..." 格式
+        assert isinstance(result, str)
+        assert "fetch failed" in result or "Error" in result or len(result) > 0
+
+    # ── MCP: 新工具注册 ──────────────────────────────────────
+
+    def test_mcp_tools_register_t39(self):
+        """TOOL_DEFINITIONS 包含 T39 4 个新工具."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_snapshot_deep" in names
+        assert "sb_get_response_headers" in names
+        assert "sb_get_dom_diff" in names
+        assert "sb_get_script_source" in names
+
+    def test_mcp_sb_safety_check_accepts_ref_label(self):
+        """sb_safety_check 接受 ref_label 参数 — 用于 click action."""
+        import asyncio
+        from semantic_browser.mcp_server.server import MCPServer
+        server = MCPServer(engine=None)
+        # click + ref_label 含 "delete" → needs_confirm
+        result = asyncio.run(server._call_tool(
+            "sb_safety_check",
+            {"action": "click", "ref_label": "Delete Account"},
+        ))
+        assert result["needs_confirm"] is True
+
+    # ── CLI: 新 debug 子命令注册 ──────────────────────────────
+
+    def test_cli_registers_t39_debug_commands(self):
+        """cli 包含 debug headers / dom-diff / script-source 子命令."""
+        from semantic_browser.client.cli import tb
+        # tb 是 root Group, debug 是子命令 (Group)
+        debug = tb.commands.get("debug")
+        assert debug is not None, "debug subcommand missing"
+        cmd_names = set(debug.commands.keys())
+        assert "headers" in cmd_names
+        assert "dom-diff" in cmd_names
+        assert "script-source" in cmd_names

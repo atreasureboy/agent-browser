@@ -691,6 +691,70 @@ class BrowserController:
         page = await self._ensure_page()
         return await page.title()
 
+    async def get_response_headers(self, url: str) -> dict[str, str] | None:
+        """T39: 给定 URL, 拿最近一次响应的 HTTP headers (从 _network_requests 缓冲里查).
+
+        Returns: header 字典 (lowercased keys), 或 None (没找到).
+        用于查 CSP / HSTS / Set-Cookie / X-Frame-Options 等安全相关 header.
+        """
+        # 优先查完全匹配, 其次 path 匹配
+        for req in reversed(self._network_requests):
+            if req.get("url") == url and req.get("response_headers"):
+                return req["response_headers"]
+        # 兜底: path 匹配 (允许只给 path, 拼上当前 origin)
+        from urllib.parse import urlparse, urljoin
+        page = self.current_page
+        if page is not None:
+            full = urljoin(page.url, url)
+            for req in reversed(self._network_requests):
+                if req.get("url") == full and req.get("response_headers"):
+                    return req["response_headers"]
+        return None
+
+    async def get_dom_diff(self, before_refs: set[str]) -> dict[str, Any]:
+        """T39: 比较当前 snapshot 的 ref 集合和 before_refs, 报告 diff.
+
+        Agent 用来判断"我点击之后, 页面发生了什么":
+        - disappeared: 之前在现在不在的 ref (页面被替换/navigate)
+        - appeared:    之前不在现在在的 ref (新内容加载)
+        - url_changed: 当前 URL vs 之前 URL
+
+        Returns: {"appeared": [...], "disappeared": [...], "url_changed": bool,
+                  "current_url": str}
+        """
+        page = self.current_page
+        if page is None:
+            return {"appeared": [], "disappeared": list(before_refs),
+                    "url_changed": False, "current_url": ""}
+        current_url = page.url
+        try:
+            engine = SnapshotEngine(page)
+            snap = await engine.capture(base_url=current_url)
+        except Exception:
+            return {"appeared": [], "disappeared": list(before_refs),
+                    "url_changed": False, "current_url": current_url}
+        current_refs = {c.ref for c in snap.controls} | {l.ref for l in snap.links}
+        return {
+            "appeared": sorted(current_refs - before_refs),
+            "disappeared": sorted(before_refs - current_refs),
+            "url_changed": False,  # 没记录 before URL, 这里只能给当前
+            "current_url": current_url,
+        }
+
+    async def fetch_script_source(self, url: str, *, timeout_ms: int = 5000) -> str:
+        """T39: deep 模式专用 — 按 URL 抓 JS 源码 (httpx).
+
+        不通过浏览器 — 因为浏览器里 fetch 受 CORS 限制.
+        直接服务端 fetch (允许任意 origin), 给 agent 看完整 JS.
+        """
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
+                r = await client.get(url)
+                return r.text[:50000]  # 50K 上限, 防止 OOM
+        except Exception as e:
+            return f"(fetch failed: {type(e).__name__}: {e})"
+
     async def get_content(self) -> str:
         """获取页面 (或当前 frame) 的 HTML。"""
         target = await self._active_page_or_frame()
@@ -780,16 +844,36 @@ class BrowserController:
         self._trim_buffer(self._network_requests)
 
     def _on_response(self, resp: Any) -> None:
-        """每个响应回填 status, 改最后一条同 url+method 的未完成 request."""
+        """每个响应回填 status, 改最后一条同 url+method 的未完成 request.
+
+        T39: 同时存 response_headers (lowercased keys) — agent 调 get_response_headers 用.
+        """
         try:
             url = resp.url
             status = resp.status
             method = resp.request.method if resp.request else None
+            # T39: 抓 headers — 安全审计要 CSP/Set-Cookie 等
+            try:
+                headers_list = resp.headers or []
+            except Exception:
+                headers_list = []
+            # headers 可能 list[tuple] 或 dict, 统一成 dict (lowercase keys)
+            headers_dict: dict[str, str] = {}
+            if isinstance(headers_list, dict):
+                headers_dict = {str(k).lower(): str(v)[:500] for k, v in headers_list.items()}
+            elif isinstance(headers_list, list):
+                for h in headers_list:
+                    try:
+                        k, v = h[0], h[1]
+                        headers_dict[str(k).lower()] = str(v)[:500]
+                    except Exception:
+                        continue
         except Exception:
             return
         for entry in reversed(self._network_requests):
             if entry.get("url") == url and entry.get("method") == method and "status" not in entry:
                 entry["status"] = status
+                entry["response_headers"] = headers_dict
                 break
 
     def _on_request_failed(self, req: Any) -> None:

@@ -462,16 +462,66 @@ def debug_network(ctx, only_failed, method, limit):
     if method:
         q["method"] = method
     data = _request("GET", "/network", q, base=ctx.obj["base"])
-    if not data:
-        click.echo("(no requests)")
+    # 默认打印关键列; 加 --json-out 拿全量 (含 response_headers)
+    if ctx.obj.get("json_out"):
+        _print(data, json_out=True)
         return
     for r in data:
         status = r.get("status", "?")
-        marker = "✗" if (isinstance(status, int) and (status < 0 or status >= 400)) else "✓"
-        click.echo(
-            f"{marker} [{r.get('method','?'):6s}] {status} "
-            f"{r.get('resource_type','?'):10s} {r.get('url','')[:80]}"
-        )
+        m = r.get("method", "?")
+        u = r.get("url", "")
+        click.echo(f"  {status:>4} {m:6s} {u[:120]}")
+
+
+@debug.command("headers")
+@click.argument("url")
+@click.pass_context
+def debug_headers(ctx, url):
+    """T39: 按 URL 拿最近一次响应的 HTTP headers (CSP / HSTS / Set-Cookie 等)."""
+    data = _request("GET", "/response-headers",
+                    {"url": url}, base=ctx.obj["base"])
+    if data is None:
+        click.echo("(no matching response)")
+        return
+    for k, v in data.items():
+        click.echo(f"  {k}: {v}")
+
+
+@debug.command("dom-diff")
+@click.option("--before-refs", required=True,
+              help="逗号分隔的 ref 集合 (之前 snapshot 看到的)")
+@click.pass_context
+def debug_dom_diff(ctx, before_refs):
+    """T39: DOM diff — 当前页面 ref 与 before_refs 比的 appeared/disappeared."""
+    data = _request("GET", "/dom-diff",
+                    {"before_refs": before_refs}, base=ctx.obj["base"])
+    appeared = data.get("appeared", [])
+    disappeared = data.get("disappeared", [])
+    click.echo(f"current_url: {data.get('current_url','')}")
+    if appeared:
+        click.echo(f"appeared ({len(appeared)}):")
+        for r in appeared[:20]:
+            click.echo(f"  + {r}")
+    if disappeared:
+        click.echo(f"disappeared ({len(disappeared)}):")
+        for r in disappeared[:20]:
+            click.echo(f"  - {r}")
+    if not appeared and not disappeared:
+        click.echo("(no diff — page unchanged)")
+
+
+@debug.command("script-source")
+@click.argument("url")
+@click.pass_context
+def debug_script_source(ctx, url):
+    """T39: 按 URL 抓 JS 源码 (deep 模式审计用)."""
+    data = _request("GET", "/script-source",
+                    {"url": url}, base=ctx.obj["base"])
+    if not data:
+        click.echo("(no response from daemon)")
+        return
+    src = data.get("source", "")
+    click.echo(src)
 
 
 @debug.command("errors")

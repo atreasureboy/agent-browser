@@ -4132,3 +4132,60 @@ class TestBenchmark:
         assert d["avg_steps"] == 3.0
         assert "agent failed" in d["failure_reasons"]
         assert len(d["results"]) == 1
+
+
+
+class TestMCPServerAdvancedTools:
+    """T37: MCP server 暴露高级 agent 工具."""
+
+    def test_tools_list_includes_advanced(self):
+        """TOOL_DEFINITIONS 包含 sb_agent_run / sb_agent_plan / sb_discover 等."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        # 高级工具必须存在
+        assert "sb_agent_run" in names
+        assert "sb_agent_plan" in names
+        assert "sb_memory_lookup" in names
+        assert "sb_memory_stats" in names
+        assert "sb_discover" in names
+        assert "sb_safety_check" in names
+        # 原有底层工具保留
+        assert "sb_click" in names
+        assert "sb_snapshot" in names
+
+    def test_sb_safety_check_blocks_delete(self):
+        """sb_safety_check: action=type, text=delete → needs_confirm=True."""
+        import asyncio
+        from semantic_browser.mcp_server.server import MCPServer
+
+        server = MCPServer(engine=None)  # 不会真启动 — safety 不依赖 engine
+        result = asyncio.run(server._call_tool(
+            "sb_safety_check",
+            {"action": "type", "text": "delete all"},
+        ))
+        assert result["needs_confirm"] is True
+        assert "delete" in result["reason"]
+
+    def test_sb_safety_check_allows_safe(self):
+        """sb_safety_check: 普通 action → needs_confirm=False."""
+        import asyncio
+        from semantic_browser.mcp_server.server import MCPServer
+
+        server = MCPServer(engine=None)
+        result = asyncio.run(server._call_tool(
+            "sb_safety_check",
+            {"action": "type", "text": "hello world"},
+        ))
+        assert result["needs_confirm"] is False
+
+    def test_sb_memory_stats_returns_path(self):
+        """sb_memory_stats 返回 path / total 字段."""
+        import asyncio
+        from semantic_browser.mcp_server.server import MCPServer
+
+        server = MCPServer(engine=None)
+        result = asyncio.run(server._call_tool("sb_memory_stats", {}))
+        assert "path" in result
+        assert "total" in result
+        assert "success" in result
+        assert "failure" in result

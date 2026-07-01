@@ -45,6 +45,28 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "sb_graph", "description": "从记忆库构建站点拓扑图。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
     {"name": "sb_history", "description": "返回访问历史；可按 domain 过滤。", "inputSchema": _schema({"domain": {"type": "string"}})},
     {"name": "sb_stats", "description": "返回记忆库统计。", "inputSchema": _schema({})},
+    # T37: 高级 agent 工具 — 让 MCP 客户端 (Claude Desktop 等) 直接用 agent 能力
+    {"name": "sb_agent_run", "description": "LLM-driven autonomous loop: 给个 goal, agent 自主完成.",
+     "inputSchema": _schema({"goal": {"type": "string"},
+                             "start_url": {"type": "string"},
+                             "tier": {"type": "string", "enum": ["cheap", "medium", "smart"]},
+                             "max_steps": {"type": "integer"}}, ["goal"])},
+    {"name": "sb_agent_plan", "description": "Dry-run: LLM 先出 plan, 不执行. 用户决定后再调 sb_agent_run.",
+     "inputSchema": _schema({"goal": {"type": "string"},
+                             "start_url": {"type": "string"},
+                             "tier": {"type": "string", "enum": ["cheap", "medium", "smart"]}}, ["goal"])},
+    {"name": "sb_memory_lookup", "description": "查 goal memory 是否有缓存 (避免重复跑).",
+     "inputSchema": _schema({"goal": {"type": "string"}}, ["goal"])},
+    {"name": "sb_memory_stats", "description": "Goal memory 统计 (cache 大小/命中率).",
+     "inputSchema": _schema({})},
+    {"name": "sb_discover", "description": "Live 站点图自动发现 (BFS 爬站点生成导航).",
+     "inputSchema": _schema({"start_url": {"type": "string"},
+                             "max_pages": {"type": "integer"},
+                             "max_depth": {"type": "integer"}}, ["start_url"])},
+    {"name": "sb_safety_check", "description": "检查 action 是否危险 (delete/remove 等关键词).",
+     "inputSchema": _schema({"action": {"type": "string", "enum": ["open", "click", "type", "drag"]},
+                             "text": {"type": "string"},
+                             "ref_label": {"type": "string"}}, ["action"])},
 ]
 
 
@@ -155,6 +177,63 @@ class MCPServer:
             return {"pages": pages, "count": len(pages)}
         if name == "sb_stats":
             return self._ensure_engine().get_memory_stats()
+        # T37: 高级 agent 工具
+        if name == "sb_agent_run":
+            from semantic_browser.agent import GoalAgent
+            engine = await self._ensure_started()
+            agent = GoalAgent(
+                engine.controller,
+                tier=args.get("tier", "smart"),
+                max_steps=int(args.get("max_steps", 20)),
+            )
+            result = await agent.run(
+                goal=args["goal"],
+                start_url=args.get("start_url") or None,
+            )
+            return result.to_dict()
+        if name == "sb_agent_plan":
+            from semantic_browser.agent import GoalAgent
+            engine = await self._ensure_started()
+            agent = GoalAgent(
+                engine.controller,
+                tier=args.get("tier", "smart"),
+            )
+            return await agent.plan(goal=args["goal"])
+        if name == "sb_memory_lookup":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            mem = GoalMemory()
+            hit = mem.lookup(args["goal"])
+            return {"hit": hit is not None, "entry": hit}
+        if name == "sb_memory_stats":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            return GoalMemory().stats()
+        if name == "sb_discover":
+            from semantic_browser.llm import discover, format_sitemap_for_llm
+            engine = await self._ensure_started()
+            result = await discover(
+                engine.controller,
+                start_url=args["start_url"],
+                max_pages=int(args.get("max_pages", 15)),
+                max_depth=int(args.get("max_depth", 2)),
+                delay_ms=0,  # MCP 客户端一般不同步等, 0 延迟
+            )
+            return {
+                "pages_visited": result.pages_visited,
+                "tree_text": result.tree_text,
+                "llm_summary": format_sitemap_for_llm(result),
+            }
+        if name == "sb_safety_check":
+            from semantic_browser.safety import check_action
+            check = check_action(
+                args["action"],
+                {"ref": args.get("ref", ""), "text": args.get("text", "")},
+                ref_label=args.get("ref_label"),
+            )
+            return {
+                "needs_confirm": check.needs_confirm,
+                "reason": check.reason,
+                "risk_level": check.risk_level,
+            }
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

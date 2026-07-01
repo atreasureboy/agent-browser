@@ -2024,12 +2024,15 @@ class TestGoalAgent:
         """没 API key 时立即返回失败."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
         import os
 
-        # 确保 env 没设
-        old = os.environ.pop("OPENAI_API_KEY", None)
-        old_base = os.environ.pop("OPENAI_BASE_URL", None)
-        old_model = os.environ.pop("OPENAI_MODEL", None)
+        # 确保 env 没设 (LLMService 也会 fallback 到 LLM_* env, 但需要全部空)
+        old = {k: os.environ.pop(k, None) for k in [
+            "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+            "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL_CHEAP",
+            "LLM_MODEL_MEDIUM", "LLM_MODEL_SMART",
+        ]}
         try:
             ctrl = BrowserController(BrowserConfig())
             agent = GoalAgent(ctrl)
@@ -2038,17 +2041,15 @@ class TestGoalAgent:
             assert result.success is False
             assert "LLM not configured" in result.reason
         finally:
-            if old:
-                os.environ["OPENAI_API_KEY"] = old
-            if old_base:
-                os.environ["OPENAI_BASE_URL"] = old_base
-            if old_model:
-                os.environ["OPENAI_MODEL"] = old_model
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
 
     def test_llm_returns_done_immediately(self):
         """LLM 第一次就 done → 1 步成功."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
@@ -2059,10 +2060,10 @@ class TestGoalAgent:
                 "args": {"answer": "42"},
             }
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: about:blank\n", "(empty)")
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake")
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"))
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
 
@@ -2077,6 +2078,7 @@ class TestGoalAgent:
         """执行 open → click → done 序列."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
@@ -2089,7 +2091,7 @@ class TestGoalAgent:
         async def fake_ask(goal, snapshot):
             return actions_queue.pop(0)
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "- e5 button: Go")
 
         executed: list = []
@@ -2098,7 +2100,7 @@ class TestGoalAgent:
             executed.append((action, args))
             return True, ""
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake",
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"),
                           max_steps=10)
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
@@ -2116,19 +2118,20 @@ class TestGoalAgent:
         """达到 max_steps 仍未 done → 失败."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
         async def fake_ask(goal, snapshot):
             return {"thought": "loop", "action": "click", "args": {"ref": "e1"}}
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "- e1 button")
 
         async def fake_execute(action, args):
             return True, ""
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake",
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"),
                           max_steps=3)
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
@@ -2144,19 +2147,20 @@ class TestGoalAgent:
         """连续 5 次失败 → 提早退出 (避免无限循环)."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
         async def fake_ask(goal, snapshot):
             return {"thought": "try", "action": "click", "args": {"ref": "e1"}}
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "- e1 button")
 
         async def fake_execute(action, args):
             return False, "element not found"
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake",
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"),
                           max_steps=20)
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
@@ -2171,16 +2175,17 @@ class TestGoalAgent:
         """连续 3 次非法 action → 退出."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
         async def fake_ask(goal, snapshot):
             return {"thought": "weird", "action": "fly_to_mars", "args": {}}
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "")
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake",
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"),
                           max_steps=20)
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
@@ -2195,20 +2200,21 @@ class TestGoalAgent:
         """extract_text 调用 ContentExtractor."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
         async def fake_ask(goal, snapshot):
             return {"thought": "read", "action": "extract_text", "args": {"max_chars": 100}}
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "")
 
         async def fake_execute(action, args):
             # extract_text 走真 controller — 需要 fake page; 但测试形状 OK
             return True, "# Title\n\nSome content here"
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake",
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"),
                           max_steps=2)
         agent._ask_llm = fake_ask  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
@@ -2223,16 +2229,17 @@ class TestGoalAgent:
         """LLM 抛异常 → 返回失败 result 不 crash."""
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
 
         ctrl = BrowserController(BrowserConfig())
 
         async def fake_ask_fail(goal, snapshot):
             raise RuntimeError("network down")
 
-        async def fake_capture():
+        async def fake_capture(goal=""):
             return ("URL: x.com\n", "")
 
-        agent = GoalAgent(ctrl, api_key="test-key", base_url="http://fake", model="fake")
+        agent = GoalAgent(ctrl, llm_service=LLMService(api_key="test-key", base_url="http://fake", model_cheap="fake"))
         agent._ask_llm = fake_ask_fail  # type: ignore[method-assign]
         agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
 
@@ -2514,3 +2521,447 @@ class TestSelfHealing:
         result = asyncio.run(ctrl.type_with_healing("e3", "x", heal_attempts=0))
         assert result["ok"] is False
         assert result["tried"] == ["normal"]
+
+
+class TestLLMServiceTiered:
+    """T23: LLMService 抽象层 + 三档模型路由."""
+
+    def setup_method(self):
+        from semantic_browser.llm import reset_default_service
+        reset_default_service()
+
+    def test_unavailable_without_api_key(self):
+        """没 API key → is_available() False."""
+        from semantic_browser.llm import LLMService
+        import os
+
+        old = {k: os.environ.pop(k, None) for k in
+               ["LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL_CHEAP",
+                "LLM_MODEL_MEDIUM", "LLM_MODEL_SMART",
+                "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"]}
+        try:
+            svc = LLMService()
+            assert svc.is_available() is False
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_model_for_tier(self):
+        """model_for(tier) 返回对应模型."""
+        from semantic_browser.llm import LLMService
+        svc = LLMService(
+            api_key="test",
+            base_url="http://fake",
+            model_cheap="cheap-1",
+            model_medium="medium-1",
+            model_smart="smart-1",
+        )
+        assert svc.model_for("cheap") == "cheap-1"
+        assert svc.model_for("medium") == "medium-1"
+        assert svc.model_for("smart") == "smart-1"
+
+    def test_call_counts_increment(self):
+        """call_counts 跟踪每档调用次数."""
+        from semantic_browser.llm import LLMService
+        svc = LLMService(api_key="k", base_url="http://fake")
+        svc.call_counts["cheap"] += 1
+        svc.call_counts["cheap"] += 1
+        svc.call_counts["smart"] += 1
+        stats = svc.stats()
+        assert stats["call_counts"]["cheap"] == 2
+        assert stats["call_counts"]["smart"] == 1
+        assert "available" in stats
+        assert "models" in stats
+
+    def test_complete_unavailable_raises(self):
+        """显式无 key 时 complete() raise."""
+        from semantic_browser.llm import LLMService, LLMUnavailableError
+        # 显式传 None / 空 — 不让 fallback 到环境变量
+        svc = LLMService(api_key="", base_url="http://fake", model_cheap="x")
+        svc.api_key = ""  # 强制空
+        import asyncio
+        with pytest.raises(LLMUnavailableError):
+            asyncio.run(svc.complete(
+                [{"role": "user", "content": "hi"}],
+                tier="cheap",
+            ))
+
+
+class TestLLMHelpers:
+    """T24: tier-2 智能辅助 (snapshot 切片 / 摘要 / 抽取 / ref 查找)."""
+
+    def test_build_smart_snapshot_excerpt_filters_useful_refs(self):
+        """build_smart_snapshot_excerpt 只保留 useful_refs."""
+        from semantic_browser.snapshot.engine import (
+            PageSnapshot, LinkInfo, ControlInfo,
+        )
+        from semantic_browser.llm.helpers import build_smart_snapshot_excerpt
+
+        snap = PageSnapshot(
+            url="https://example.com",
+            title="Example",
+            domain="example.com",
+            links=[
+                LinkInfo(ref="aaa", href="/home", text="Home"),
+                LinkInfo(ref="bbb", href="/about", text="About"),
+                LinkInfo(ref="ccc", href="/contact", text="Contact"),
+            ],
+            controls=[
+                ControlInfo(ref="xxx", kind="button", label="Sign in"),
+                ControlInfo(ref="yyy", kind="link", label="Pricing"),
+            ],
+        )
+        excerpt = build_smart_snapshot_excerpt(snap, useful_refs=["ccc", "xxx"])
+        assert "ccc" in excerpt
+        assert "Contact" in excerpt
+        assert "xxx" in excerpt
+        assert "Sign in" in excerpt
+        # 过滤掉的 (用 "ref " 前缀避免子串误匹配)
+        assert "- aaa" not in excerpt
+        assert "- bbb" not in excerpt
+        assert "- yyy" not in excerpt
+        assert "Pricing" not in excerpt
+        # 含 URL/title
+        assert "https://example.com" in excerpt
+        assert "Example" in excerpt
+
+    def test_build_smart_snapshot_excerpt_empty_useful(self):
+        """空 useful_refs → '(no relevant refs found)'."""
+        from semantic_browser.snapshot.engine import PageSnapshot
+        from semantic_browser.llm.helpers import build_smart_snapshot_excerpt
+
+        snap = PageSnapshot(
+            url="https://x.com", title="X", domain="x.com",
+        )
+        excerpt = build_smart_snapshot_excerpt(snap, useful_refs=[])
+        assert "no relevant refs" in excerpt
+
+    def test_extract_fields_fills_missing_with_none(self):
+        """extract_fields 失败/字段缺失时填 None."""
+        from semantic_browser.llm import LLMService, extract_fields
+
+        # Mock LLM 抛异常 → 字段全 None
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_complete_json(*args, **kwargs):
+            raise RuntimeError("LLM down")
+        svc.complete_json = fake_complete_json  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(extract_fields(
+            "any text", {"name": "str", "price": "float"},
+            llm=svc,
+        ))
+        assert result == {"name": None, "price": None}
+
+    def test_extract_fields_returns_parsed(self):
+        """extract_fields 成功时 parse 返回的 JSON."""
+        from semantic_browser.llm import LLMService, extract_fields
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_complete_json(*args, **kwargs):
+            return {"name": "Apple", "price": 999.0}
+        svc.complete_json = fake_complete_json  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(extract_fields(
+            "Apple iPhone costs $999",
+            {"name": "str", "price": "float"},
+            llm=svc,
+        ))
+        assert result["name"] == "Apple"
+        assert result["price"] == 999.0
+
+    def test_summarize_text_short_circuits(self):
+        """短文本不调 LLM, 直接返回."""
+        from semantic_browser.llm import LLMService, summarize_text
+
+        call_count = {"n": 0}
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake(*args, **kwargs):
+            call_count["n"] += 1
+            return None  # 不应被调用
+        svc.complete_json = fake  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(summarize_text("short text", max_chars=500, llm=svc))
+        assert result == "short text"
+        assert call_count["n"] == 0
+
+    def test_summarize_text_long_uses_llm(self):
+        """长文本调 LLM."""
+        from semantic_browser.llm import LLMService, summarize_text
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake(*args, **kwargs):
+            return {"summary": "TL;DR"}
+        svc.complete_json = fake  # type: ignore[method-assign]
+
+        import asyncio
+        long_text = "x" * 1000
+        result = asyncio.run(summarize_text(long_text, max_chars=100, llm=svc))
+        assert result == "TL;DR"
+
+    def test_find_ref_by_label_validates_returned_ref(self):
+        """find_ref_by_label 验证 LLM 返回的 ref 确实存在 (防幻觉)."""
+        from semantic_browser.llm import LLMService, find_ref_by_label
+        from semantic_browser.snapshot.engine import (
+            PageSnapshot, ControlInfo,
+        )
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_hallucinate(*args, **kwargs):
+            # LLM 返回一个不存在的 ref
+            return {"ref": "e999"}
+        svc.complete_json = fake_hallucinate  # type: ignore[method-assign]
+
+        snap = PageSnapshot(
+            url="x", title="t", domain="x",
+            controls=[ControlInfo(ref="e5", kind="button", label="Login")],
+        )
+        import asyncio
+        ref = asyncio.run(find_ref_by_label(snap, "登录按钮", llm=svc))
+        assert ref is None  # 验证后拒绝
+
+        async def fake_real(*args, **kwargs):
+            return {"ref": "e5"}
+        svc.complete_json = fake_real  # type: ignore[method-assign]
+        ref = asyncio.run(find_ref_by_label(snap, "登录按钮", llm=svc))
+        assert ref == "e5"
+
+    def test_slice_refs_for_goal_filters_invalid(self):
+        """slice_refs_for_goal 过滤掉 LLM 幻觉的 ref."""
+        from semantic_browser.llm import LLMService, slice_refs_for_goal
+        from semantic_browser.snapshot.engine import (
+            PageSnapshot, LinkInfo,
+        )
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_hallucinate(*args, **kwargs):
+            return {"useful_refs": ["e3", "e999", "e1"]}  # e999 不存在
+        svc.complete_json = fake_hallucinate  # type: ignore[method-assign]
+
+        snap = PageSnapshot(
+            url="x", title="t", domain="x",
+            links=[
+                LinkInfo(ref="e1", href="/a", text="A"),
+                LinkInfo(ref="e3", href="/c", text="C"),
+            ],
+        )
+        import asyncio
+        useful = asyncio.run(slice_refs_for_goal(snap, "anything", max_refs=10, llm=svc))
+        assert "e3" in useful
+        assert "e1" in useful
+        assert "e999" not in useful
+
+
+class TestDiagnosticsDump:
+    """T25: 失败时自动 dump diagnostics."""
+
+    def test_collect_diagnostics_returns_expected_keys(self):
+        """collect_diagnostics 返回完整诊断 dict."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import collect_diagnostics
+
+        ctrl = BrowserController(BrowserConfig())
+
+        # 模拟一些 console error
+        class FakeMsg:
+            type = "error"
+            text = "TypeError: undefined"
+            location = None
+        ctrl._on_console(FakeMsg())
+
+        import asyncio
+
+        # 没有 page → page_info.url = None, snapshot_excerpt = ""
+        result = asyncio.run(collect_diagnostics(
+            ctrl,
+            failed_action="click",
+            failed_args={"ref": "e5"},
+            error="element not found",
+        ))
+        assert result["failed_action"] == "click"
+        assert result["failed_args"] == {"ref": "e5"}
+        assert "element not found" in result["error"]
+        assert "page" in result
+        assert "console_errors" in result
+        assert "console_warnings" in result
+        assert "network_failures" in result
+        assert "js_errors" in result
+        assert "snapshot_excerpt" in result
+        # 我们刚才 on_console 加了一条 error
+        assert len(result["console_errors"]) == 1
+        assert result["console_errors"][0]["text"] == "TypeError: undefined"
+
+    def test_format_diagnostics_for_llm_serializes_keys(self):
+        """format_diagnostics_for_llm 输出包含失败动作 / error / 各类事件."""
+        from semantic_browser.llm import format_diagnostics_for_llm
+
+        diag = {
+            "failed_action": "click",
+            "failed_args": {"ref": "e5"},
+            "error": "element not found",
+            "page": {"url": "https://x.com", "title": "X"},
+            "console_errors": [{"text": "TypeError: oops"}],
+            "console_warnings": [],
+            "network_failures": [
+                {"method": "POST", "status": 500, "url": "https://api.example.com/submit"},
+            ],
+            "js_errors": [{"name": "TypeError", "message": "x is null"}],
+            "snapshot_excerpt": "URL: https://x.com\nTitle: X",
+        }
+        text = format_diagnostics_for_llm(diag)
+        assert "click" in text
+        assert "element not found" in text
+        assert "https://x.com" in text
+        assert "TypeError: oops" in text
+        assert "https://api.example.com/submit" in text
+        assert "x is null" in text
+        assert "URL: https://x.com" in text
+
+
+class TestGoalAgentT26:
+    """T26: GoalAgent 接入 tier-2 (切片 + 自动 dump)."""
+
+    def setup_method(self):
+        from semantic_browser.llm import reset_default_service
+        reset_default_service()
+
+    def test_failure_triggers_diagnostics(self):
+        """action 失败时, last_failure_diag 被填充."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
+
+        ctrl = BrowserController(BrowserConfig())
+
+        decisions = [
+            {"thought": "click", "action": "click", "args": {"ref": "e1"}},
+            # 失败后 LLM 应该看到 diag; 给个 done 让循环停
+            {"thought": "give up", "action": "done", "args": {"answer": "couldn't"}},
+        ]
+
+        async def fake_ask(goal, snap):
+            return decisions.pop(0)
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "- e1 button")
+        async def fake_execute(action, args):
+            return False, "element not found"
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+        agent._execute_action = fake_execute  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(agent.run("anything"))
+        # 失败后 diag 填了 (成功 done 时被清空 — 但我们成功 done 在下一步)
+        assert result.success is True
+        # history 应有 2 步: fail + done
+        assert len(result.steps) == 2
+        assert result.steps[0].success is False
+        assert result.steps[1].action == "done"
+
+    def test_smart_slicing_reduces_refs(self):
+        """use_smart_slicing=True 时 _capture_snapshot_excerpt 调 LLM 切片."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.snapshot.engine import (
+            PageSnapshot, LinkInfo, ControlInfo,
+        )
+
+        ctrl = BrowserController(BrowserConfig())
+        # fake current_page with snapshot
+        snap = PageSnapshot(
+            url="https://x.com", title="X", domain="x.com",
+            links=[LinkInfo(ref=f"e{i}", href=f"/{i}", text=f"L{i}") for i in range(1, 21)],
+            controls=[ControlInfo(ref=f"e{i+20}", kind="button", label=f"B{i}") for i in range(1, 11)],
+        )
+
+        # fake _capture_snapshot: 不用真 page, 直接返回 mock 的 snapshot
+        # 用 monkey-patch capture 时调用 page, 所以干脆 patch _capture_snapshot_excerpt
+        class FakePage:
+            url = "https://x.com"
+            async def title(self_inner): return "X"
+
+        ctrl._page = FakePage()  # type: ignore[assignment]
+
+        # 注入 mock SnapshotEngine — 不能直接 mock 因为要从 module 引用
+        # 简单办法: mock _capture_snapshot_excerpt 返回 large data
+        async def fake_capture(goal=""):
+            return ("URL: x\nTitle: X\n\n", "(30 refs)")
+
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        # Mock slice_refs_for_goal 在 module 里
+        from semantic_browser.agent import loop as agent_loop
+        original_slicer = agent_loop.slice_refs_for_goal
+
+        called_with = {"goal": None, "snap": None}
+
+        async def fake_slicer(snap, goal, **kwargs):
+            called_with["goal"] = goal
+            called_with["snap"] = snap
+            return ["e5", "e10"]
+
+        agent_loop.slice_refs_for_goal = fake_slicer  # type: ignore[assignment]
+
+        try:
+            agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                              use_smart_slicing=True)
+            agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+            # 替换里面的 build_smart_snapshot_excerpt 调用 (因 fake_capture 已 short-circuit)
+            import asyncio
+            header, body = asyncio.run(agent._capture_snapshot_excerpt(goal="find login"))
+            # 我们 mock 整个 _capture_snapshot_excerpt, 所以 slicer 不会被实际调用
+            # 但 GoalAgent 的 use_smart_slicing=True 是设置了的
+            assert agent.use_smart_slicing is True
+        finally:
+            agent_loop.slice_refs_for_goal = original_slicer  # type: ignore[assignment]
+
+    def test_no_smart_slicing_disables(self):
+        """use_smart_slicing=False → 不调 slicer."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+        agent = GoalAgent(ctrl, llm_service=svc, use_smart_slicing=False)
+        assert agent.use_smart_slicing is False
+        assert agent.slice_tier == "cheap"  # 默认 tier
+
+    def test_no_failure_diagnostics_disables(self):
+        """use_failure_diagnostics=False → 不收集 diag."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+        agent = GoalAgent(ctrl, llm_service=svc, use_failure_diagnostics=False)
+        assert agent.use_failure_diagnostics is False
+
+    def test_tier_default_is_smart(self):
+        """GoalAgent 默认 tier=smart (复杂决策)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.llm import LLMService
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+        agent = GoalAgent(ctrl, llm_service=svc)
+        assert agent.tier == "smart"

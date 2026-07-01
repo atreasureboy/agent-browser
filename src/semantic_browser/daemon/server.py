@@ -265,6 +265,18 @@ class TransparentBrowserDaemon:
             ))
         if method == "POST" and path == "/agent/run":
             return self.owner.run(self._run_agent(args))
+        # T23/T24: LLM 智能辅助端点
+        if method == "GET" and path == "/llm/stats":
+            from semantic_browser.llm import get_default_service
+            return get_default_service().stats()
+        if method == "POST" and path == "/llm/slice":
+            return self.owner.run(self._llm_slice(args))
+        if method == "POST" and path == "/llm/summarize":
+            return self.owner.run(self._llm_summarize(args))
+        if method == "POST" and path == "/llm/extract":
+            return self.owner.run(self._llm_extract(args))
+        if method == "POST" and path == "/llm/find-ref":
+            return self.owner.run(self._llm_find_ref(args))
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":
@@ -522,13 +534,66 @@ class TransparentBrowserDaemon:
         from semantic_browser.agent import GoalAgent
         agent = GoalAgent(
             self.owner.browser.controller,
+            tier=args.get("tier", "smart"),
             max_steps=int(args.get("max_steps", 20)),
+            use_smart_slicing=bool(args.get("use_smart_slicing", True)),
+            use_failure_diagnostics=bool(args.get("use_failure_diagnostics", True)),
         )
         result = await agent.run(
             goal=args["goal"],
             start_url=args.get("start_url") or None,
         )
         return result.to_dict()
+
+    async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.llm import slice_refs_for_goal, get_default_service
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        page = self.owner.browser.controller.current_page
+        if page is None:
+            raise ValueError("no active page; call /open first")
+        engine = SnapshotEngine(page)
+        snap = await engine.capture(base_url=page.url)
+        useful = await slice_refs_for_goal(
+            snap, args["goal"],
+            max_refs=int(args.get("max_refs", 15)),
+            llm=get_default_service(),
+            tier=args.get("tier", "cheap"),
+        )
+        return {"useful_refs": useful, "count": len(useful)}
+
+    async def _llm_summarize(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.llm import summarize_text, get_default_service
+        summary = await summarize_text(
+            args["text"],
+            max_chars=int(args.get("max_chars", 500)),
+            llm=get_default_service(),
+            tier=args.get("tier", "cheap"),
+        )
+        return {"summary": summary}
+
+    async def _llm_extract(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.llm import extract_fields, get_default_service
+        fields = await extract_fields(
+            args["text"], args["schema"],
+            llm=get_default_service(),
+            tier=args.get("tier", "cheap"),
+        )
+        return {"fields": fields}
+
+    async def _llm_find_ref(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.llm import find_ref_by_label, get_default_service
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        page = self.owner.browser.controller.current_page
+        if page is None:
+            raise ValueError("no active page; call /open first")
+        engine = SnapshotEngine(page)
+        snap = await engine.capture(base_url=page.url)
+        ref = await find_ref_by_label(
+            snap, args["description"],
+            llm=get_default_service(),
+            tier=args.get("tier", "cheap"),
+        )
+        return {"ref": ref}
 
 
 def main(argv: list[str] | None = None) -> None:

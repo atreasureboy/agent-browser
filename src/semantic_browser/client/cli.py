@@ -925,23 +925,37 @@ def run_workflow(ctx, workflow_file, json_out):
 @click.option("--start-url", help="先打开这个 URL 再开始")
 @click.option("--max-steps", default=20, show_default=True,
               help="最多步数 (LLM 决策循环)")
+@click.option("--tier", default="smart",
+              type=click.Choice(["cheap", "medium", "smart"]),
+              show_default=True,
+              help="决策模型层 (smart=复杂决策, cheap=便宜快速)")
+@click.option("--no-slicing", is_flag=True,
+              help="禁用 smart snapshot 切片 (默认开, 用 cheap 模型按 goal 过滤 ref)")
+@click.option("--no-diagnostics", is_flag=True,
+              help="禁用失败时自动 dump diagnostics")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def agent_cmd(ctx, goal, start_url, max_steps, json_out):
-    """T21: LLM-driven autonomous loop — 给个目标, agent 自主完成.
+def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, json_out):
+    """T21 + T26: LLM-driven autonomous loop — 给个目标, agent 自主完成.
 
     \b
-    需环境变量:
-      OPENAI_API_KEY  LLM API key
-      OPENAI_BASE_URL  API base URL (默认 https://api.deepseek.com/v1)
-      OPENAI_MODEL     模型名 (默认 deepseek-chat)
+    需环境变量 (任一组):
+      LLM_API_KEY + LLM_BASE_URL + LLM_MODEL_<TIER>
+      或 OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL (fallback)
 
     \b
     Examples:
       tb agent "find contact email" --start-url https://example.com
       tb agent "搜 'deepseek' 并提取第一条结果的标题" --start-url https://www.google.com
+      tb agent "..." --tier cheap  (便宜模型跑, 适合简单任务)
     """
-    body = {"goal": goal, "max_steps": max_steps}
+    body = {
+        "goal": goal,
+        "max_steps": max_steps,
+        "tier": tier,
+        "use_smart_slicing": not no_slicing,
+        "use_failure_diagnostics": not no_diagnostics,
+    }
     if start_url:
         body["start_url"] = start_url
     data = _request("POST", "/agent/run", body, base=ctx.obj["base"])
@@ -954,13 +968,110 @@ def agent_cmd(ctx, goal, start_url, max_steps, json_out):
                 click.echo(f"  答案: {data['answer']}")
         else:
             click.echo(f"✗ 未达成 (steps={data['total_steps']}): {data.get('reason','')}")
-        # 打印步骤轨迹
         for s in data.get("steps", []):
             mark = "✓" if s["success"] else "✗"
             arg_str = json.dumps(s["args"], ensure_ascii=False)
             click.echo(f"  [{s['step']}] {mark} {s['action']:12s} {arg_str}")
             if s.get("thought"):
                 click.echo(f"      thought: {s['thought'][:80]}")
+
+
+@tb.group()
+def llm():
+    """T23/T24: LLM 智能辅助 (snapshot 切片 / 摘要 / 字段抽取 / ref 查找)."""
+
+
+@llm.command("stats")
+@click.pass_context
+def llm_stats(ctx):
+    """显示当前 LLM 配置和调用统计 (cheap/medium/smart 各调几次)."""
+    # 走 daemon 内部 stats 端点
+    try:
+        data = _request("GET", "/llm/stats", base=ctx.obj["base"])
+    except click.ClickException:
+        # daemon 没启 — fallback 本地
+        from semantic_browser.llm import get_default_service
+        svc = get_default_service()
+        data = svc.stats()
+    click.echo(f"available: {data['available']}")
+    click.echo(f"models: {data['models']}")
+    click.echo(f"call_counts: {data['call_counts']}")
+
+
+@llm.command("slice")
+@click.argument("goal")
+@click.option("--max-refs", default=15, show_default=True)
+@click.pass_context
+def llm_slice(ctx, goal, max_refs):
+    """T24: 给 goal → 当前页 top-K 最有用的 ref (cheap 模型)."""
+    data = _request("POST", "/llm/slice",
+                    {"goal": goal, "max_refs": max_refs},
+                    base=ctx.obj["base"])
+    useful = data.get("useful_refs", [])
+    reason = data.get("reason", "")
+    click.echo(f"reason: {reason}")
+    click.echo(f"useful refs ({len(useful)}): {useful}")
+
+
+@llm.command("summarize")
+@click.argument("text")
+@click.option("--max-chars", default=500, show_default=True)
+@click.pass_context
+def llm_summarize(ctx, text, max_chars):
+    """T24: 长文摘要 (cheap 模型)."""
+    data = _request("POST", "/llm/summarize",
+                    {"text": text, "max_chars": max_chars},
+                    base=ctx.obj["base"])
+    click.echo(data.get("summary", ""))
+
+
+@llm.command("extract")
+@click.argument("schema_text")  # 格式: "name=str, price=float"  (k=v,k=v)
+@click.option("--from-json", "text_source", type=click.Path(exists=True),
+              help="从文件读源文本")
+@click.option("--text", "text_inline", help="直接给源文本 (与 --from-json 互斥)")
+@click.pass_context
+def llm_extract(ctx, schema_text, text_source, text_inline):
+    """T24: 结构化字段抽取 (cheap 模型).
+
+    \b
+    Examples:
+      tb llm extract "name=str,price=float" --text "Apple iPhone costs $999"
+    """
+    # 解析 schema
+    schema: dict[str, str] = {}
+    for pair in schema_text.split(","):
+        if "=" not in pair:
+            raise click.ClickException(f"--schema 格式必须是 k=type, got {pair!r}")
+        k, t = pair.split("=", 1)
+        schema[k.strip()] = t.strip()
+    if text_source:
+        text = Path(text_source).read_text(encoding="utf-8")
+    elif text_inline:
+        text = text_inline
+    else:
+        raise click.ClickException("需要 --text 或 --from-json")
+    data = _request("POST", "/llm/extract",
+                    {"text": text, "schema": schema},
+                    base=ctx.obj["base"])
+    click.echo(json.dumps(data.get("fields", {}), ensure_ascii=False, indent=2))
+
+
+@llm.command("find-ref")
+@click.argument("description")
+@click.pass_context
+def llm_find_ref(ctx, description):
+    """T24: 用语义描述找 ref (e.g. "登录按钮").
+
+    解决 refresh 后 ref 重新编号的问题."""
+    data = _request("POST", "/llm/find-ref",
+                    {"description": description},
+                    base=ctx.obj["base"])
+    ref = data.get("ref")
+    if ref:
+        click.echo(f"ref: {ref}")
+    else:
+        click.echo("(no match)")
 
 
 def main():

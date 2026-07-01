@@ -27,10 +27,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import httpx
-
 from semantic_browser.browser.controller import BrowserController
-from semantic_browser.snapshot.engine import SnapshotEngine
+from semantic_browser.llm.service import LLMService, LLMUnavailableError, Tier
+from semantic_browser.llm.helpers import slice_refs_for_goal, build_smart_snapshot_excerpt
+from semantic_browser.llm.diagnostics import collect_diagnostics, format_diagnostics_for_llm
+from semantic_browser.snapshot.engine import PageSnapshot, SnapshotEngine
 
 logger = logging.getLogger(__name__)
 
@@ -110,33 +111,50 @@ class GoalResult:
 
 
 class GoalAgent:
-    """LLM-driven agent: 给定自然语言目标, 在浏览器里自主达成."""
+    """LLM-driven agent: 给定自然语言目标, 在浏览器里自主达成.
+
+    T26 增强: 用 cheap 模型 slice snapshot (省 token), 失败自动 dump diagnostics.
+    """
 
     def __init__(
         self,
         controller: BrowserController,
         *,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
+        llm_service: LLMService | None = None,
+        tier: Tier = "smart",  # GoalAgent 是复杂决策, 默认用强模型
         max_steps: int = 20,
         snapshot_ref_limit: int = 80,
+        # T26: 可选 tier-2 智能 — 切片 + 失败 dump. 默认开启.
+        use_smart_slicing: bool = True,
+        slice_tier: Tier = "cheap",  # 切片用便宜模型
+        slice_max_refs: int = 15,  # 只给 LLM 最多 15 个 ref
+        use_failure_diagnostics: bool = True,  # 失败自动 dump
     ) -> None:
         self.controller = controller
-        self.model = model or os.getenv("OPENAI_MODEL", "deepseek-chat")
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
-        self.base_url = base_url or os.getenv(
-            "OPENAI_BASE_URL", "https://api.deepseek.com/v1"
-        )
+        if llm_service is None:
+            self.llm = LLMService()
+        else:
+            self.llm = llm_service
+        self.tier = tier
         self.max_steps = max_steps
         self.snapshot_ref_limit = snapshot_ref_limit
+        self.use_smart_slicing = use_smart_slicing
+        self.slice_tier = slice_tier
+        self.slice_max_refs = slice_max_refs
+        self.use_failure_diagnostics = use_failure_diagnostics
         self.history: list[StepRecord] = []
+        # T26: 失败诊断累积 (LLM 下一步看)
+        self.last_failure_diag: Optional[str] = None
 
     def _is_available(self) -> bool:
-        return bool(self.api_key) and bool(self.model) and bool(self.base_url)
+        return self.llm.is_available()
 
-    async def _capture_snapshot_excerpt(self) -> tuple[str, str]:
-        """拿当前 snapshot (URL + title + 主要 ref 列表); 超大时截断."""
+    async def _capture_snapshot_excerpt(self, goal: str = "") -> tuple[str, str]:
+        """拿当前 snapshot (URL + title + 主要 ref 列表); 超大时截断.
+
+        T26: 如果 use_smart_slicing=True, 用 cheap 模型给 goal 挑 top-K refs.
+        返回 (header, body) 两段; 调用者拼起来给 LLM 看.
+        """
         page = self.controller.current_page
         if page is None:
             return "(no page open)", ""
@@ -147,10 +165,26 @@ class GoalAgent:
             snap = await engine.capture(base_url=url)
         except Exception as e:
             return f"(snapshot error: {e})", ""
-        # 序列化主要 refs (限制数量)
-        refs = []
-        # links + controls 合并
+
+        # T26: smart slicing (用 cheap 模型按 goal 切片)
+        if self.use_smart_slicing and goal:
+            try:
+                useful = await slice_refs_for_goal(
+                    snap, goal,
+                    max_refs=self.slice_max_refs,
+                    llm=self.llm,
+                    tier=self.slice_tier,
+                )
+                if useful:
+                    body = build_smart_snapshot_excerpt(snap, useful)
+                    header = f"URL: {url}\nTitle: {title}\n\n(sliced: {len(useful)}/{len(snap.links) + len(snap.controls)} refs relevant)"
+                    return header, body
+            except Exception as e:
+                logger.warning("smart slicing failed, falling back: %s", e)
+
+        # 兜底: 原 flat 列表 (无 goal 或 slicing 失败)
         all_refs = list(snap.links) + list(snap.controls)
+        refs = []
         for c in all_refs[:self.snapshot_ref_limit]:
             refs.append(f"  - {c.ref} {c.kind}: {c.label or c.href or ''}")
         excerpt = "\n".join(refs) if refs else "(no interactive elements)"
@@ -158,7 +192,7 @@ class GoalAgent:
         return header, excerpt
 
     async def _ask_llm(self, goal: str, snapshot_excerpt: str) -> dict[str, Any]:
-        """问 LLM 下一步做什么."""
+        """问 LLM 下一步做什么. 默认走 tier=smart (复杂多步决策)."""
         history_lines = []
         for step in self.history[-5:]:  # 只给最近 5 步
             history_lines.append(
@@ -169,44 +203,27 @@ class GoalAgent:
             "\n".join(history_lines) if history_lines else "(first step)"
         )
 
+        # T26: 把上次失败诊断塞 prompt
+        failure_block = ""
+        if self.last_failure_diag:
+            failure_block = f"\nLast failure diagnostics:\n{self.last_failure_diag}\n"
+
         user_prompt = f"""Goal: {goal}
 
 Current page snapshot:
 {snapshot_excerpt}
-
-Recent history:
-{history_block}
-
+{history_block}{failure_block}
 What's the next single action? Respond with JSON only."""
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-        payload = {
-            "model": self.model,
-            "messages": [
+        return await self.llm.complete_json(
+            messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.2,
-            "max_tokens": 500,
-        }
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
-        # LLM 可能包在 ```json ... ``` 里
-        if "```" in content:
-            m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-            if m:
-                content = m.group(1).strip()
-        return json.loads(content)
+            tier=self.tier,
+            temperature=0.2,
+            max_tokens=500,
+        )
 
     async def _execute_action(self, action: str, args: dict[str, Any]) -> tuple[bool, str]:
         """执行 LLM 选的动作. Returns (success, error_or_output).
@@ -257,9 +274,10 @@ What's the next single action? Respond with JSON only."""
         if not self._is_available():
             return GoalResult(
                 goal=goal, success=False,
-                reason="LLM not configured (need OPENAI_API_KEY + model + base_url)",
+                reason="LLM not configured (need LLM_API_KEY + LLM_BASE_URL or OPENAI_API_KEY)",
             )
         self.history = []
+        self.last_failure_diag = None  # T26: 重置失败诊断
 
         # 可选: 自动 open start_url
         if start_url:
@@ -267,7 +285,7 @@ What's the next single action? Respond with JSON only."""
 
         consecutive_failures = 0
         for step_num in range(1, self.max_steps + 1):
-            snapshot_header, snapshot_excerpt = await self._capture_snapshot_excerpt()
+            snapshot_header, snapshot_excerpt = await self._capture_snapshot_excerpt(goal=goal)
             try:
                 decision = await self._ask_llm(goal, snapshot_header + "\n" + snapshot_excerpt)
             except Exception as e:
@@ -324,8 +342,25 @@ What's the next single action? Respond with JSON only."""
 
             if ok:
                 consecutive_failures = 0
+                self.last_failure_diag = None  # 成功后清空
             else:
                 consecutive_failures += 1
+                # T26: 失败时收集 diagnostics, 让 LLM 下一步看到底发生了什么
+                if self.use_failure_diagnostics:
+                    try:
+                        diag = await collect_diagnostics(
+                            self.controller,
+                            failed_action=action,
+                            failed_args=args,
+                            error=output or "unknown error",
+                        )
+                        self.last_failure_diag = format_diagnostics_for_llm(diag)
+                        logger.info(
+                            "Action %s failed; diagnostics:\n%s",
+                            action, self.last_failure_diag[:300],
+                        )
+                    except Exception as e:
+                        logger.warning("collect_diagnostics failed: %s", e)
                 if consecutive_failures >= 5:
                     return GoalResult(
                         goal=goal, success=False,

@@ -1244,3 +1244,233 @@ class TestFrameSupport:
         assert ok is True
         assert captured["selector"] == '[data-sb-ref="e7"]'
         assert captured["filled"] == "hello world"
+
+
+class TestActionPrimitives:
+    """T19: hover / dblclick / rightclick / drag / select_option — 验证 API 形状
+    和 frame routing. 真实 Playwright 测试由 test_daemon e2e 覆盖."""
+
+    def test_hover_signature(self):
+        """hover(ref) → bool."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        # 验证方法存在且签名是 async
+        import inspect
+        sig = inspect.signature(ctrl.hover)
+        assert list(sig.parameters.keys()) == ["ref"]
+        assert inspect.iscoroutinefunction(ctrl.hover)
+
+    def test_dblclick_signature(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.dblclick)
+        assert list(sig.parameters.keys()) == ["ref"]
+        assert inspect.iscoroutinefunction(ctrl.dblclick)
+
+    def test_rightclick_signature(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.rightclick)
+        assert list(sig.parameters.keys()) == ["ref"]
+        assert inspect.iscoroutinefunction(ctrl.rightclick)
+
+    def test_drag_signature(self):
+        """drag(from_ref, to_ref) → bool."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.drag)
+        assert list(sig.parameters.keys()) == ["from_ref", "to_ref"]
+        assert inspect.iscoroutinefunction(ctrl.drag)
+
+    def test_select_option_signature(self):
+        """select_option(ref, value) — value 可 str 或 list[str]."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.select_option)
+        assert list(sig.parameters.keys()) == ["ref", "value"]
+        assert inspect.iscoroutinefunction(ctrl.select_option)
+        # value 注解: Python 3.10+ 用 `str | list[str]` (types.UnionType);
+        # 3.9- 用 typing.Union. 两者都接受.
+        ann_str = str(sig.parameters["value"].annotation)
+        assert "str" in ann_str and "list" in ann_str
+
+    def test_hover_routes_through_active_page_or_frame(self):
+        """hover() 走 _active_page_or_frame() — 设了 _frame 时不打 page."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def hover(self, timeout=5000):
+                                captured["hovered"] = True
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should not call _ensure_page when frame is set")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.hover("e3"))
+        assert ok is True
+        assert captured["selector"] == '[data-sb-ref="e3"]'
+        assert captured["hovered"] is True
+
+    def test_dblclick_uses_right_api(self):
+        """dblclick() 走 locator.first.dblclick()."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def dblclick(self, timeout=5000):
+                                captured["dblclicked"] = True
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.dblclick("e5"))
+        assert ok is True
+        assert captured["selector"] == '[data-sb-ref="e5"]'
+        assert captured["dblclicked"] is True
+
+    def test_rightclick_uses_button_right(self):
+        """rightclick() 走 locator.first.click(button='right')."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def click(self, button=None, timeout=5000):
+                                captured["button"] = button
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.rightclick("e2"))
+        assert ok is True
+        assert captured["button"] == "right"
+
+    def test_drag_uses_mouse_gesture(self):
+        """drag() 走 mouse.down/move/up (不依赖 HTML5 drag API)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"mouse_calls": []}
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def bounding_box(self):
+                                return {"x": 100, "y": 100, "width": 50, "height": 30}
+                        return LL()
+                return FakeLocator()
+
+            class mouse:
+                @staticmethod
+                async def move(x, y, steps=None):
+                    captured["mouse_calls"].append(("move", x, y, steps))
+                @staticmethod
+                async def down():
+                    captured["mouse_calls"].append(("down",))
+                @staticmethod
+                async def up():
+                    captured["mouse_calls"].append(("up",))
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.drag("e1", "e2"))
+        assert ok is True
+        # mouse 序列: move(start) -> down -> move(mid) -> move(end) -> up
+        kinds = [c[0] for c in captured["mouse_calls"]]
+        assert kinds == ["move", "down", "move", "move", "up"]
+        # 起点 = e1 bbox center (125, 115)
+        assert captured["mouse_calls"][0] == ("move", 125, 115, None)
+
+    def test_select_option_passes_value_through(self):
+        """select_option(ref, value) 直接传 value (Playwright 接受 value/label/index)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def select_option(self, value, timeout=5000):
+                                captured["value"] = value
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        # string value
+        ok = asyncio.run(ctrl.select_option("e7", "us-east-1"))
+        assert ok is True
+        assert captured["value"] == "us-east-1"
+        # list value (multi-select)
+        ok = asyncio.run(ctrl.select_option("e8", ["us-east-1", "eu-west-1"]))
+        assert ok is True
+        assert captured["value"] == ["us-east-1", "eu-west-1"]

@@ -94,6 +94,11 @@ HELP_TEXT = """\
 [bold]操作[/bold]
   click <ref>             点击元素 (ref 接受 3 / e3 / @e3)
   type <ref> <text...>    在元素中输入文本 (用引号包含空格)
+  hover <ref>             悬停 (触发 dropdown / tooltip)
+  dblclick <ref>          双击
+  rightclick <ref>        右键点击
+  drag <from> <to>        拖拽 (HTML5 dnd + 鼠标手势)
+  select <ref> <value>    <select> 元素选值
   extract [--markdown]    提取正文
 
 [bold]记忆[/bold]
@@ -352,6 +357,46 @@ class REPLSession:
         if not ok:
             return CommandResult(text=f"✗ 输入失败: ref={ref}", error=True)
         return CommandResult(text=f"✓ 已在 {ref} 输入 {len(text)} 字符")
+
+    async def _cmd_hover(self, cmd: Command) -> CommandResult:
+        """`hover <ref>` — 鼠标悬停 (触发 dropdown / tooltip)."""
+        if not cmd.args:
+            return CommandResult(text="用法: hover <ref>", error=True)
+        await self._ensure_started()
+        ok = await self.controller.hover(cmd.args[0])
+        return CommandResult(text=f"{'✓' if ok else '✗'} hover {cmd.args[0]}", error=not ok)
+
+    async def _cmd_dblclick(self, cmd: Command) -> CommandResult:
+        """`dblclick <ref>` — 双击元素."""
+        if not cmd.args:
+            return CommandResult(text="用法: dblclick <ref>", error=True)
+        await self._ensure_started()
+        ok = await self.controller.dblclick(cmd.args[0])
+        return CommandResult(text=f"{'✓' if ok else '✗'} dblclick {cmd.args[0]}", error=not ok)
+
+    async def _cmd_rightclick(self, cmd: Command) -> CommandResult:
+        """`rightclick <ref>` — 右键点击 (打开 context menu)."""
+        if not cmd.args:
+            return CommandResult(text="用法: rightclick <ref>", error=True)
+        await self._ensure_started()
+        ok = await self.controller.rightclick(cmd.args[0])
+        return CommandResult(text=f"{'✓' if ok else '✗'} rightclick {cmd.args[0]}", error=not ok)
+
+    async def _cmd_drag(self, cmd: Command) -> CommandResult:
+        """`drag <from_ref> <to_ref>` — 拖拽."""
+        if len(cmd.args) < 2:
+            return CommandResult(text="用法: drag <from_ref> <to_ref>", error=True)
+        await self._ensure_started()
+        ok = await self.controller.drag(cmd.args[0], cmd.args[1])
+        return CommandResult(text=f"{'✓' if ok else '✗'} drag {cmd.args[0]} -> {cmd.args[1]}", error=not ok)
+
+    async def _cmd_select(self, cmd: Command) -> CommandResult:
+        """`select <ref> <value>` — 在 select 元素上选 value."""
+        if len(cmd.args) < 2:
+            return CommandResult(text="用法: select <ref> <value>", error=True)
+        await self._ensure_started()
+        ok = await self.controller.select_option(cmd.args[0], cmd.args[1])
+        return CommandResult(text=f"{'✓' if ok else '✗'} select {cmd.args[0]}={cmd.args[1]}", error=not ok)
 
     async def _cmd_extract(self, cmd: Command) -> CommandResult:
         await self._ensure_started()

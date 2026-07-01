@@ -327,6 +327,94 @@ class BrowserController:
             out[ref] = await self.type_text(ref, text)
         return out
 
+    # ── T19: 完整动作原语 (hover / dblclick / rightclick / drag / select) ──
+
+    async def hover(self, ref: str) -> bool:
+        """T19: 鼠标悬停在 ref 元素上 (触发 hover 状态 / tooltip / 下拉菜单等)."""
+        target = await self._active_page_or_frame()
+        try:
+            selector = self._ref_to_selector(ref)
+            await target.locator(selector).first.hover(timeout=5000)
+            logger.info("Hovered ref=%s", ref)
+            return True
+        except Exception as e:
+            logger.warning("Hover failed ref=%s: %s", ref, e)
+            return False
+
+    async def dblclick(self, ref: str) -> bool:
+        """T19: 双击元素 (人类编辑文件 / 打开项目的动作)."""
+        target = await self._active_page_or_frame()
+        try:
+            selector = self._ref_to_selector(ref)
+            await target.locator(selector).first.dblclick(timeout=5000)
+            logger.info("Double-clicked ref=%s", ref)
+            return True
+        except Exception as e:
+            logger.warning("Dblclick failed ref=%s: %s", ref, e)
+            return False
+
+    async def rightclick(self, ref: str) -> bool:
+        """T19: 右键点击元素 (打开 context menu)."""
+        target = await self._active_page_or_frame()
+        try:
+            selector = self._ref_to_selector(ref)
+            await target.locator(selector).first.click(button="right", timeout=5000)
+            logger.info("Right-clicked ref=%s", ref)
+            return True
+        except Exception as e:
+            logger.warning("Rightclick failed ref=%s: %s", ref, e)
+            return False
+
+    async def drag(self, from_ref: str, to_ref: str) -> bool:
+        """T19: 拖拽 from_ref 到 to_ref (人类拖文件 / 排序列表 / 移动卡片).
+
+        HTML5 drag-and-drop + 鼠标手势都尝试, 用 mouse.down/move/up 兜底.
+        """
+        target = await self._active_page_or_frame()
+        try:
+            from_sel = self._ref_to_selector(from_ref)
+            to_sel = self._ref_to_selector(to_ref)
+            from_loc = target.locator(from_sel).first
+            to_loc = target.locator(to_sel).first
+            await from_loc.scroll_into_view_if_needed(timeout=5000)
+            await to_loc.scroll_into_view_if_needed(timeout=5000)
+            from_box = await from_loc.bounding_box()
+            to_box = await to_loc.bounding_box()
+            if from_box is None or to_box is None:
+                raise RuntimeError("element not visible (no bounding box)")
+            # 鼠标手势拖 (兼容性最好 — 不依赖 HTML5 drag API)
+            sx = from_box["x"] + from_box["width"] / 2
+            sy = from_box["y"] + from_box["height"] / 2
+            tx = to_box["x"] + to_box["width"] / 2
+            ty = to_box["y"] + to_box["height"] / 2
+            await target.mouse.move(sx, sy)
+            await target.mouse.down()
+            # 多步移动 (某些 framework 需要中间步骤才触发 dragenter/dragover)
+            await target.mouse.move((sx + tx) / 2, (sy + ty) / 2, steps=10)
+            await target.mouse.move(tx, ty, steps=10)
+            await target.mouse.up()
+            logger.info("Dragged ref=%s -> ref=%s", from_ref, to_ref)
+            return True
+        except Exception as e:
+            logger.warning("Drag failed ref=%s->%s: %s", from_ref, to_ref, e)
+            return False
+
+    async def select_option(self, ref: str, value: str | list[str]) -> bool:
+        """T19: 在 <select> ref 上选 value. 接受单值或 list (multi-select).
+
+        value 可以是 option 的 value / label / index (Playwright 支持).
+        """
+        target = await self._active_page_or_frame()
+        try:
+            selector = self._ref_to_selector(ref)
+            await target.locator(selector).first.select_option(value, timeout=5000)
+            n = len(value) if isinstance(value, list) else 1
+            logger.info("Selected %d option(s) on ref=%s", n, ref)
+            return True
+        except Exception as e:
+            logger.warning("Select failed ref=%s: %s", ref, e)
+            return False
+
     async def press_key(self, key: str) -> None:
         """按键，如 Enter, Tab, Escape。"""
         page = await self._ensure_page()

@@ -137,6 +137,16 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._click(args["ref"]))
         if method == "POST" and path == "/type":
             return self.owner.run(self._type(args["ref"], args["text"]))
+        if method == "POST" and path == "/hover":
+            return self.owner.run(self._hover(args["ref"]))
+        if method == "POST" and path == "/dblclick":
+            return self.owner.run(self._dblclick(args["ref"]))
+        if method == "POST" and path == "/rightclick":
+            return self.owner.run(self._rightclick(args["ref"]))
+        if method == "POST" and path == "/drag":
+            return self.owner.run(self._drag(args["from_ref"], args["to_ref"]))
+        if method == "POST" and path == "/select-option":
+            return self.owner.run(self._select_option(args["ref"], args["value"]))
         if method == "POST" and path == "/fill-form":
             return self.owner.run(self._fill_form(args["fields"]))
         if method == "POST" and path == "/with-retry":
@@ -270,6 +280,26 @@ class TransparentBrowserDaemon:
     async def _type(self, ref: str, text: str) -> dict[str, Any]:
         ok = await self.owner.browser.controller.type_text(ref, text)
         return {"success": ok, "text_length": len(text)}
+
+    async def _hover(self, ref: str) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.hover(ref)
+        return {"success": ok, "ref": ref}
+
+    async def _dblclick(self, ref: str) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.dblclick(ref)
+        return {"success": ok, "ref": ref}
+
+    async def _rightclick(self, ref: str) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.rightclick(ref)
+        return {"success": ok, "ref": ref}
+
+    async def _drag(self, from_ref: str, to_ref: str) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.drag(from_ref, to_ref)
+        return {"success": ok, "from_ref": from_ref, "to_ref": to_ref}
+
+    async def _select_option(self, ref: str, value: Any) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.select_option(ref, value)
+        return {"success": ok, "ref": ref, "value": value}
 
     async def _fill_form(self, fields: dict[str, str]) -> dict[str, Any]:
         result = await self.owner.browser.controller.fill_form(fields)

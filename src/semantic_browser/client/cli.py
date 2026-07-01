@@ -190,6 +190,52 @@ def type_cmd(ctx, ref, text):
     _print(_request("POST", "/type", {"ref": ref, "text": text}, base=ctx.obj["base"]))
 
 
+@tb.command("hover")
+@click.argument("ref")
+@click.pass_context
+def hover(ctx, ref):
+    """T19: 鼠标悬停在 ref 上 (触发 tooltip / 下拉菜单 / hover 状态)."""
+    _print(_request("POST", "/hover", {"ref": ref}, base=ctx.obj["base"]))
+
+
+@tb.command("dblclick")
+@click.argument("ref")
+@click.pass_context
+def dblclick(ctx, ref):
+    """T19: 双击元素."""
+    _print(_request("POST", "/dblclick", {"ref": ref}, base=ctx.obj["base"]))
+
+
+@tb.command("rightclick")
+@click.argument("ref")
+@click.pass_context
+def rightclick(ctx, ref):
+    """T19: 右键点击 (打开 context menu)."""
+    _print(_request("POST", "/rightclick", {"ref": ref}, base=ctx.obj["base"]))
+
+
+@tb.command("drag")
+@click.argument("from_ref")
+@click.argument("to_ref")
+@click.pass_context
+def drag(ctx, from_ref, to_ref):
+    """T19: 拖拽 from_ref -> to_ref (HTML5 dnd 兼容 + 鼠标手势)."""
+    _print(_request("POST", "/drag",
+                    {"from_ref": from_ref, "to_ref": to_ref},
+                    base=ctx.obj["base"]))
+
+
+@tb.command("select-option")
+@click.argument("ref")
+@click.argument("value")
+@click.pass_context
+def select_option(ctx, ref, value):
+    """T19: 在 <select> ref 上选 value (value / label / index 都可)."""
+    _print(_request("POST", "/select-option",
+                    {"ref": ref, "value": value},
+                    base=ctx.obj["base"]))
+
+
 @tb.command("fill-form")
 @click.option("--field", "fields", multiple=True, metavar="REF=TEXT",
               help="填一个字段, 格式 e1=hello (可多次使用)")

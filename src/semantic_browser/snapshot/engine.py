@@ -221,6 +221,7 @@ class SnapshotEngine:
 
         T39: 同时收集 form metadata (action/method/input_name) — default 模式.
               detail_level="deep" 时还填 raw_attrs + outerHTML.
+        T40h: 穿透 shadow DOM (closed mode 除外) — 用 TreeWalker + 自定义 walk.
         """
         base_domain = urlparse(base_url).netloc
         raw = await self.page.evaluate(
@@ -237,6 +238,23 @@ class SnapshotEngine:
                 'a[role="button"]', 'summary',
             ].join(', ');
 
+            // T40h: 递归 walk — 穿透 shadow DOM (open 模式).
+            // closed shadow root 无法访问, 这是浏览器安全限制.
+            const visit = (root, fn) => {
+                if (!root) return;
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+                let n = walker.currentNode || root;
+                while (n) {
+                    fn(n);
+                    // 先遍历 light DOM, 再进入 shadow root (避免重复)
+                    if (n.shadowRoot) {
+                        visit(n.shadowRoot, fn);
+                    }
+                    n = walker.nextNode();
+                }
+                // 也遍历 root 自身 (walker.currentNode 默认不会触发 fn)
+            };
+
             let idx = 0;
             const assignRef = (el) => {
                 let ref = el.getAttribute('data-sb-ref');
@@ -251,38 +269,41 @@ class SnapshotEngine:
                 return style.visibility !== 'hidden' && style.display !== 'none';
             };
 
-            for (const el of document.querySelectorAll('a[href]')) {
-                if (!visible(el)) continue;
-                const href = el.href;
-                if (!href || href.startsWith('javascript:') || seenLinks.has(href)) continue;
-                seenLinks.add(href);
-                let internal = true;
-                try { internal = new URL(href).hostname === baseDomain.split(':')[0]; } catch { internal = false; }
-                // T40d: 拆 query 参数 — 审计/重组 URL 用
-                let params = {};
-                try {
-                    new URL(href, location.href).searchParams.forEach((v, k) => {
-                        params[k] = (v || '').substring(0, 200);
+            // T40h: 改 querySelectorAll 为递归 walk — shadow DOM 内 a[href] 也能拿到.
+            visit(document, (el) => {
+                if (el.tagName && el.tagName.toLowerCase() === 'a' && el.hasAttribute('href')) {
+                    if (!visible(el)) return;
+                    const href = el.href;
+                    if (!href || href.startsWith('javascript:') || seenLinks.has(href)) return;
+                    seenLinks.add(href);
+                    let internal = true;
+                    try { internal = new URL(href).hostname === baseDomain.split(':')[0]; } catch { internal = false; }
+                    let params = {};
+                    try {
+                        new URL(href, location.href).searchParams.forEach((v, k) => {
+                            params[k] = (v || '').substring(0, 200);
+                        });
+                    } catch {}
+                    links.push({
+                        ref: assignRef(el),
+                        href,
+                        text: (el.textContent || '').trim().substring(0, 200),
+                        internal,
+                        params,
                     });
-                } catch {}
-                links.push({
-                    ref: assignRef(el),
-                    href,
-                    text: el.textContent.trim().substring(0, 200),
-                    internal,
-                    params,
-                });
-            }
+                }
+            });
 
-            for (const el of document.querySelectorAll(controlSelector)) {
-                if (!visible(el)) continue;
+            visit(document, (el) => {
+                if (!el.matches || !el.matches(controlSelector)) return;
+                if (!visible(el)) return;
                 const tag = el.tagName.toLowerCase();
                 const type = (el.getAttribute('type') || '').toLowerCase();
                 const role = el.getAttribute('role') || '';
                 const label = (
                     el.getAttribute('aria-label') ||
                     el.getAttribute('placeholder') ||
-                    el.textContent.trim() ||
+                    (el.textContent || '').trim() ||
                     el.getAttribute('name') ||
                     ''
                 ).substring(0, 100);
@@ -310,14 +331,12 @@ class SnapshotEngine:
                     kind = 'switch';
                 }
 
-                // T39: form metadata — 找最近的 <form> ancestor.
                 let form = el.closest('form');
                 let formAction = '', formMethod = '', formId = '', formParams = {};
                 if (form) {
                     formAction = (form.getAttribute('action') || '').substring(0, 200);
                     formMethod = (form.getAttribute('method') || 'get').toLowerCase();
                     formId = form.getAttribute('id') || '';
-                    // T40d: form action 的 query 参数 — e.g. ?redirect=/admin
                     if (formAction) {
                         try {
                             const formUrl = new URL(formAction, location.href);
@@ -328,7 +347,6 @@ class SnapshotEngine:
                     }
                 }
 
-                // T39: deep 模式填 raw_attrs + outerHTML
                 let rawAttrs = {}, outerHtml = '';
                 if (deep) {
                     const attrs = el.attributes;
@@ -351,7 +369,7 @@ class SnapshotEngine:
                     raw_attrs: rawAttrs,
                     outer_html: outerHtml,
                 });
-            }
+            });
             return {links, controls};
         }""", [base_domain, detail_level == "deep"])
 

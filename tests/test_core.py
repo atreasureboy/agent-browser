@@ -4764,3 +4764,68 @@ class TestT40gApiEndpointExtraction:
         from semantic_browser.client.cli import tb
         assert "extract-api-endpoints" in tb.commands
 
+
+class TestT40hShadowDomPiercing:
+    """T40h: snapshot 引擎穿透 shadow DOM."""
+
+    def test_extract_interactive_uses_recursive_walk_js(self):
+        """_extract_interactive 的 JS 包含递归 shadow root 访问 (visit function)."""
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        import inspect
+        src = inspect.getsource(SnapshotEngine._extract_interactive)
+        assert "shadowRoot" in src, "必须递归进入 shadowRoot"
+        assert "createTreeWalker" in src, "必须用 TreeWalker 遍历"
+        # 不应当还残留 querySelectorAll 旧调用
+        # (controlSelector 还保留用于 matches, 这是允许的)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_finds_shadow_dom_link(self):
+        """真实浏览器: shadow DOM 内的 a[href] 也应被 snapshot 抓到."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        from semantic_browser.browser.controller import BrowserController
+
+        # HTML 含 custom element + shadow DOM + shadow 内的链接
+        html_body = b'''<!doctype html><html><body>
+<my-widget id="w"></my-widget>
+<script>
+  const host = document.getElementById('w');
+  const root = host.attachShadow({mode: 'open'});
+  root.innerHTML = '<a href="/shadow-link">shadow link</a><input type="text" placeholder="shadow input"/>';
+</script>
+</body></html>'''
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(html_body)))
+                self.end_headers()
+                self.wfile.write(html_body)
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            ctrl = BrowserController()
+            page = await ctrl.open(f"http://127.0.0.1:{port}/")
+            snap = await SnapshotEngine(page).capture(base_url=page.url)
+            await ctrl.close()
+            hrefs = {l.href for l in snap.links}
+            # el.href 解析为绝对 URL, 但内容应包含 /shadow-link
+            assert any("/shadow-link" in h for h in hrefs), (
+                f"shadow DOM 内的链接应当被抓到, got: {hrefs}"
+            )
+            # shadow 内的 input 也应在
+            labels = {c.label for c in snap.controls}
+            assert "shadow input" in labels, (
+                f"shadow DOM 内的 input 应当被抓到, got: {labels}"
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+

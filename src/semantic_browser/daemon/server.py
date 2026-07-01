@@ -145,6 +145,14 @@ class TransparentBrowserDaemon:
             action_args = args.get("args", {})
             max_retries = int(args.get("max_retries", 2))
             return self.owner.run(self._with_retry(action_name, action_args, max_retries))
+        if method == "POST" and path == "/set-files":
+            return self.owner.run(self._set_files(args["ref"], args["paths"]))
+        if method == "POST" and path == "/download":
+            return self.owner.run(self._download(
+                args.get("trigger_ref"),
+                args.get("save_to"),
+                int(args.get("timeout_ms", 30000)),
+            ))
         if method == "POST" and path == "/scroll":
             return self.owner.run(self._scroll(args.get("direction", "down"), int(args.get("amount", 500))))
         if method == "POST" and path == "/wait-for/text":
@@ -280,6 +288,14 @@ class TransparentBrowserDaemon:
             raise ValueError(f"unsupported retry action: {action_name!r}")
         result = await ctrl.with_retry(_do, max_retries=max_retries, what=action_name)
         return {**result, "retries": ctrl.retry_count}
+
+    async def _set_files(self, ref: str, paths: list[str]) -> dict[str, Any]:
+        return await self.owner.browser.controller.set_files(ref, paths)
+
+    async def _download(self, trigger_ref: str | None, save_to: str | None, timeout_ms: int) -> dict[str, Any]:
+        return await self.owner.browser.controller.download_file(
+            trigger_ref=trigger_ref, save_to=save_to, timeout_ms=timeout_ms,
+        )
 
     async def _scroll(self, direction: str, amount: int) -> dict[str, Any]:
         await self.owner.browser.controller.scroll(direction, amount)

@@ -331,6 +331,81 @@ class BrowserController:
         page = await self._ensure_page()
         await page.keyboard.press(key)
 
+    # ── T13: 文件上传 ────────────────────────────────────────
+
+    async def set_files(self, ref: str, paths: list[str]) -> dict[str, Any]:
+        """T13: 通过 ref 给 file input 设置文件路径 (人类"上传附件"动作).
+
+        Returns {"ok": bool, "ref": str, "file_count": int, "error": Optional[str]}.
+        """
+        page = await self._ensure_page()
+        try:
+            selector = self._ref_to_selector(ref)
+            locator = page.locator(selector).first
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            await locator.set_input_files(paths, timeout=10000)
+            logger.info("Set files ref=%s: %d files", ref, len(paths))
+            return {"ok": True, "ref": ref, "file_count": len(paths), "error": None}
+        except Exception as e:
+            logger.warning("set_files failed ref=%s: %s", ref, e)
+            return {"ok": False, "ref": ref, "file_count": 0, "error": str(e)[:200]}
+
+    # ── T14: 下载拦截 ────────────────────────────────────────
+
+    async def download_file(
+        self,
+        trigger_ref: str | None = None,
+        *,
+        save_to: str | None = None,
+        timeout_ms: int = 30000,
+    ) -> dict[str, Any]:
+        """T14: 触发下载并保存文件。
+
+        用法 1 — 知道 ref: `download_file(trigger_ref='e5', save_to='/tmp/file.zip')`
+        用法 2 — 已点击外部触发器 (e.g. agent 已 click): `download_file(save_to='/tmp/x')`
+                等下一个下载事件 (适用罕见场景).
+
+        Returns {"ok", "path", "size", "suggested_filename", "url"}.
+        """
+        page = await self._ensure_page()
+        import os as _os
+
+        async def _do_download():
+            if trigger_ref:
+                # 边 click 边捕获 download 事件
+                async with page.expect_download(timeout=timeout_ms) as dl_info:
+                    ok = await self.click(trigger_ref)
+                    if not ok:
+                        raise RuntimeError(f"click {trigger_ref} failed")
+                download = await dl_info.value
+            else:
+                # 等待下一个 download 事件 (调用前已 click 过了)
+                download = await page.expect_download(timeout=timeout_ms).__aenter__()
+            suggested = download.suggested_filename
+            target = save_to or _os.path.join("/tmp", suggested or "download.bin")
+            await download.save_as(target)
+            return download, target, suggested
+
+        try:
+            download, target, suggested = await _do_download()
+            size = _os.path.getsize(target) if _os.path.exists(target) else 0
+            return {
+                "ok": True,
+                "path": target,
+                "size": size,
+                "suggested_filename": suggested,
+                "url": download.url,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "path": None,
+                "size": 0,
+                "suggested_filename": None,
+                "url": None,
+                "error": f"{type(e).__name__}: {e}"[:200],
+            }
+
     # ── 页面信息 ──────────────────────────────────────────────
 
     async def get_url(self) -> str:

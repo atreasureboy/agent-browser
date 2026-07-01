@@ -256,6 +256,35 @@ def retry_cmd(ctx, action, url, ref, text, max_retries):
                     base=ctx.obj["base"]))
 
 
+@tb.command("set-files")
+@click.argument("ref")
+@click.argument("paths", nargs=-1, required=True,
+                metavar="PATHS...")
+@click.pass_context
+def set_files(ctx, ref, paths):
+    """T13: 通过 ref 给 file input 设置文件 (人类上传附件动作)."""
+    _print(_request("POST", "/set-files",
+                    {"ref": ref, "paths": list(paths)},
+                    base=ctx.obj["base"]))
+
+
+@tb.command("download")
+@click.option("--ref", "trigger_ref",
+              help="触发下载的 ref (例如 'Download' 按钮). 省略 = 监听下一次下载事件.")
+@click.option("--save-to", type=click.Path(),
+              help="保存路径 (省略则用 /tmp/<suggested_filename>)")
+@click.option("--timeout-ms", default=30000, show_default=True)
+@click.pass_context
+def download(ctx, trigger_ref, save_to, timeout_ms):
+    """T14: 触发下载并保存文件。返回 path/size/suggested_filename。"""
+    body = {"timeout_ms": timeout_ms}
+    if trigger_ref:
+        body["trigger_ref"] = trigger_ref
+    if save_to:
+        body["save_to"] = save_to
+    _print(_request("POST", "/download", body, base=ctx.obj["base"]))
+
+
 @tb.command()
 @click.argument("direction", default="down")
 @click.argument("amount", type=int, default=500)

@@ -1515,21 +1515,73 @@ class BrowserController:
         return self._page  # 初始 = 顶层 page
 
     async def list_frames(self) -> list[dict[str, Any]]:
-        """T15: 列出所有 frame (顶层 + 所有 iframe).
+        """T15/T40e: 列出所有 frame (顶层 + 所有 iframe) — 含结构信息.
 
-        Returns [{"name": "main", "url": "...", "is_main": True},
-                 {"name": "iframe[name=foo]", "url": "...", "is_main": False}, ...]
+        每个 frame 报告:
+          - name, url, is_main
+          - depth: 嵌套深度 (顶层 = 0)
+          - parent: 父 frame 的 name (顶层 = None)
+          - is_cross_origin: 与顶层不同源 (可能受 CORS 限制, agent 拿不到内部 DOM)
+          - child_count: 直接子 frame 数
+
+        Returns [
+          {"name": "main", "url": "...", "is_main": True, "depth": 0,
+           "parent": None, "is_cross_origin": False, "child_count": N},
+          {"name": "frame[foo]", "url": "...", "is_main": False, "depth": 1,
+           "parent": "main", "is_cross_origin": bool, "child_count": M},
+          ...
+        ]
         """
+        from urllib.parse import urlparse
         page = await self._ensure_page()
-        out = [{"name": "main", "url": page.url, "is_main": True}]
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            out.append({
-                "name": f"frame[{frame.name or '(unnamed)'}]",
-                "url": frame.url,
-                "is_main": False,
-            })
+        origin_top = urlparse(page.url).netloc
+        # 先建一个 name → frame 的索引, 同时递归算 child_count + depth
+        frames = [f for f in page.frames]
+
+        def _parent_of(f):
+            return f.parent_frame if f.parent_frame in frames else None
+
+        def _children_of(f):
+            return [c for c in frames if _parent_of(c) is f]
+
+        out: list[dict[str, Any]] = []
+        # 主 frame
+        out.append({
+            "name": "main",
+            "url": page.url,
+            "is_main": True,
+            "depth": 0,
+            "parent": None,
+            "is_cross_origin": False,
+            "child_count": len(_children_of(page.main_frame)),
+        })
+        # BFS 算 depth
+        visited: set[int] = {id(page.main_frame)}
+        queue: list[tuple[Any, int]] = [(page.main_frame, 0)]
+        # index by id, 用于 child lookup
+        id_to_frame = {id(f): f for f in frames}
+        id_to_frame[id(page.main_frame)] = page.main_frame
+        while queue:
+            cur, depth = queue.pop(0)
+            for child in _children_of(cur):
+                if id(child) in visited:
+                    continue
+                visited.add(id(child))
+                queue.append((child, depth + 1))
+                try:
+                    child_origin = urlparse(child.url).netloc
+                    is_cross = child_origin != origin_top
+                except Exception:
+                    is_cross = True
+                out.append({
+                    "name": f"frame[{child.name or '(unnamed)'}]",
+                    "url": child.url,
+                    "is_main": False,
+                    "depth": depth + 1,
+                    "parent": "main" if cur is page.main_frame else f"frame[{cur.name or '(unnamed)'}]",
+                    "is_cross_origin": is_cross,
+                    "child_count": len(_children_of(child)),
+                })
         return out
 
     async def switch_frame(self, name_or_url: str) -> dict[str, Any]:

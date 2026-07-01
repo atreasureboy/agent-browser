@@ -92,6 +92,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({"url": {"type": "string"},
                              "categories": {"type": "string",
                                             "description": "逗号分隔; well_known/discovery/admin; 空=全部"}})},
+    {"name": "sb_list_frames", "description": "T40e: 列出页面所有 frame (顶层 + iframe) 含 depth/cross-origin/child 结构.",
+     "inputSchema": _schema({})},
+    {"name": "sb_switch_frame", "description": "T40e: 切换活跃 frame (按 name substring 或 url substring).",
+     "inputSchema": _schema({"name_or_url": {"type": "string"}}, ["name_or_url"])},
 ]
 
 
@@ -302,6 +306,12 @@ class MCPServer:
             cats_raw = args.get("categories", "")
             categories = [c for c in cats_raw.split(",") if c] if cats_raw else None
             return await engine.controller.probe_paths(args["url"], categories=categories)
+        if name == "sb_list_frames":
+            engine = await self._ensure_started()
+            return await engine.controller.list_frames()
+        if name == "sb_switch_frame":
+            engine = await self._ensure_started()
+            return await engine.controller.switch_frame(args["name_or_url"])
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

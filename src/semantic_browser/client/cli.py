@@ -600,6 +600,23 @@ def probe_paths(ctx, url, categories, json_out):
            json_out=json_out)
 
 
+@tb.command("list-frames")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def list_frames(ctx, json_out):
+    """T40e: 列出所有 frame 含结构 (depth/cross-origin/child_count)."""
+    _print(_request("GET", "/frame/list", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("switch-frame")
+@click.argument("name_or_url")
+@click.pass_context
+def switch_frame(ctx, name_or_url):
+    """T40e: 切换活跃 frame (按 name substring 或 url substring; 'main'/'top' 切回顶层)."""
+    _print(_request("POST", "/frame/switch", {"name_or_url": name_or_url},
+                    base=ctx.obj["base"]))
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

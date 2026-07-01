@@ -4562,3 +4562,88 @@ class TestT40bHiddenPathsProbe:
         from semantic_browser.client.cli import tb
         assert "probe-paths" in tb.commands
 
+
+class TestT40eFrameInventory:
+    """T40e: list_frames 输出新增 depth/parent/is_cross_origin/child_count 结构."""
+
+    def test_list_frames_main_entry_has_new_fields(self):
+        """list_frames 返回 main frame 时应当包含新结构字段."""
+        # 替身验证 — 我们只查返回 shape (mock page)
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class FakeMain:
+            url = "https://x.com"
+            is_main = True
+            name = ""
+            parent_frame = None
+            frames = []  # no iframes for simplicity
+            main_frame = None
+
+        ctrl = BrowserController(BrowserConfig())
+
+        async def fake_ensure():
+            return FakeMain()
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.list_frames())
+        assert len(result) == 1
+        main = result[0]
+        assert main["is_main"] is True
+        assert main["name"] == "main"
+        assert main["depth"] == 0
+        assert main["parent"] is None
+        assert main["is_cross_origin"] is False
+        assert main["child_count"] == 0
+
+    def test_list_frames_with_iframe_structure(self):
+        """含 iframe 时 — depth=1, parent=main, child_count 正确."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class FakeIframe:
+            url = "https://embed.other.com/widget"
+            name = "login"
+            parent_frame = None  # 后面指回 main
+
+        class FakeMain:
+            url = "https://x.com"
+            is_main = True
+            name = ""
+            parent_frame = None
+            frames = []
+            main_frame = None
+
+        main = FakeMain()
+        iframe = FakeIframe()
+        iframe.parent_frame = main
+        main.frames = [iframe]
+
+        ctrl = BrowserController(BrowserConfig())
+
+        async def fake_ensure():
+            return main
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.list_frames())
+        assert len(result) == 2
+        iframe_entry = result[1]
+        assert iframe_entry["depth"] == 1
+        assert iframe_entry["parent"] == "main"
+        assert iframe_entry["is_cross_origin"] is True  # different netloc
+        assert iframe_entry["child_count"] == 0
+        assert iframe_entry["name"] == "frame[login]"
+
+    def test_mcp_tool_register_t40e(self):
+        """sb_list_frames + sb_switch_frame 注册."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_list_frames" in names
+        assert "sb_switch_frame" in names
+
+    def test_cli_command_register_t40e(self):
+        """tb list-frames + switch-frame 注册."""
+        from semantic_browser.client.cli import tb
+        assert "list-frames" in tb.commands
+        assert "switch-frame" in tb.commands
+

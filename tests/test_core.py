@@ -500,3 +500,89 @@ class TestBrowserControllerRefs:
             return
         with pytest.raises(ValueError):
             BrowserController._ref_to_selector(bad_ref)
+
+
+# ── T7: Tab 管理 (用 fake Page object 测 list_tabs/switch 边界) ──────
+
+class FakePage:
+    """minimal Page 替身 — 只要 .url, .is_closed(), .close()."""
+    def __init__(self, url: str, closed: bool = False):
+        self.url = url
+        self._closed = closed
+    def is_closed(self) -> bool:
+        return self._closed
+    async def close(self) -> None:
+        self._closed = True
+    async def bring_to_front(self) -> None:
+        pass
+    async def title(self) -> str:
+        return f"title-of-{self.url}"
+
+
+class TestTabManagement:
+    """T7: 验证 switch/close/list/active_index 边界。
+
+    用 stub context.pages 替 Playwright, 不起浏览器。"""
+
+    def _make_controller_with_pages(self, urls: list[str]):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        # 不调 start(), 直接注入 fake pages + context
+        pages = [FakePage(u) for u in urls]
+        ctrl._context = type("FakeCtx", (), {"pages": pages})()
+        ctrl._page = pages[0]
+        return ctrl, pages
+
+    async def test_list_tabs_marks_active(self):
+        ctrl, _ = self._make_controller_with_pages(["https://a", "https://b", "https://c"])
+        tabs = ctrl.list_tabs()
+        assert len(tabs) == 3
+        assert tabs[0]["active"] is True
+        assert tabs[1]["active"] is False
+        assert tabs[2]["url"] == "https://c"
+
+    async def test_switch_tab_changes_active(self):
+        ctrl, _ = self._make_controller_with_pages(["https://a", "https://b"])
+        await ctrl.switch_tab(1)
+        assert ctrl._page.url == "https://b"
+        assert ctrl.list_tabs()[1]["active"] is True
+
+    async def test_switch_tab_out_of_range_raises(self):
+        ctrl, _ = self._make_controller_with_pages(["https://a"])
+        with pytest.raises(ValueError, match="out of range"):
+            await ctrl.switch_tab(5)
+        with pytest.raises(ValueError, match="out of range"):
+            await ctrl.switch_tab(-1)
+
+    async def test_close_tab_default_closes_active(self):
+        ctrl, pages = self._make_controller_with_pages(["https://a", "https://b", "https://c"])
+        remaining = await ctrl.close_tab()  # None = current
+        assert remaining == 2
+        # active 应回退到下一个; 原 index 0 → 现在 index 0 是原 index 1
+        assert pages[0]._closed is True
+        assert pages[1]._closed is False
+        assert ctrl._page.url == "https://b"
+
+    async def test_close_tab_by_index(self):
+        ctrl, pages = self._make_controller_with_pages(["https://a", "https://b", "https://c"])
+        remaining = await ctrl.close_tab(1)
+        assert remaining == 2
+        assert pages[1]._closed is True
+        assert pages[0]._closed is False
+        assert pages[2]._closed is False
+        # active 是 min(1, 2-1) = 1, 即 pages[2]
+        assert ctrl._page.url == "https://c"
+
+    async def test_close_last_tab_clears_active(self):
+        ctrl, pages = self._make_controller_with_pages(["https://a"])
+        remaining = await ctrl.close_tab()
+        assert remaining == 0
+        assert ctrl._page is None
+
+    async def test_active_index_falls_back_when_page_closed(self):
+        ctrl, pages = self._make_controller_with_pages(["https://a", "https://b"])
+        pages[0]._closed = True  # 假装当前 page 已被外部关闭
+        # active_index 应回退到 0 (现在 pages[0] 是 "https://b" 因为过滤掉了 closed)
+        idx = ctrl.active_index
+        # 过滤后只剩 1 个 tab, idx 应是 0
+        assert idx == 0

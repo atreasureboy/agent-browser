@@ -315,6 +315,53 @@ def notes(ctx, url, limit, json_out):
             click.echo(f"[{ts}] {url_disp}: {n['note']}")
 
 
+@tb.group()
+def tab():
+    """Multi-tab management."""
+
+
+@tab.command("list")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def tab_list(ctx, json_out):
+    """列出所有 tab (with active marker)."""
+    tabs = _request("GET", "/tab/list", base=ctx.obj["base"])
+    if json_out:
+        _print(tabs, json_out=True)
+        return
+    if not tabs:
+        click.echo("(no tabs)")
+        return
+    for t in tabs:
+        marker = "*" if t["active"] else " "
+        click.echo(f"{marker} [{t['index']}] {t['url']}")
+
+
+@tab.command("new")
+@click.argument("url", required=False)
+@click.pass_context
+def tab_new(ctx, url):
+    """Open a new tab (URL optional, blank if missing)."""
+    _print(_request("POST", "/tab/new", {"url": url or ""}, base=ctx.obj["base"]))
+
+
+@tab.command("switch")
+@click.argument("index", type=int)
+@click.pass_context
+def tab_switch(ctx, index):
+    """Switch to tab INDEX."""
+    _print(_request("POST", "/tab/switch", {"index": index}, base=ctx.obj["base"]))
+
+
+@tab.command("close")
+@click.argument("index", type=int, required=False)
+@click.pass_context
+def tab_close(ctx, index):
+    """Close tab INDEX (or current if INDEX omitted)."""
+    body = {"index": index} if index is not None else {}
+    _print(_request("POST", "/tab/close", body, base=ctx.obj["base"]))
+
+
 def main():
     tb()
 

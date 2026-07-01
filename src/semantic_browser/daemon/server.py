@@ -149,6 +149,17 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._screenshot(args.get("path")))
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
+        if method == "GET" and path == "/tab/list":
+            return self.owner.browser.controller.list_tabs()
+        if method == "POST" and path == "/tab/new":
+            url = args.get("url", "")
+            return self.owner.run(self._tab_new(url))
+        if method == "POST" and path == "/tab/switch":
+            idx = int(args["index"])
+            return self.owner.run(self._tab_switch(idx))
+        if method == "POST" and path == "/tab/close":
+            idx = int(args["index"]) if "index" in args else None
+            return self.owner.run(self._tab_close(idx))
         if method == "GET" and path == "/history":
             pages = self.owner.browser.get_visited_pages(args.get("domain", ""))
             return {"pages": pages, "count": len(pages)}
@@ -238,6 +249,20 @@ class TransparentBrowserDaemon:
     async def _save_state(self, path: str | None) -> dict[str, Any]:
         saved = await self.owner.browser.save_storage_state(path)
         return {"path": saved}
+
+    async def _tab_new(self, url: str) -> dict[str, Any]:
+        page = await self.owner.browser.controller.new_tab(url)
+        return {"index": self.owner.browser.controller.active_index,
+                "url": page.url, "title": await page.title()}
+
+    async def _tab_switch(self, index: int) -> dict[str, Any]:
+        page = await self.owner.browser.controller.switch_tab(index)
+        return {"index": index, "url": page.url, "title": await page.title()}
+
+    async def _tab_close(self, index: int | None) -> dict[str, Any]:
+        remaining = await self.owner.browser.controller.close_tab(index)
+        active = self.owner.browser.controller.active_index
+        return {"closed": index, "remaining": remaining, "active": active}
 
 
 def main(argv: list[str] | None = None) -> None:

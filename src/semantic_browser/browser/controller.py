@@ -55,6 +55,7 @@ class BrowserController:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._active_idx: int = 0  # T7: 当前活跃 tab 在 self._pages 中的下标
 
     async def start(self) -> None:
         """启动浏览器。"""
@@ -88,13 +89,104 @@ class BrowserController:
         self._context = None
         self._browser = None
         self._playwright = None
+        self._active_idx = 0
         logger.info("BrowserController closed")
 
+    # ── Tab 管理 (T7) ──────────────────────────────────────
+
+    @property
+    def pages(self) -> list[Page]:
+        """所有当前活跃 tab 的 Page 对象列表 (按用户操作顺序)。"""
+        if self._context is None:
+            return []
+        # 过滤已关闭的
+        return [p for p in self._context.pages if not p.is_closed()]
+
+    @property
+    def active_index(self) -> int:
+        """当前活跃 tab 在 self.pages 里的下标; 若 page 已关闭则回退到 0。"""
+        if self._page is None or self._page.is_closed():
+            return 0
+        try:
+            return self.pages.index(self._page)
+        except ValueError:
+            return 0
+
+    def list_tabs(self) -> list[dict[str, Any]]:
+        """列出所有 tab, 用于 CLI/daemon 输出。同步; 不查 title (异步)。"""
+        out = []
+        active = self.active_index
+        for i, p in enumerate(self.pages):
+            out.append({
+                "index": i,
+                "url": p.url,
+                "active": i == active,
+            })
+        return out
+
+    async def new_tab(self, url: str = "") -> Page:
+        """打开新 tab 并切到它。空 url = about:blank。"""
+        if self._context is None:
+            await self.start()
+        page = await self._context.new_page()
+        if url:
+            await page.goto(url, wait_until="networkidle")
+        # 新建后自动成为当前活跃 tab (Playwright 默认就是, 但 explicit set 更稳)
+        self._page = page
+        self._active_idx = self.active_index
+        logger.info("Opened new tab: %s", url or "(blank)")
+        return page
+
+    async def switch_tab(self, index: int) -> Page:
+        """切换到第 N 个 tab。"""
+        tabs = self.pages
+        if index < 0 or index >= len(tabs):
+            raise ValueError(
+                f"tab index {index} out of range (have {len(tabs)} tabs: 0..{len(tabs)-1})"
+            )
+        page = tabs[index]
+        # Playwright: bring_to_front 让 tab 在 UI 上聚焦 (headless 不必要, 但无害)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        self._page = page
+        self._active_idx = index
+        logger.info("Switched to tab %d: %s", index, page.url)
+        return page
+
+    async def close_tab(self, index: int | None = None) -> int:
+        """关闭一个 tab。None = 关闭当前。返回剩余 tab 数。"""
+        tabs = self.pages
+        if not tabs:
+            return 0
+        if index is None:
+            index = self.active_index
+        if index < 0 or index >= len(tabs):
+            raise ValueError(
+                f"tab index {index} out of range (have {len(tabs)} tabs)"
+            )
+        target = tabs[index]
+        await target.close()
+        # 切到下一个可用 tab
+        remaining = self.pages
+        if remaining:
+            new_active = min(index, len(remaining) - 1)
+            self._page = remaining[new_active]
+            self._active_idx = new_active
+        else:
+            self._page = None
+            self._active_idx = 0
+        logger.info("Closed tab %d; %d remaining", index, len(remaining))
+        return len(remaining)
+
     async def _ensure_page(self) -> Page:
+        """确保有 current_page — 必要时建一个。"""
         if self._page is None or self._page.is_closed():
             if self._context is None:
                 await self.start()
             self._page = await self._context.new_page()
+            self._active_idx = 0
         return self._page
 
     # ── 基本浏览器动作 ──────────────────────────────────────────

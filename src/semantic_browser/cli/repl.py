@@ -75,6 +75,8 @@ HELP_TEXT = """\
   back / forward / reload 浏览器导航
   url / title             显示当前 URL / 标题
   scroll [up|down] [n]    滚动 (默认 down 500)
+  tabs / new [url] / switch <N> / close [N]
+                          多 tab 管理 (人类浏览器的核心能力)
 
 [bold]查看[/bold]
   snapshot                语义快照表格
@@ -442,6 +444,45 @@ class REPLSession:
             title=f"🏷️ Refs ({len(all_refs)})",
             border_style="cyan",
         ))
+
+    async def _cmd_tabs(self, _cmd: Command) -> CommandResult:
+        """列出所有 tab (active 加 * 号)。"""
+        tabs = self.controller.list_tabs()
+        if not tabs:
+            return CommandResult(text="(no tabs)")
+        lines = []
+        for t in tabs:
+            marker = "*" if t["active"] else " "
+            url_disp = t["url"] if len(t["url"]) <= 60 else t["url"][:30] + "…" + t["url"][-27:]
+            lines.append(f"{marker} [{t['index']}] {url_disp}")
+        return CommandResult(panel=Panel("\n".join(lines),
+                                          title=f"📑 Tabs ({len(tabs)})",
+                                          border_style="cyan"))
+
+    async def _cmd_new(self, cmd: Command) -> CommandResult:
+        """打开新 tab。`new <url>` 或 `new` = blank tab."""
+        url = cmd.arg(0, "")
+        await self.controller.new_tab(url)
+        # 新 tab 自动激活, 拉一次 snapshot 让用户立刻看到内容
+        snap = await self._refresh_snapshot()
+        return CommandResult(text=f"✓ 新 tab: {snap.url}")
+
+    async def _cmd_switch(self, cmd: Command) -> CommandResult:
+        idx = int(cmd.arg(0, "-1"))
+        try:
+            await self.controller.switch_tab(idx)
+        except ValueError as e:
+            return CommandResult(text=f"✗ {e}", error=True)
+        snap = await self._refresh_snapshot()
+        return CommandResult(text=f"→ tab {idx}: {snap.url}")
+
+    async def _cmd_close_tab(self, cmd: Command) -> CommandResult:
+        idx = int(cmd.arg(0)) if cmd.arg(0) else None
+        try:
+            remaining = await self.controller.close_tab(idx)
+        except ValueError as e:
+            return CommandResult(text=f"✗ {e}", error=True)
+        return CommandResult(text=f"✗ 关闭 tab {idx if idx is not None else 'current'}; 剩余 {remaining}")
 
     async def _cmd_note(self, cmd: Command) -> CommandResult:
         if not cmd.args:

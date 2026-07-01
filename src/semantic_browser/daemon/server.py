@@ -241,6 +241,24 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.clear_storage(
                 kind=args.get("kind", "local"),
             ))
+        # T16: 键盘 / 焦点 / Tab 导航
+        if method == "GET" and path == "/focus":
+            return self.owner.run(self.owner.browser.controller.get_focused_element())
+        if method == "POST" and path == "/focus":
+            return self.owner.run(self.owner.browser.controller.focus(args["ref"]))
+        if method == "POST" and path == "/tab":
+            shift = args.get("shift", "false").lower() in ("1", "true", "yes")
+            count = int(args.get("count", 1))
+            return self.owner.run(self.owner.browser.controller.tab(shift=shift, count=count))
+        if method == "POST" and path == "/keyboard/shortcut":
+            keys = args["keys"] if isinstance(args["keys"], list) else [args["keys"]]
+            return self.owner.run(self.owner.browser.controller.keyboard_shortcut(*keys))
+        if method == "POST" and path == "/keyboard/type":
+            text = args["text"]
+            delay_ms = int(args.get("delay_ms", 0))
+            return self.owner.run(self.owner.browser.controller.type_into_active(
+                text, delay_ms=delay_ms,
+            ))
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":

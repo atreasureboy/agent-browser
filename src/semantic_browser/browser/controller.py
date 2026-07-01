@@ -794,6 +794,88 @@ class BrowserController:
         except Exception as e:
             return {"ok": False, "kind": kind, "error": str(e)[:200]}
 
+    # ── T16: 键盘 / 焦点 / Tab 导航 ───────────────────────────
+    #
+    # agent 模拟人类键盘浏览: Tab / Shift+Tab / Enter / Esc / 焦点环查询 /
+    # 键盘快捷键 (Ctrl+A/F5 等). 现代 SPA 大量依赖键盘可达性.
+
+    async def get_focused_element(self) -> dict[str, Any]:
+        """T16: 返回当前 active element 的描述.
+
+        Returns {"tag", "type", "ref", "text", "value", "href"} 或 {} 若无焦点.
+        用 :focus + [data-sb-ref] 查 ref.
+        """
+        target = await self._active_page_or_frame()
+        info = await target.evaluate("""
+            () => {
+                const el = document.activeElement;
+                if (!el || el === document.body) return null;
+                const out = {
+                    tag: el.tagName.toLowerCase(),
+                    type: (el.getAttribute('type') || '').toLowerCase(),
+                    ref: el.getAttribute('data-sb-ref') || null,
+                    text: (el.textContent || '').trim().slice(0, 80),
+                    value: el.value !== undefined ? String(el.value).slice(0, 200) : null,
+                    href: el.href || null,
+                    placeholder: el.placeholder || null,
+                    aria_label: el.getAttribute('aria-label') || null,
+                };
+                return out;
+            }
+        """)
+        return info or {}
+
+    async def focus(self, ref: str) -> bool:
+        """T16: 把焦点设到 ref 元素上 (无需 click)."""
+        target = await self._active_page_or_frame()
+        try:
+            selector = self._ref_to_selector(ref)
+            await target.locator(selector).first.focus(timeout=5000)
+            return True
+        except Exception as e:
+            logger.warning("Focus failed ref=%s: %s", ref, e)
+            return False
+
+    async def tab(self, shift: bool = False, count: int = 1) -> str | None:
+        """T16: 按 Tab N 次. shift=True = Shift+Tab (反方向).
+
+        返回最后焦点元素的 ref (若有), 便于 agent 接着操作.
+        """
+        target = await self._active_page_or_frame()
+        for _ in range(count):
+            key = "Shift+Tab" if shift else "Tab"
+            await target.keyboard.press(key)
+            await asyncio.sleep(0.05)
+        # 看现在焦点在哪儿
+        info = await self.get_focused_element()
+        return info.get("ref") if isinstance(info, dict) else None
+
+    async def keyboard_shortcut(self, *keys: str) -> None:
+        """T16: 键盘组合键. 用法: keyboard_shortcut('Control', 'a') (全选).
+        或者 keyboard_shortcut('F5') (单键也支持).
+        """
+        target = await self._active_page_or_frame()
+        if len(keys) == 1:
+            await target.keyboard.press(keys[0])
+        else:
+            await target.keyboard.press("+".join(keys))
+
+    async def type_into_active(self, text: str, delay_ms: int = 0) -> bool:
+        """T16: 直接往当前焦点元素打字 (不需要 ref). 模拟人类"键入"动作.
+
+        delay_ms > 0 时模拟真实键入速度 (避免某些 framework 拦截过快键入).
+        """
+        target = await self._active_page_or_frame()
+        try:
+            if delay_ms > 0:
+                await target.keyboard.type(text, delay=delay_ms)
+            else:
+                await target.keyboard.type(text)
+            return True
+        except Exception as e:
+            logger.warning("type_into_active failed: %s", e)
+            return False
+
     # ── T15: Frame (iframe) 支持 ─────────────────────────────
 
     @property

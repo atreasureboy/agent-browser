@@ -555,6 +555,64 @@ def storage_clear(ctx, kind):
     _print(_request("POST", "/storage/clear", {"kind": kind}, base=ctx.obj["base"]))
 
 
+@tb.group()
+def keyboard():
+    """T16: 键盘导航 / 焦点 / 快捷键."""
+
+
+@keyboard.command("focus")
+@click.argument("ref", required=False)
+@click.pass_context
+def keyboard_focus(ctx, ref):
+    """查询当前焦点元素; 给 ref 时则把焦点设到该 ref."""
+    if ref:
+        _print(_request("POST", "/focus", {"ref": ref}, base=ctx.obj["base"]))
+    else:
+        data = _request("GET", "/focus", base=ctx.obj["base"])
+        if not data:
+            click.echo("(no element focused)")
+        else:
+            click.echo(f"[{data.get('tag','?')}] ref={data.get('ref') or '-'}  "
+                       f"text={data.get('text','')[:40]}")
+
+
+@keyboard.command("tab")
+@click.option("--shift", is_flag=True, help="Shift+Tab (反方向)")
+@click.option("--count", default=1, show_default=True, help="按几次")
+@click.pass_context
+def keyboard_tab(ctx, shift, count):
+    """按 Tab / Shift+Tab N 次."""
+    data = _request("POST", "/tab",
+                    {"shift": "true" if shift else "false", "count": count},
+                    base=ctx.obj["base"])
+    if isinstance(data, dict) and data.get("ref"):
+        click.echo(f"focused ref: {data['ref']}")
+    else:
+        click.echo(f"pressed Tab x{count}")
+
+
+@keyboard.command("shortcut")
+@click.argument("keys", nargs=-1, required=True, metavar="KEY...")
+@click.pass_context
+def keyboard_shortcut(ctx, keys):
+    """键盘组合键. 用法: tb keyboard shortcut F5  或  Control a."""
+    _print(_request("POST", "/keyboard/shortcut",
+                    {"keys": list(keys)},
+                    base=ctx.obj["base"]))
+
+
+@keyboard.command("type")
+@click.argument("text")
+@click.option("--delay-ms", default=0, show_default=True,
+              help="每键间隔 (ms). >0 模拟真实键入.")
+@click.pass_context
+def keyboard_type(ctx, text, delay_ms):
+    """往当前焦点元素打字 (无需 ref)."""
+    _print(_request("POST", "/keyboard/type",
+                    {"text": text, "delay_ms": delay_ms},
+                    base=ctx.obj["base"]))
+
+
 @tb.group("state")
 def state_group():
     """Browser state commands."""

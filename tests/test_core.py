@@ -1825,3 +1825,193 @@ class TestCookieStorageManagement:
         js = captured["js"]
         assert "localStorage.clear()" in js
         assert "sessionStorage.clear()" in js
+
+
+class TestKeyboardFocus:
+    """T16: 键盘 / 焦点 / Tab 导航 — agent 模拟人类键入."""
+
+    def test_get_focused_element_signature(self):
+        """get_focused_element() → dict (可能空)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        assert inspect.iscoroutinefunction(ctrl.get_focused_element)
+        assert list(inspect.signature(ctrl.get_focused_element).parameters) == []
+
+    def test_focus_signature(self):
+        """focus(ref) → bool."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.focus)
+        assert list(sig.parameters.keys()) == ["ref"]
+        assert inspect.iscoroutinefunction(ctrl.focus)
+
+    def test_tab_uses_keyboard_press(self):
+        """tab(count=3) 按 Tab 3 次."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"pressed": []}
+
+        class FakeFrame:
+            class keyboard:
+                @staticmethod
+                async def press(key):
+                    captured["pressed"].append(key)
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        async def fake_get_focused():
+            return {"tag": "input", "ref": "e7", "text": ""}
+        ctrl.get_focused_element = fake_get_focused  # type: ignore[method-assign]
+
+        import asyncio
+        ref = asyncio.run(ctrl.tab(count=3))
+        assert captured["pressed"] == ["Tab", "Tab", "Tab"]
+        assert ref == "e7"
+
+    def test_tab_shift_uses_shift_tab(self):
+        """tab(shift=True) 按 Shift+Tab."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"pressed": []}
+
+        class FakeFrame:
+            class keyboard:
+                @staticmethod
+                async def press(key):
+                    captured["pressed"].append(key)
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        async def fake_get_focused():
+            return {"ref": "e3"}
+        ctrl.get_focused_element = fake_get_focused  # type: ignore[method-assign]
+
+        import asyncio
+        asyncio.run(ctrl.tab(shift=True, count=2))
+        assert captured["pressed"] == ["Shift+Tab", "Shift+Tab"]
+
+    def test_keyboard_shortcut_uses_plus_join(self):
+        """keyboard_shortcut('Control', 'a') → press('Control+a')."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"pressed": []}
+
+        class FakeFrame:
+            class keyboard:
+                @staticmethod
+                async def press(key):
+                    captured["pressed"].append(key)
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        # 组合键
+        asyncio.run(ctrl.keyboard_shortcut("Control", "a"))
+        assert captured["pressed"] == ["Control+a"]
+        # 单键
+        asyncio.run(ctrl.keyboard_shortcut("F5"))
+        assert captured["pressed"] == ["Control+a", "F5"]
+        # 三键
+        asyncio.run(ctrl.keyboard_shortcut("Control", "Shift", "p"))
+        assert captured["pressed"][-1] == "Control+Shift+p"
+
+    def test_type_into_active_uses_keyboard_type(self):
+        """type_into_active(text, delay) → page.keyboard.type(text, delay)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"typed": None}
+
+        class FakeFrame:
+            class keyboard:
+                @staticmethod
+                async def type(text, delay=0):
+                    captured["typed"] = (text, delay)
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.type_into_active("hello", delay_ms=50))
+        assert ok is True
+        assert captured["typed"] == ("hello", 50)
+
+        # delay=0 也行
+        asyncio.run(ctrl.type_into_active("fast"))
+        assert captured["typed"] == ("fast", 0)
+
+    def test_focus_routes_through_active_target(self):
+        """focus(ref) 走 _active_page_or_frame()."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def focus(self, timeout=5000):
+                                captured["focused"] = True
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should use frame")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.focus("e9"))
+        assert ok is True
+        assert captured["selector"] == '[data-sb-ref="e9"]'
+        assert captured["focused"] is True
+
+    def test_get_focused_returns_active_element_info(self):
+        """get_focused_element() 用 JS 读 document.activeElement."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        expected = {"tag": "input", "type": "text", "ref": "e5",
+                    "text": "", "value": "hello", "href": None,
+                    "placeholder": "name", "aria_label": None}
+
+        class FakeFrame:
+            async def evaluate(self, js, arg=None):
+                return expected
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        info = asyncio.run(ctrl.get_focused_element())
+        assert info["tag"] == "input"
+        assert info["ref"] == "e5"
+        assert info["value"] == "hello"

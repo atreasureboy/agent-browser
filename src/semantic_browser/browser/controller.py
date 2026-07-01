@@ -991,6 +991,142 @@ class BrowserController:
             out["score"] = "missing"
         return out
 
+    # ── T40b: Hidden paths probe ─────────────────────────────
+
+    # 常见 path 列表 — 分四类
+    _WELL_KNOWN_PATHS: tuple[str, ...] = (
+        "/.well-known/security.txt",
+        "/.well-known/openid-configuration",
+        "/.well-known/change-password",
+        "/.well-known/apple-app-site-association",
+        "/.well-known/assetlinks.json",
+        "/.well-known/mta-sts.txt",
+        "/.well-known/acme-challenge/",
+    )
+    _DISCOVERY_PATHS: tuple[str, ...] = (
+        "/robots.txt",
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/llms.txt",
+        "/humans.txt",
+        "/manifest.json",
+        "/crossdomain.xml",
+        "/clientaccesspolicy.xml",
+        "/.git/HEAD",
+        "/.env",
+    )
+    _ADMIN_PATHS: tuple[str, ...] = (
+        "/admin",
+        "/admin/login",
+        "/administrator",
+        "/login",
+        "/wp-admin/",
+        "/wp-login.php",
+        "/user/login",
+        "/api",
+        "/api/v1",
+        "/graphql",
+        "/cgi-bin/",
+        "/phpmyadmin/",
+        "/server-status",
+        "/.htaccess",
+    )
+
+    async def probe_paths(
+        self,
+        base_url: str,
+        *,
+        categories: list[str] | None = None,
+        timeout_ms: int = 5000,
+        max_concurrency: int = 6,
+    ) -> dict[str, Any]:
+        """T40b: 探测常见隐藏路径 — 给 agent / 安全审计用.
+
+        探测三类 path:
+          - well_known:  /.well-known/* (RFC 8615 + 行业标准)
+          - discovery:  robots.txt / sitemap.xml / .git/HEAD 等发现类
+          - admin:      /admin /login /api /graphql 等常见管理/API 入口
+
+        不通过浏览器 — 用 httpx 直发 (避开 CORS, 不污染浏览历史).
+        所有 path 并发探测 (max_concurrency 控制并发).
+
+        Args:
+            base_url: 起点 URL, 自动从其中解析 origin
+            categories: 子集白名单 (None = 全部三类); 可选 "well_known"/"discovery"/"admin"
+            timeout_ms: 单 path 超时
+            max_concurrency: 并发上限
+
+        Returns: {
+          "base_url", "origin",
+          "found": [{"path", "status", "category", "content_type", "size", "redirect"}],
+          "missing": [{"path", "category", "status": 404}],
+          "total_probed": int,
+          "duration_ms": int,
+        }
+        """
+        import httpx
+        import time as _time
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        wanted_cats = categories or ["well_known", "discovery", "admin"]
+        all_paths: list[tuple[str, str]] = []
+        if "well_known" in wanted_cats:
+            all_paths += [("well_known", p) for p in self._WELL_KNOWN_PATHS]
+        if "discovery" in wanted_cats:
+            all_paths += [("discovery", p) for p in self._DISCOVERY_PATHS]
+        if "admin" in wanted_cats:
+            all_paths += [("admin", p) for p in self._ADMIN_PATHS]
+
+        sem = asyncio.Semaphore(max_concurrency)
+        found: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        t0 = _time.monotonic()
+
+        async def _probe_one(cat: str, path: str) -> None:
+            url = origin + path
+            try:
+                async with sem:
+                    async with httpx.AsyncClient(
+                        timeout=timeout_ms / 1000,
+                        follow_redirects=False,
+                        headers={"User-Agent": "semantic-browser-probe/1.0"},
+                    ) as client:
+                        r = await client.get(url)
+                status = r.status_code
+                entry: dict[str, Any] = {
+                    "path": path,
+                    "status": status,
+                    "category": cat,
+                    "url": url,
+                }
+                if status in (200, 301, 302, 307, 308, 401, 403):
+                    entry["content_type"] = r.headers.get("content-type", "")
+                    entry["size"] = len(r.content)
+                    if 300 <= status < 400:
+                        entry["redirect"] = r.headers.get("location", "")
+                    found.append(entry)
+                else:
+                    missing.append({"path": path, "category": cat, "status": status})
+            except Exception as e:
+                missing.append({
+                    "path": path, "category": cat,
+                    "status": -1, "error": f"{type(e).__name__}: {e}",
+                })
+
+        await asyncio.gather(*[_probe_one(c, p) for c, p in all_paths])
+
+        return {
+            "base_url": base_url,
+            "origin": origin,
+            "found": sorted(found, key=lambda x: (x["category"], x["path"])),
+            "missing": sorted(missing, key=lambda x: (x["category"], x["path"])),
+            "total_probed": len(all_paths),
+            "duration_ms": int((_time.monotonic() - t0) * 1000),
+        }
+
     async def get_content(self) -> str:
         """获取页面 (或当前 frame) 的 HTML。"""
         target = await self._active_page_or_frame()

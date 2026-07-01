@@ -4467,3 +4467,98 @@ class TestT40a40fStorageAndSecurityHeaders:
         assert "storage" in tb.commands
         assert "security-headers" in tb.commands
 
+
+class TestT40bHiddenPathsProbe:
+    """T40b: 探测常见隐藏路径 — robots/sitemap/.well-known/admin/api."""
+
+    def test_well_known_paths_defined(self):
+        """_WELL_KNOWN_PATHS 包含 security.txt / openid / change-password 等."""
+        from semantic_browser.browser.controller import BrowserController
+        paths = BrowserController._WELL_KNOWN_PATHS
+        assert "/.well-known/security.txt" in paths
+        assert "/.well-known/openid-configuration" in paths
+        assert "/.well-known/change-password" in paths
+
+    def test_discovery_paths_include_robots_sitemap(self):
+        from semantic_browser.browser.controller import BrowserController
+        paths = BrowserController._DISCOVERY_PATHS
+        assert "/robots.txt" in paths
+        assert "/sitemap.xml" in paths
+        assert "/llms.txt" in paths
+        assert "/.git/HEAD" in paths
+
+    def test_admin_paths_include_common(self):
+        from semantic_browser.browser.controller import BrowserController
+        paths = BrowserController._ADMIN_PATHS
+        assert "/admin" in paths
+        assert "/login" in paths
+        assert "/api" in paths
+        assert "/graphql" in paths
+        assert "/wp-admin/" in paths
+
+    @pytest.mark.asyncio
+    async def test_probe_paths_against_http_server(self):
+        """真实 HTTP server — 验证探测逻辑 (found/missing 分类正确)."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from semantic_browser.browser.controller import BrowserController
+
+        # 简易 stdlib HTTP server: robots.txt + admin → 200; 其他 → 404
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):  # 静音
+                pass
+            def do_GET(self):
+                if self.path == "/robots.txt":
+                    body = b"User-agent: *\nDisallow: /admin\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/admin":
+                    body = b"<html>login</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    body = b"nope"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            base_url = f"http://127.0.0.1:{port}"
+            ctrl = BrowserController()
+            result = await ctrl.probe_paths(base_url, categories=["discovery", "admin"])
+            assert result["origin"] == base_url
+            assert result["total_probed"] > 0
+            # robots.txt + admin 应当 found
+            found_paths = {e["path"] for e in result["found"]}
+            assert "/robots.txt" in found_paths
+            assert "/admin" in found_paths
+            # /login 不在 server, 应当 missing
+            missing_paths = {e["path"]: e["status"] for e in result["missing"]}
+            assert missing_paths.get("/login") == 404
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_mcp_tool_register_t40b(self):
+        """sb_probe_paths 注册到 MCP TOOL_DEFINITIONS."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_probe_paths" in names
+
+    def test_cli_command_register_t40b(self):
+        """tb probe-paths 注册."""
+        from semantic_browser.client.cli import tb
+        assert "probe-paths" in tb.commands
+

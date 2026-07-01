@@ -88,6 +88,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({})},
     {"name": "sb_security_headers", "description": "T40f: 按 URL 解析 CSP/HSTS/XFO/Referrer-Policy/COOP/COEP/Set-Cookie 标志.",
      "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    {"name": "sb_probe_paths", "description": "T40b: 探测常见隐藏路径 (robots.txt / sitemap.xml / .well-known/* / admin / api).",
+     "inputSchema": _schema({"url": {"type": "string"},
+                             "categories": {"type": "string",
+                                            "description": "逗号分隔; well_known/discovery/admin; 空=全部"}})},
 ]
 
 
@@ -293,6 +297,11 @@ class MCPServer:
         if name == "sb_security_headers":
             engine = await self._ensure_started()
             return await engine.controller.get_security_headers(args["url"])
+        if name == "sb_probe_paths":
+            engine = await self._ensure_started()
+            cats_raw = args.get("categories", "")
+            categories = [c for c in cats_raw.split(",") if c] if cats_raw else None
+            return await engine.controller.probe_paths(args["url"], categories=categories)
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

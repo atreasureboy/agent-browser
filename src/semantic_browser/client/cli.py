@@ -585,6 +585,21 @@ def security_headers(ctx, url, json_out):
                     base=ctx.obj["base"]), json_out=json_out)
 
 
+@tb.command("probe-paths")
+@click.argument("url")
+@click.option("--categories", default="",
+              help="well_known,discovery,admin (逗号分隔; 空=全部)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def probe_paths(ctx, url, categories, json_out):
+    """T40b: 探测常见隐藏路径 (robots/sitemap/.well-known/admin/api)."""
+    q = {"url": url}
+    if categories:
+        q["categories"] = categories
+    _print(_request("GET", "/probe-paths", q, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

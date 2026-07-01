@@ -249,6 +249,16 @@ class TransparentBrowserDaemon:
             if not url:
                 raise ValueError("url required")
             return self.owner.run(self.owner.browser.controller.get_security_headers(url))
+        # T40b: Hidden paths probe (httpx 探测常见路径)
+        if method == "GET" and path == "/probe-paths":
+            url = args.get("url", "")
+            if not url:
+                raise ValueError("url required")
+            cats_raw = args.get("categories", "")
+            categories = [c for c in cats_raw.split(",") if c] if cats_raw else None
+            return self.owner.run(self.owner.browser.controller.probe_paths(
+                url, categories=categories,
+            ))
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)

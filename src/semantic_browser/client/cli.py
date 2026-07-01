@@ -487,6 +487,45 @@ def tab_close(ctx, index):
     _print(_request("POST", "/tab/close", body, base=ctx.obj["base"]))
 
 
+@tb.group()
+def frame():
+    """iframe / frame management."""
+
+
+@frame.command("list")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def frame_list(ctx, json_out):
+    """列出所有 frame (顶层 + 所有 iframe)."""
+    frames = _request("GET", "/frame/list", base=ctx.obj["base"])
+    if json_out:
+        _print(frames, json_out=True)
+        return
+    if not frames:
+        click.echo("(no frames)")
+        return
+    for f in frames:
+        marker = "*" if f["is_main"] else " "
+        click.echo(f"{marker} {f['name']:30s} {f['url']}")
+
+
+@frame.command("switch")
+@click.argument("name_or_url")
+@click.pass_context
+def frame_switch(ctx, name_or_url):
+    """Switch active frame by name substring or URL substring."""
+    _print(_request("POST", "/frame/switch",
+                    {"name_or_url": name_or_url},
+                    base=ctx.obj["base"]))
+
+
+@frame.command("to-top")
+@click.pass_context
+def frame_to_top(ctx):
+    """回到顶层 frame (main)."""
+    _print(_request("POST", "/frame/to-top", base=ctx.obj["base"]))
+
+
 @tb.group("wait-for")
 def wait_for_group():
     """智能等待 — 比 sleep 更可靠。"""

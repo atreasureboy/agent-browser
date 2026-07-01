@@ -1002,3 +1002,245 @@ class TestFileUploadAndDownload:
             "error": "TimeoutError: ...",
         }
         assert "error" in fail_result
+
+
+class TestFrameSupport:
+    """T15: iframe 支持 — 验证 API 形状和 frame routing.
+
+    真实 Playwright 测试由 test_daemon e2e 覆盖; 这里测纯逻辑
+    (frame 列表/切换/回归主 frame).
+    """
+
+    def test_initial_frame_is_none(self):
+        """刚初始化的 controller, active frame 应为 None (顶层 page)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        assert ctrl._frame is None
+        assert ctrl.active_frame is ctrl.current_page  # active_frame 返回 page 默认
+
+    def test_to_top_frame_resets_to_none(self):
+        """to_top_frame 强制 _frame = None (无论之前切到了哪个 frame)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        # 假装切到了某个 frame
+        class FakeFrame:
+            pass
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+        assert ctrl._frame is not None
+        # 同步调用 _active_page_or_frame 不能跑 (需要 _ensure_page), 但 to_top_frame 是 sync 设值
+        # 改用 asyncio 跑
+        import asyncio
+        asyncio.run(ctrl.to_top_frame())
+        assert ctrl._frame is None
+
+    def test_active_page_or_frame_returns_frame_when_set(self):
+        """_frame 已设 → _active_page_or_frame() 返回 frame."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            pass
+        fake_frame = FakeFrame()
+        ctrl._frame = fake_frame  # type: ignore[assignment]
+
+        # 同时 mock 掉 _ensure_page, 让它返回 page
+        async def fake_ensure():
+            class FakePage:
+                pass
+            return FakePage()
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        target = asyncio.run(ctrl._active_page_or_frame())
+        assert target is fake_frame  # 不是 page, 是 frame
+
+    def test_active_page_or_frame_returns_page_when_no_frame(self):
+        """_frame 未设 → _active_page_or_frame() 返回 page."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakePage:
+            pass
+        fake_page = FakePage()
+
+        async def fake_ensure():
+            return fake_page
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        target = asyncio.run(ctrl._active_page_or_frame())
+        assert target is fake_page
+
+    def test_list_frames_output_shape(self):
+        """list_frames 返回 [{name, url, is_main}, ...] 形状."""
+        # 替身验证 shape
+        expected = [
+            {"name": "main", "url": "https://x.com", "is_main": True},
+            {"name": "frame[login]", "url": "https://x.com/embed", "is_main": False},
+        ]
+        for f in expected:
+            assert "name" in f and "url" in f and "is_main" in f
+            assert isinstance(f["is_main"], bool)
+
+    def test_switch_frame_accepts_main_or_top_as_top(self):
+        """switch_frame('main') / switch_frame('top') → 切回顶层, _frame=None."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        # 设个假 frame
+        class FakeFrame:
+            name = "iframe-x"
+            url = "https://x.com/embed"
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            class FakePage:
+                url = "https://x.com"
+            return FakePage()
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.switch_frame("main"))
+        assert result == {"name": "main", "url": "https://x.com"}
+        assert ctrl._frame is None
+
+        # 再设一次, 试 "top"
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+        result = asyncio.run(ctrl.switch_frame("top"))
+        assert ctrl._frame is None
+
+    def test_switch_frame_finds_by_name_substring(self):
+        """switch_frame 通过 name substring 匹配."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            def __init__(self, name, url):
+                self.name = name
+                self.url = url
+
+        target_frame = FakeFrame("payment", "https://x.com/pay")
+
+        class FakePage:
+            url = "https://x.com"
+            main_frame = "MAIN"  # 任意标记
+
+            @property
+            def frames(self):
+                return [self.main_frame, target_frame]
+
+        async def fake_ensure():
+            return FakePage()
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.switch_frame("payment"))
+        assert result["name"] == "payment"
+        assert result["url"] == "https://x.com/pay"
+        assert ctrl._frame is target_frame
+
+    def test_switch_frame_raises_on_not_found(self):
+        """switch_frame 找不到 → ValueError with helpful list."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            name = "login"
+            url = "https://x.com/login"
+
+        class FakePage:
+            url = "https://x.com"
+            main_frame = "MAIN"
+
+            @property
+            def frames(self):
+                return [self.main_frame, FakeFrame()]
+
+        async def fake_ensure():
+            return FakePage()
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        async def fake_list():
+            return [
+                {"name": "main", "url": "https://x.com", "is_main": True},
+                {"name": "frame[login]", "url": "https://x.com/login", "is_main": False},
+            ]
+        ctrl.list_frames = fake_list  # type: ignore[method-assign]
+
+        import asyncio
+        with pytest.raises(ValueError, match="frame not found"):
+            asyncio.run(ctrl.switch_frame("nonexistent"))
+
+    def test_frame_routes_via_active_page_or_frame_in_click(self):
+        """click() 走 _active_page_or_frame() — 验证 frame 时 locator 也打到 frame."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            """FramePage 替身, 暴露 locator().first.scroll_into_view_if_needed().click()."""
+            def locator(self, selector):
+                captured["selector"] = selector
+
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                captured["scrolled"] = True
+
+                            async def click(self, timeout=5000):
+                                captured["clicked"] = True
+
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should not call _ensure_page when frame is set")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.click("e5"))
+        assert ok is True
+        assert captured["selector"] == '[data-sb-ref="e5"]'
+        assert captured["scrolled"] is True
+        assert captured["clicked"] is True
+
+    def test_frame_routes_via_active_page_or_frame_in_type(self):
+        """type_text() 同样 frame-routed."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+
+                            async def fill(self, text, timeout=5000):
+                                captured["filled"] = text
+
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should not call _ensure_page when frame is set")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.type_text("e7", "hello world"))
+        assert ok is True
+        assert captured["selector"] == '[data-sb-ref="e7"]'
+        assert captured["filled"] == "hello world"

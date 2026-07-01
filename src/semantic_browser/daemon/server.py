@@ -195,6 +195,14 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/tab/close":
             idx = int(args["index"]) if "index" in args else None
             return self.owner.run(self._tab_close(idx))
+        if method == "GET" and path == "/frame/list":
+            return self.owner.run(self.owner.browser.controller.list_frames())
+        if method == "POST" and path == "/frame/switch":
+            name_or_url = args["name_or_url"]
+            return self.owner.run(self.owner.browser.controller.switch_frame(name_or_url))
+        if method == "POST" and path == "/frame/to-top":
+            self.owner.run(self.owner.browser.controller.to_top_frame())
+            return {"active": "main"}
         if method == "GET" and path == "/history":
             pages = self.owner.browser.get_visited_pages(args.get("domain", ""))
             return {"pages": pages, "count": len(pages)}

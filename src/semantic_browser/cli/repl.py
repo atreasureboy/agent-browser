@@ -77,6 +77,8 @@ HELP_TEXT = """\
   scroll [up|down] [n]    滚动 (默认 down 500)
   tabs / new [url] / switch <N> / close [N]
                           多 tab 管理 (人类浏览器的核心能力)
+  frames / frame <name> / to-top
+                          iframe 切换 (现代网页大量嵌入)
   wait text|ref|url X [ms]
                           智能等待 (默认 10s); 比 sleep 稳
 
@@ -507,6 +509,36 @@ class REPLSession:
         except ValueError as e:
             return CommandResult(text=f"✗ {e}", error=True)
         return CommandResult(text=f"✗ 关闭 tab {idx if idx is not None else 'current'}; 剩余 {remaining}")
+
+    async def _cmd_frames(self, _cmd: Command) -> CommandResult:
+        """列出当前页的所有 frame (顶层 + iframe)."""
+        frames = await self.controller.list_frames()
+        if not frames:
+            return CommandResult(text="(no frames)")
+        lines = []
+        for f in frames:
+            marker = "*" if f["is_main"] else " "
+            url_disp = f["url"] if len(f["url"]) <= 60 else f["url"][:30] + "…" + f["url"][-27:]
+            lines.append(f"{marker} {f['name']:24s} {url_disp}")
+        return CommandResult(panel=Panel("\n".join(lines),
+                                          title=f"🪟 Frames ({len(frames)})",
+                                          border_style="cyan"))
+
+    async def _cmd_frame(self, cmd: Command) -> CommandResult:
+        """`frame <name_or_url>` — 切到该 frame (后续 click/type 走它)."""
+        target = cmd.arg(0)
+        if not target:
+            return CommandResult(text="用法: frame <name_or_url>  (或 'main'/'top' 回顶层)", error=True)
+        try:
+            result = await self.controller.switch_frame(target)
+        except ValueError as e:
+            return CommandResult(text=f"✗ {e}", error=True)
+        return CommandResult(text=f"→ frame {result['name']}: {result['url']}")
+
+    async def _cmd_to_top(self, _cmd: Command) -> CommandResult:
+        """回到顶层 frame (main)."""
+        await self.controller.to_top_frame()
+        return CommandResult(text="→ top frame")
 
     async def _cmd_note(self, cmd: Command) -> CommandResult:
         if not cmd.args:

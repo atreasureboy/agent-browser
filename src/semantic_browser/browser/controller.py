@@ -57,6 +57,7 @@ class BrowserController:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._active_idx: int = 0  # T7: 当前活跃 tab 在 self._pages 中的下标
+        self._frame = None  # T15: 当前活跃 FramePage; None = 顶层
 
     async def start(self) -> None:
         """启动浏览器。"""
@@ -233,11 +234,11 @@ class BrowserController:
 
         Returns True 找到了, False 超时。
         """
-        page = await self._ensure_page()
+        target = await self._active_page_or_frame()
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
         while asyncio.get_event_loop().time() < deadline:
             try:
-                count = await page.locator(in_selector).filter(has_text=text).count()
+                count = await target.locator(in_selector).filter(has_text=text).count()
                 if count > 0:
                     return True
             except Exception:
@@ -249,7 +250,7 @@ class BrowserController:
     async def wait_for_ref(self, ref: str, *, timeout_ms: int = 10000) -> bool:
         """轮询直到 ref 元素出现在 DOM 中 (可见也算, 但不强求 — 现代 SPA
         ref 元素可能在 viewport 外但仍可交互)。"""
-        page = await self._ensure_page()
+        target = await self._active_page_or_frame()
         selector = self._ref_to_selector(ref)
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
         while asyncio.get_event_loop().time() < deadline:
@@ -274,8 +275,8 @@ class BrowserController:
 
     async def screenshot(self, path: str | None = None) -> bytes:
         """截图。返回 PNG bytes，同时存到 path（如果给定）。"""
-        page = await self._ensure_page()
-        return await page.screenshot(path=path, full_page=False)
+        target = await self._active_page_or_frame()
+        return await target.screenshot(path=path, full_page=False)
 
     async def save_storage_state(self, path: str | None = None) -> str:
         """保存 cookies/localStorage 登录态，返回保存路径。"""
@@ -290,10 +291,10 @@ class BrowserController:
 
     async def click(self, ref: str) -> bool:
         """通过 @ref 点击元素。"""
-        page = await self._ensure_page()
+        target = await self._active_page_or_frame()
         try:
             selector = self._ref_to_selector(ref)
-            locator = page.locator(selector).first
+            locator = target.locator(selector).first
             await locator.scroll_into_view_if_needed(timeout=5000)
             await locator.click(timeout=5000)
             logger.info("Clicked ref=%s", ref)
@@ -304,10 +305,10 @@ class BrowserController:
 
     async def type_text(self, ref: str, text: str) -> bool:
         """通过 @ref 输入文本。"""
-        page = await self._ensure_page()
+        target = await self._active_page_or_frame()
         try:
             selector = self._ref_to_selector(ref)
-            locator = page.locator(selector).first
+            locator = target.locator(selector).first
             await locator.scroll_into_view_if_needed(timeout=5000)
             await locator.fill(text, timeout=5000)
             logger.info("Typed into ref=%s", ref)
@@ -338,10 +339,10 @@ class BrowserController:
 
         Returns {"ok": bool, "ref": str, "file_count": int, "error": Optional[str]}.
         """
-        page = await self._ensure_page()
+        target = await self._active_page_or_frame()
         try:
             selector = self._ref_to_selector(ref)
-            locator = page.locator(selector).first
+            locator = target.locator(selector).first
             await locator.scroll_into_view_if_needed(timeout=5000)
             await locator.set_input_files(paths, timeout=10000)
             logger.info("Set files ref=%s: %d files", ref, len(paths))
@@ -417,9 +418,9 @@ class BrowserController:
         return await page.title()
 
     async def get_content(self) -> str:
-        """获取页面 HTML。"""
-        page = await self._ensure_page()
-        return await page.content()
+        """获取页面 (或当前 frame) 的 HTML。"""
+        target = await self._active_page_or_frame()
+        return await target.content()
 
     async def get_aria_snapshot(self) -> str:
         """
@@ -474,6 +475,66 @@ class BrowserController:
     @property
     def current_page(self) -> Optional[Page]:
         return self._page
+
+    # ── T15: Frame (iframe) 支持 ─────────────────────────────
+
+    @property
+    def active_frame(self) -> Optional[Page]:
+        """当前活跃的 frame (page 或 frame_page); 默认 = current_page."""
+        return self._page  # 初始 = 顶层 page
+
+    async def list_frames(self) -> list[dict[str, Any]]:
+        """T15: 列出所有 frame (顶层 + 所有 iframe).
+
+        Returns [{"name": "main", "url": "...", "is_main": True},
+                 {"name": "iframe[name=foo]", "url": "...", "is_main": False}, ...]
+        """
+        page = await self._ensure_page()
+        out = [{"name": "main", "url": page.url, "is_main": True}]
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            out.append({
+                "name": f"frame[{frame.name or '(unnamed)'}]",
+                "url": frame.url,
+                "is_main": False,
+            })
+        return out
+
+    async def switch_frame(self, name_or_url: str) -> dict[str, Any]:
+        """T15: 切换活跃 frame (按 name substring 或 url substring 匹配).
+
+        设置 _frame 后, 所有 click/type/snapshot/wait 都作用在该 frame 上。
+        Returns {"name", "url"} or raises ValueError if not found.
+        """
+        page = await self._ensure_page()
+        # 主 frame 用特殊 key
+        if name_or_url in ("main", "top"):
+            self._frame = None
+            return {"name": "main", "url": page.url}
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            if (frame.name and name_or_url in frame.name) or name_or_url in frame.url:
+                self._frame = frame
+                logger.info("Switched to frame: %s (%s)", frame.name, frame.url)
+                return {"name": frame.name, "url": frame.url}
+        raise ValueError(f"frame not found: {name_or_url!r}; try one of {[f['name'] for f in await self.list_frames()]}")
+
+    async def to_top_frame(self) -> None:
+        """T15: 回到顶层 frame."""
+        self._frame = None
+
+    async def _active_page_or_frame(self) -> Any:
+        """返回当前活跃 page (或 frame 替身). Frame 也实现了 page-like 接口
+        (locator, click, fill, set_input_files, screenshot 等),
+        所以 click/type/snapshot/wait 等操作都可以路由到 frame.
+
+        若 frame 已设, 直接返回 frame (避免无谓 page 初始化).
+        """
+        if self._frame is not None:
+            return self._frame
+        return await self._ensure_page()
 
     # ── T12: 通用 retry ─────────────────────────────────────────────
 

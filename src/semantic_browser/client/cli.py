@@ -946,9 +946,11 @@ def run_workflow(ctx, workflow_file, json_out):
               help="禁用失败时自动 dump diagnostics")
 @click.option("--dry-run", is_flag=True,
               help="T29: 只生成 plan 不执行 (用户先看再决定)")
+@click.option("--stream", is_flag=True,
+              help="T31: 实时流式输出每步 (需要在同一台机器跑 daemon)")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, dry_run, json_out):
+def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, dry_run, stream, json_out):
     """T21 + T26: LLM-driven autonomous loop — 给个目标, agent 自主完成.
 
     \b
@@ -988,6 +990,9 @@ def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics,
     }
     if start_url:
         body["start_url"] = start_url
+    # T31: --stream 实时打印每步 (回调通过 SSE-like 增量在 daemon 端)
+    if stream:
+        body["stream"] = True
     data = _request("POST", "/agent/run", body, base=ctx.obj["base"])
     if json_out:
         _print(data, json_out=True)

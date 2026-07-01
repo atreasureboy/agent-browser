@@ -3382,3 +3382,126 @@ class TestGoalAgentPlanDryRun:
         result = asyncio.run(agent.plan("anything"))
         assert "RuntimeError" in result.get("error", "")
         assert result["plan"] == []
+
+
+class TestGoalAgentStreaming:
+    """T31: on_step 回调 — 流式进度."""
+
+    def test_on_step_called_for_each_action(self):
+        """每步完成后调 on_step(record)."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        decisions = [
+            {"thought": "open", "action": "open", "args": {"url": "https://x.com"}},
+            {"thought": "done", "action": "done", "args": {"answer": "ok"}},
+        ]
+        async def fake_ask(goal, snap):
+            return decisions.pop(0)
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "")
+        async def fake_execute(action, args):
+            return True, ""
+
+        captured: list = []
+        def on_step_sync(record):
+            captured.append((record.step, record.action, record.success))
+        async def on_step_async(record):
+            captured.append((record.step, record.action, record.success, "async"))
+
+        # 测同步回调 (没 await)
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                          use_memory=False, on_step=on_step_sync)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+        agent._execute_action = fake_execute  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.run("anything"))
+        assert result.success is True
+        # 2 步都触发回调 (open + done)
+        assert len(captured) == 2
+        assert captured[0] == (1, "open", True)
+        assert captured[1] == (2, "done", True)
+
+    def test_async_on_step_awaited(self):
+        """async on_step 也会被 await."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_ask(goal, snap):
+            return {"thought": "x", "action": "done", "args": {"answer": "ok"}}
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "")
+
+        events: list = []
+        async def on_step_async(record):
+            await asyncio.sleep(0)  # 真 await
+            events.append(record.action)
+
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                          use_memory=False, on_step=on_step_async)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        asyncio.run(agent.run("anything"))
+        assert events == ["done"]
+
+    def test_on_step_exception_does_not_crash(self):
+        """on_step 抛异常不能打断 agent 主循环."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_ask(goal, snap):
+            return {"thought": "x", "action": "done", "args": {"answer": "ok"}}
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "")
+
+        def bad_callback(record):
+            raise RuntimeError("user code bad")
+
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                          use_memory=False, on_step=bad_callback)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        # 不应该因为 callback 抛异常而 crash
+        result = asyncio.run(agent.run("anything"))
+        assert result.success is True
+
+    def test_no_callback_when_not_provided(self):
+        """on_step=None → 不调任何回调 (默认行为)."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_ask(goal, snap):
+            return {"thought": "x", "action": "done", "args": {"answer": "ok"}}
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "")
+
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5, use_memory=False)
+        assert agent.on_step is None
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.run("anything"))
+        assert result.success is True

@@ -551,18 +551,37 @@ class TransparentBrowserDaemon:
 
     async def _run_agent(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.agent import GoalAgent
+        # T31: 流式输出 — 把每步写到 SSE-like 行缓冲 (daemon 客户端按行读)
+        progress_log: list[dict[str, Any]] = []
+        async def on_step(record):
+            entry = {
+                "step": record.step, "action": record.action,
+                "args": record.args, "success": record.success,
+                "error": record.error,
+            }
+            progress_log.append(entry)
+            # 写到 stderr (如果 stream=True) — 不影响 HTTP 响应体
+            if args.get("stream"):
+                import sys
+                print(f"[step {record.step}] {record.action} "
+                      f"{'✓' if record.success else '✗'} {entry['args']}",
+                      file=sys.stderr, flush=True)
         agent = GoalAgent(
             self.owner.browser.controller,
             tier=args.get("tier", "smart"),
             max_steps=int(args.get("max_steps", 20)),
             use_smart_slicing=bool(args.get("use_smart_slicing", True)),
             use_failure_diagnostics=bool(args.get("use_failure_diagnostics", True)),
+            on_step=on_step,
         )
         result = await agent.run(
             goal=args["goal"],
             start_url=args.get("start_url") or None,
         )
-        return result.to_dict()
+        out = result.to_dict()
+        if args.get("stream"):
+            out["progress"] = progress_log  # 额外字段, 客户端可校验
+        return out
 
     async def _plan_agent(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.agent import GoalAgent

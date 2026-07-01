@@ -155,6 +155,8 @@ class GoalAgent:
         # T27: 跨 session goal memory. 默认开启.
         use_memory: bool = True,
         goal_memory: GoalMemory | None = None,
+        # T31: 流式进度回调 — 每步完成时调用 (StepRecord). 可传 async callable.
+        on_step: "Optional[callable]" = None,
     ) -> None:
         self.controller = controller
         if llm_service is None:
@@ -170,6 +172,7 @@ class GoalAgent:
         self.use_failure_diagnostics = use_failure_diagnostics
         self.use_memory = use_memory
         self.goal_memory = goal_memory or (GoalMemory() if use_memory else None)
+        self.on_step = on_step
         self.history: list[StepRecord] = []
         # T26: 失败诊断累积 (LLM 下一步看)
         self.last_failure_diag: Optional[str] = None
@@ -295,6 +298,17 @@ Return a JSON plan with at most {max_steps} steps."""
             "goal": goal,
         }
 
+    async def _emit_step(self, record: StepRecord) -> None:
+        """T31: 调 on_step 回调 (每步完成). 异常不打断 agent."""
+        if self.on_step is None:
+            return
+        try:
+            cb = self.on_step(record)
+            if hasattr(cb, "__await__"):
+                await cb
+        except Exception as e:
+            logger.warning("on_step callback raised: %s", e)
+
     async def _execute_action(self, action: str, args: dict[str, Any]) -> tuple[bool, str]:
         """执行 LLM 选的动作. Returns (success, error_or_output).
 
@@ -406,6 +420,7 @@ Return a JSON plan with at most {max_steps} steps."""
                     snapshot_excerpt=snapshot_excerpt[:200],
                 )
                 self.history.append(record)
+                await self._emit_step(record)
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
                     return GoalResult(
@@ -423,6 +438,7 @@ Return a JSON plan with at most {max_steps} steps."""
                     success=True, snapshot_excerpt=snapshot_excerpt[:200],
                 )
                 self.history.append(record)
+                await self._emit_step(record)
                 return GoalResult(
                     goal=goal, success=True, answer=answer,
                     steps=self.history, total_steps=len(self.history),
@@ -439,6 +455,7 @@ Return a JSON plan with at most {max_steps} steps."""
             if action == "extract_text" and ok:
                 record.snapshot_excerpt = output[:300]
             self.history.append(record)
+            await self._emit_step(record)
 
             if ok:
                 consecutive_failures = 0

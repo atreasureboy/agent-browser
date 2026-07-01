@@ -215,6 +215,28 @@ asyncio.run(main())
 - ✅ 持久浏览器 daemon (`tb-daemon` HTTP server, 7/7 e2e 测试通过)
 - ✅ `--json-out` valid JSON (含 CJK / 转义符 / 嵌套数组)
 
+## 安全审计增强套件 (T40)
+
+给 agent / 安全审计工具用的站点情报扩展。所有工具都同时通过 MCP / CLI / daemon 三层暴露：
+
+```bash
+# T40a: 客户端存储探针 (local/session/cookies)
+tb storage
+# T40b: 隐藏路径探针 (well_known/discovery/admin)
+tb probe-paths https://example.com
+# T40c: HTML 注释提取 (含 shadow root)
+# T40d: URL 参数解析 (链接 + form action)
+# T40e: Frame inventory (depth/cross-origin/child_count)
+tb list-frames
+# T40f: CSP/HSTS/XFO 结构化
+tb security-headers https://example.com
+# T40g: 从 JS 提取 API endpoints (fetch/axios/XHR)
+tb extract-api-endpoints
+# T40h: Shadow DOM 穿透 (snapshot 递归)
+# T40i: WebSocket 连接监控
+tb websockets
+```
+
 ## 后续路线
 
 - [ ] MCP Server 封装（作为 Hermes MCP 插件）

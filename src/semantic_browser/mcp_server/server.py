@@ -98,6 +98,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({"name_or_url": {"type": "string"}}, ["name_or_url"])},
     {"name": "sb_extract_api_endpoints", "description": "T40g: 从页面 JS 中提取 API endpoints (fetch/axios/XHR 模式).",
      "inputSchema": _schema({})},
+    {"name": "sb_extract_js_libraries", "description": "T42b: 识别页面 JS 库 (jQuery/React/Vue/...) + 版本 + 已知 CVE.",
+     "inputSchema": _schema({})},
+    {"name": "sb_detect_graphql", "description": "T42g: 给定 endpoint URL, 跑 GraphQL introspection query dump schema.",
+     "inputSchema": _schema({"endpoint": {"type": "string"}}, ["endpoint"])},
     {"name": "sb_get_websockets", "description": "T40i: 返回当前累积的 WebSocket 连接列表 (wss:// URLs).",
      "inputSchema": _schema({"limit": {"type": "integer"}})},
 ]
@@ -319,6 +323,12 @@ class MCPServer:
         if name == "sb_extract_api_endpoints":
             engine = await self._ensure_started()
             return await engine.controller.extract_api_endpoints()
+        if name == "sb_extract_js_libraries":
+            engine = await self._ensure_started()
+            return await engine.controller.extract_js_libraries()
+        if name == "sb_detect_graphql":
+            engine = await self._ensure_started()
+            return await engine.controller.detect_graphql(args["endpoint"])
         if name == "sb_get_websockets":
             engine = await self._ensure_started()
             return engine.controller.get_websockets(limit=int(args.get("limit", 100)))

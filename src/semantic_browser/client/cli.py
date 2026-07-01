@@ -567,10 +567,10 @@ def debug_clear(ctx):
     _print(_request("POST", "/debug/clear", base=ctx.obj["base"]))
 
 
-@tb.command("storage")
+@tb.command("dump-storage")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def storage(ctx, json_out):
+def dump_storage(ctx, json_out):
     """T40a: 客户端存储探针 — localStorage/sessionStorage 全文 + cookies 字段."""
     _print(_request("GET", "/storage", base=ctx.obj["base"]), json_out=json_out)
 
@@ -588,11 +588,11 @@ def security_headers(ctx, url, json_out):
 @tb.command("probe-paths")
 @click.argument("url")
 @click.option("--categories", default="",
-              help="well_known,discovery,admin (逗号分隔; 空=全部)")
+              help="well_known,discovery,admin,debug (逗号分隔; 空=全部)")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
 def probe_paths(ctx, url, categories, json_out):
-    """T40b: 探测常见隐藏路径 (robots/sitemap/.well-known/admin/api)."""
+    """T40b: 探测常见隐藏路径 (robots/sitemap/.well-known/admin/api/debug/actuator)."""
     q = {"url": url}
     if categories:
         q["categories"] = categories
@@ -624,6 +624,25 @@ def extract_api_endpoints(ctx, json_out):
     """T40g: 从当前页面 JS 中提取 API endpoints (fetch/axios/XHR 模式)."""
     _print(_request("GET", "/extract-api-endpoints", base=ctx.obj["base"]),
            json_out=json_out)
+
+
+@tb.command("extract-js-libraries")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def extract_js_libraries(ctx, json_out):
+    """T42b: 识别页面 JS 库 (jQuery/React/Vue/...) + 版本 + 已知 CVE."""
+    _print(_request("GET", "/extract-js-libraries", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("detect-graphql")
+@click.argument("endpoint")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def detect_graphql(ctx, endpoint, json_out):
+    """T42g: 跑 GraphQL introspection query dump schema (types/queries/mutations)."""
+    _print(_request("GET", "/detect-graphql", {"endpoint": endpoint},
+                    base=ctx.obj["base"]), json_out=json_out)
 
 
 @tb.command("websockets")

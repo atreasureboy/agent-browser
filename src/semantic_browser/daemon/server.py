@@ -264,6 +264,19 @@ class TransparentBrowserDaemon:
             return self.owner.run(
                 self.owner.browser.controller.extract_api_endpoints()
             )
+        # T42b: JS 库版本 + CVE 识别
+        if method == "GET" and path == "/extract-js-libraries":
+            return self.owner.run(
+                self.owner.browser.controller.extract_js_libraries()
+            )
+        # T42g: GraphQL introspection
+        if method == "GET" and path == "/detect-graphql":
+            endpoint = args.get("endpoint", "")
+            if not endpoint:
+                raise ValueError("endpoint required")
+            return self.owner.run(
+                self.owner.browser.controller.detect_graphql(endpoint)
+            )
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)

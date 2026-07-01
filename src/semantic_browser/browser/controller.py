@@ -994,6 +994,250 @@ class BrowserController:
             "by_source": by_source,
         }
 
+    # ── T42b: JS library fingerprinting ────────────────────────
+
+    # 已知 JS 库 + 关键 CVE 表 — name → [(regex, version_group_index, [(max_vuln_ver, cve_id, desc)])]
+    # 客户端版本字符串通常出现在 URL: jquery-3.5.1.min.js, react@17.0.2.js, vue/2.6.14/vue.min.js
+    _JS_LIB_FINGERPRINTS: tuple[dict[str, Any], ...] = (
+        {
+            "name": "jQuery",
+            "patterns": (
+                r"jquery[/-](\d+\.\d+(?:\.\d+)?)",
+                r"jquery[.-](\d+\.\d+(?:\.\d+)?)",
+            ),
+            "cves": (
+                ("3.5.0", "CVE-2020-11022/CVE-2020-11023", "XSS via untrusted HTML passed to DOM manipulation methods"),
+                ("3.0.0", "CVE-2019-11358", "Prototype pollution in jQuery.extend"),
+                ("3.4.0", "CVE-2016-10706", "Prototype pollution via jQuery.uniqueSort"),
+            ),
+        },
+        {
+            "name": "AngularJS",
+            "patterns": (r"angular[/-](\d+\.\d+(?:\.\d+)?)",),
+            "cves": (
+                ("1.8.0", "CVE-2020-7676", "XSS in angular.copy"),
+            ),
+        },
+        {
+            "name": "Bootstrap",
+            "patterns": (r"bootstrap[/-](\d+\.\d+(?:\.\d+)?)",),
+            "cves": (
+                ("4.0.0", "CVE-2019-8331", "XSS in tooltip/popover data-template"),
+            ),
+        },
+        {
+            "name": "Lodash",
+            "patterns": (r"lodash[.-](\d+\.\d+(?:\.\d+)?)", r"lodash@(\d+\.\d+(?:\.\d+)?)"),
+            "cves": (
+                ("4.17.21", "CVE-2020-8203", "Prototype pollution in zipObjectDeep"),
+            ),
+        },
+        {
+            "name": "Moment.js",
+            "patterns": (r"moment[.-](\d+\.\d+(?:\.\d+)?)", r"moment[/-](\d+\.\d+(?:\.\d+)?)"),
+            "cves": (
+                ("2.29.0", "CVE-2022-24785", "Path traversal in moment.locale"),
+            ),
+        },
+        {
+            "name": "Vue.js",
+            "patterns": (r"vue[/@](\d+\.\d+(?:\.\d+)?)", r"vue[.-](\d+\.\d+(?:\.\d+)?)"),
+            "cves": (),
+        },
+        {
+            "name": "React",
+            "patterns": (r"react[/@](\d+\.\d+(?:\.\d+)?)", r"react[.-](\d+\.\d+(?:\.\d+)?)"),
+            "cves": (),
+        },
+        {
+            "name": "Backbone.js",
+            "patterns": (r"backbone[.-](\d+\.\d+(?:\.\d+)?)",),
+            "cves": (),
+        },
+        {
+            "name": "Handlebars",
+            "patterns": (r"handlebars[.-](\d+\.\d+(?:\.\d+)?)", r"handlebars[/-]v?(\d+\.\d+(?:\.\d+)?)"),
+            "cves": (
+                ("4.3.0", "CVE-2019-19919", "Arbitrary code execution via lookup helper"),
+                ("4.0.14", "CVE-2017-16016", "XSS via templates"),
+            ),
+        },
+        {
+            "name": "axios",
+            "patterns": (r"axios[.-](\d+\.\d+(?:\.\d+)?)", r"axios[/@](\d+\.\d+(?:\.\d+)?)"),
+            "cves": (),
+        },
+    )
+
+    async def extract_js_libraries(
+        self,
+        *,
+        max_scripts: int = 30,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """T42b: 从 <script src> URL 中识别 JS 库 + 版本 + 已知 CVE.
+
+        流程:
+          1. 收集所有 <script src=...> URLs
+          2. 对每个 URL 用 _JS_LIB_FINGERPRINTS 里的 regex 扫
+          3. 命中后解析版本, 对照已知 CVE 表 (用 < 字符串比对)
+          4. 多个 URL 命中同一 lib 只保留版本最高的
+
+        Returns {
+          "page_url", "scripts_scanned", "scripts_failed",
+          "libraries": [
+            {"name", "version", "urls": [...], "cves": [{id, max_version, desc}]}
+          ],
+          "vulnerable_count": int  # 有 known CVE 的 lib 数
+        }
+        """
+        import re
+        from urllib.parse import urljoin
+        import httpx
+
+        def _vuln_to_cve_entry(threshold: str, cve_id: str, desc: str) -> dict[str, str]:
+            return {"max_vuln_version": threshold, "id": cve_id, "desc": desc}
+
+        page = await self._ensure_page()
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            return out;
+        }""")
+        scripts = scripts[:max_scripts]
+        page_url = page.url
+        abs_urls = [urljoin(page_url, s) for s in scripts if s]
+
+        # 收集所有 URL 文本 (script src 字符串 + 未来可能 fetch 源码)
+        url_corpus = "\n".join(abs_urls)
+        scripts_scanned = len(abs_urls)
+        scripts_failed = 0
+
+        # 解析 lib 命中
+        lib_hits: dict[str, dict[str, Any]] = {}
+        for fp in self._JS_LIB_FINGERPRINTS:
+            name = fp["name"]
+            for pat in fp["patterns"]:
+                for m in re.finditer(pat, url_corpus, re.IGNORECASE):
+                    ver = m.group(1)
+                    hit = lib_hits.setdefault(name, {
+                        "name": name,
+                        "_versions": {},  # ver -> [urls]
+                        "cves": [],
+                    })
+                    hit["_versions"].setdefault(ver, set()).add(abs_urls[0] if not abs_urls else "")
+                    # 找到对应的 url — 用 match.start() 反推
+                    for u in abs_urls:
+                        if m.group(0) in u:
+                            hit["_versions"][ver].add(u)
+                            break
+
+        # 计算 CVE
+        libraries_out = []
+        vulnerable_count = 0
+        for name, hit in lib_hits.items():
+            fp = next((f for f in self._JS_LIB_FINGERPRINTS if f["name"] == name), None)
+            if not fp:
+                continue
+            # 选最高版本
+            best_ver = max(hit["_versions"].keys(), key=lambda v: tuple(int(x) for x in v.split(".")))
+            # 选最 representative url (出现次数最多)
+            best_urls = sorted(hit["_versions"][best_ver])
+            cves: list[dict[str, str]] = []
+            for threshold, cve_id, desc in fp["cves"]:
+                if _version_lt(best_ver, threshold):
+                    cves.append(_vuln_to_cve_entry(threshold, cve_id, desc))
+            if cves:
+                vulnerable_count += 1
+            libraries_out.append({
+                "name": name,
+                "version": best_ver,
+                "urls": best_urls[:5],
+                "cves": cves,
+            })
+        libraries_out.sort(key=lambda x: x["name"])
+
+        return {
+            "page_url": page_url,
+            "scripts_scanned": scripts_scanned,
+            "scripts_failed": scripts_failed,
+            "library_count": len(libraries_out),
+            "libraries": libraries_out,
+            "vulnerable_count": vulnerable_count,
+        }
+
+    # ── T42g: GraphQL introspection ────────────────────────────
+
+    async def detect_graphql(
+        self,
+        endpoint: str,
+        *,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """T42g: 给定 GraphQL 端点 URL, 跑 introspection query dump schema.
+
+        经典 introspection:
+          {
+            __schema {
+              queryType { name }
+              mutationType { name }
+              types { name kind }
+            }
+          }
+
+        Returns {
+          "endpoint", "is_graphql": bool, "error": str or None,
+          "query_type": str or None, "mutation_type": str or None,
+          "types": [str, ...]   # 所有 type name
+          "type_count": int,
+        }
+        """
+        import httpx
+        introspection = {
+            "query": (
+                "{ __schema { queryType { name } mutationType { name } "
+                "types { name kind } } }"
+            )
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_ms / 1000,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "semantic-browser-probe/1.0",
+                    "Accept": "application/json",
+                },
+            ) as client:
+                r = await client.post(endpoint, json=introspection)
+            if r.status_code >= 400:
+                return {"endpoint": endpoint, "is_graphql": False,
+                        "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            try:
+                data = r.json()
+            except Exception as e:
+                return {"endpoint": endpoint, "is_graphql": False,
+                        "error": f"non-JSON response: {e}"}
+            if "data" not in data or "__schema" not in data.get("data", {}):
+                return {"endpoint": endpoint, "is_graphql": False,
+                        "error": "response missing __schema (likely not GraphQL)"}
+            schema = data["data"]["__schema"]
+            types = [t["name"] for t in schema.get("types", []) if not t["name"].startswith("__")]
+            return {
+                "endpoint": endpoint,
+                "is_graphql": True,
+                "error": None,
+                "query_type": (schema.get("queryType") or {}).get("name"),
+                "mutation_type": (schema.get("mutationType") or {}).get("name"),
+                "types": sorted(types),
+                "type_count": len(types),
+            }
+        except Exception as e:
+            return {"endpoint": endpoint, "is_graphql": False,
+                    "error": f"{type(e).__name__}: {e}"}
+
     # ── T40a: 客户端存储 ─────────────────────────────────
 
     async def get_storage(self) -> dict[str, Any]:
@@ -1103,6 +1347,19 @@ class BrowserController:
             if sc else []
         )
 
+        # T42c: CORS 风险评估
+        cors_origin = raw.get("access-control-allow-origin")
+        cors_creds = raw.get("access-control-allow-credentials", "").lower() == "true"
+        out["cors"] = {
+            "allow_origin": cors_origin,
+            "allow_credentials": cors_creds,
+            "allow_methods": raw.get("access-control-allow-methods"),
+            "allow_headers": raw.get("access-control-allow-headers"),
+            "expose_headers": raw.get("access-control-expose-headers"),
+            "max_age": raw.get("access-control-max-age"),
+            "risk": _assess_cors_risk(cors_origin, cors_creds),
+        }
+
         # 简易评分 (安全头覆盖度)
         score = 0
         if out["csp"]:               score += 2
@@ -1164,6 +1421,50 @@ class BrowserController:
         "/server-status",
         "/.htaccess",
     )
+    # T42f: devops / debug / actuator 端点 (Spring Boot Actuator / Flask debug / Django / PHP)
+    _DEBUG_PATHS: tuple[str, ...] = (
+        "/debug",
+        "/debug/vars",
+        "/debug/pprof",
+        "/trace",
+        "/actuator",
+        "/actuator/env",
+        "/actuator/health",
+        "/actuator/info",
+        "/actuator/metrics",
+        "/actuator/beans",
+        "/actuator/mappings",
+        "/actuator/configprops",
+        "/actuator/heapdump",
+        "/actuator/threaddump",
+        "/actuator/loggers",
+        "/env",
+        "/info",
+        "/health",
+        "/metrics",
+        "/_debug",
+        "/__debug__",
+        "/_profiler",
+        "/phpinfo.php",
+        "/server-info",
+        "/status",
+        "/.env.production",
+        "/.env.local",
+        "/config",
+        "/configuration",
+        "/swagger",
+        "/swagger-ui.html",
+        "/swagger-ui/",
+        "/v1/api-docs",
+        "/v2/api-docs",
+        "/v3/api-docs",
+        "/openapi.json",
+        "/openapi.yaml",
+        "/api-docs",
+        "/redoc",
+        "/graphiql",
+        "/playground",
+    )
 
     async def probe_paths(
         self,
@@ -1204,7 +1505,7 @@ class BrowserController:
         parsed = urlparse(base_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        wanted_cats = categories or ["well_known", "discovery", "admin"]
+        wanted_cats = categories or ["well_known", "discovery", "admin", "debug"]
         all_paths: list[tuple[str, str]] = []
         if "well_known" in wanted_cats:
             all_paths += [("well_known", p) for p in self._WELL_KNOWN_PATHS]
@@ -1212,13 +1513,50 @@ class BrowserController:
             all_paths += [("discovery", p) for p in self._DISCOVERY_PATHS]
         if "admin" in wanted_cats:
             all_paths += [("admin", p) for p in self._ADMIN_PATHS]
+        if "debug" in wanted_cats:  # T42f
+            all_paths += [("debug", p) for p in self._DEBUG_PATHS]
 
         sem = asyncio.Semaphore(max_concurrency)
         found: list[dict[str, Any]] = []
         missing: list[dict[str, Any]] = []
+        soft_404_count = 0  # T42e
         t0 = _time.monotonic()
 
+        # T42e: 第一次先拿一个肯定不存在的 path, 用它的 body length 作 soft-404 baseline.
+        baseline_size: int | None = None
+        baseline_has_404: bool = False
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_ms / 1000,
+                follow_redirects=False,
+                headers={"User-Agent": "semantic-browser-probe/1.0"},
+            ) as client:
+                r = await client.get(origin + "/zzz-sb-probe-nonexistent-zzz")
+                baseline_size = len(r.content)
+                baseline_has_404 = (r.status_code == 200 and (
+                    "404" in r.text[:5000].lower() or
+                    "not found" in r.text[:5000].lower() or
+                    "page not found" in r.text[:5000].lower()
+                ))
+        except Exception:
+            pass
+
+        def _is_soft_404(content: bytes, status: int) -> bool:
+            """T42e: 检测 soft-404 — 200 但内容是 404 页.
+            启发式: 内容很短 (<= baseline+10%) 且包含 '404'/'not found' 关键字.
+            """
+            if status != 200 or baseline_size is None:
+                return False
+            size = len(content)
+            # 体积异常小 (与 baseline 几乎一致, 误差 < 10%)
+            if baseline_size > 0 and abs(size - baseline_size) < max(50, baseline_size * 0.10):
+                text = content[:5000].decode("utf-8", errors="ignore").lower()
+                if "404" in text or "not found" in text or "page not found" in text:
+                    return True
+            return False
+
         async def _probe_one(cat: str, path: str) -> None:
+            nonlocal soft_404_count
             url = origin + path
             try:
                 async with sem:
@@ -1240,6 +1578,10 @@ class BrowserController:
                     entry["size"] = len(r.content)
                     if 300 <= status < 400:
                         entry["redirect"] = r.headers.get("location", "")
+                    # T42e: soft-404 标记
+                    if status == 200 and _is_soft_404(r.content, status):
+                        entry["soft_404"] = True
+                        soft_404_count += 1
                     found.append(entry)
                 else:
                     missing.append({"path": path, "category": cat, "status": status})
@@ -1257,6 +1599,7 @@ class BrowserController:
             "found": sorted(found, key=lambda x: (x["category"], x["path"])),
             "missing": sorted(missing, key=lambda x: (x["category"], x["path"])),
             "total_probed": len(all_paths),
+            "soft_404_count": soft_404_count,  # T42e
             "duration_ms": int((_time.monotonic() - t0) * 1000),
         }
 
@@ -1829,3 +2172,38 @@ class BrowserController:
         # 不会到这里 (最后那次若失败会 raise), 但类型检查器要 unbind
         assert last_exc is not None
         raise last_exc
+
+
+# ── T42c: CORS 风险评估 (module-level helper) ─────────────
+
+def _assess_cors_risk(allow_origin: str | None, allow_credentials: bool) -> str:
+    """CORS misconfig 风险分级 — pen-tester 第一眼看.
+
+    high:   ACAO=* + credentials=true — 浏览器实际会拒绝, 但说明后端配置混乱 / 可能绕过
+    medium: ACAO=* (无 credentials) — 任意 origin 可读 (取决于 content 敏感性)
+    low:    ACAO 是具体 origin (e.g. https://app.example.com) — 正常情况
+    none:   没有 ACAO 头 — 浏览器 same-origin 保护
+    """
+    if not allow_origin:
+        return "none"
+    if allow_origin == "*":
+        return "high" if allow_credentials else "medium"
+    if allow_origin == "null":
+        return "high"  # null origin + 沙箱文件 / data: URI 是攻击向量
+    return "low"
+
+
+# ── T42b: 版本号比较 (module-level helper) ─────────────
+
+def _version_lt(a: str, b: str) -> bool:
+    """简单 semver-like 比较: a < b ? True."""
+    try:
+        ap = tuple(int(x) for x in a.split("."))
+        bp = tuple(int(x) for x in b.split("."))
+        while len(ap) < len(bp):
+            ap = ap + (0,)
+        while len(bp) < len(ap):
+            bp = bp + (0,)
+        return ap < bp
+    except Exception:
+        return False

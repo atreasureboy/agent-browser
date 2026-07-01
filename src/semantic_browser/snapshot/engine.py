@@ -34,7 +34,7 @@ class LinkInfo:
 class ControlInfo:
     """可操作控件。"""
     ref: str
-    kind: str  # button, textbox, searchbox, select, checkbox, link, textarea, tab, menuitem
+    kind: str  # button, textbox, searchbox, select, checkbox, link, textarea, tab, menuitem, hidden, file_upload
     label: str
     placeholder: str = ""
     role: str = ""
@@ -49,6 +49,34 @@ class ControlInfo:
     form_params: dict[str, str] = field(default_factory=dict)
     raw_attrs: dict[str, str] = field(default_factory=dict)  # deep 模式: 所有 HTML 属性
     outer_html: str = ""      # deep 模式: 元素 outerHTML (截断到 500 字符)
+    # T42a: hidden 字段的 value (CSRF token / _token / state 等). 默认空 (非 hidden 时无意义).
+    value: str = ""
+    # T42h: <input type=file> 的 accept / multiple (上传限制, 安全审计关键).
+    accept: str = ""
+    multiple: bool = False
+
+
+@dataclass
+class FormInfo:
+    """T42a: 表单元数据 — 字段汇总 + 分类 + 隐藏字段全集.
+
+    classification 推断:
+      - "login"    — 出现 password 字段 + username/email 字段
+      - "search"   — 出现 search 类型或 name 含 q/query/search
+      - "upload"   — 出现 type=file 字段 (enctype=multipart/form-data)
+      - "signup"   — 出现 password + password confirmation
+      - "contact"  — 出现 textarea + email 字段
+      - "checkout" — 出现信用卡/地址/cvv 字段
+      - "unknown"  — 其它
+    """
+    form_id: str = ""           # <form id="...">
+    action: str = ""            # 截断到 200 字符
+    method: str = ""            # get/post (默认 get)
+    enctype: str = ""           # multipart/form-data / application/x-www-form-urlencoded
+    field_count: int = 0
+    hidden_fields: list[dict[str, str]] = field(default_factory=list)  # [{name, value, type}]
+    input_names: list[str] = field(default_factory=list)              # 所有 input/select/textarea name
+    classification: str = "unknown"
 
 
 @dataclass
@@ -57,6 +85,11 @@ class ScriptInfo:
     src: str = ""            # <script src="..."> 绝对 URL
     inline: str = ""         # 内联 JS 内容 (deep 模式, 截断)
     has_src: bool = False
+    # T42d: SRI (Subresource Integrity) 检查
+    has_integrity: bool = False
+    integrity_hash: str = ""  # 截断到 100 字符
+    # T42d: mixed content 检查 (HTTPS 页面加载 HTTP subresource)
+    is_mixed_content: bool = False
 
 
 @dataclass
@@ -85,6 +118,8 @@ class PageSnapshot:
     detail_level: str = "normal"
     # T40c: HTML 注释 — 安全审计 (TODO/FIXME/凭据泄漏常见)
     comments: list[str] = field(default_factory=list)
+    # T42a: form 分类 + 隐藏字段全集 — agent 登录 / 提交表单 / 找 CSRF 必需.
+    forms: list[FormInfo] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -101,7 +136,28 @@ class PageSnapshot:
             f"Type:  {self.page_type}",
             f"Blocks: {len(self.text_blocks)} | Links: {len(self.links)} | Controls: {len(self.controls)}",
         ]
+        # T42d: SRI / mixed content summary
+        ext = self.sri_summary()
+        if ext:
+            lines.append(ext)
         return "\n".join(lines)
+
+    def sri_summary(self) -> str:
+        """T42d: SRI coverage + mixed content 摘要.
+        返回: "SRI: 2/3 (66.7%) | Mixed: 1 (http://cdn.example.com/script.js)" 或空字符串.
+        """
+        external = [s for s in self.scripts if s.has_src]
+        if not external:
+            return ""
+        with_sri = sum(1 for s in external if s.has_integrity)
+        mixed = [s.src for s in external if s.is_mixed_content]
+        total = len(external)
+        pct = (with_sri / total * 100) if total else 0
+        result = f"SRI: {with_sri}/{total} ({pct:.1f}%)"
+        if mixed:
+            sample = ", ".join(mixed[:3])
+            result += f" | Mixed: {len(mixed)} ({sample})"
+        return result
 
 
 class SnapshotEngine:
@@ -143,7 +199,7 @@ class SnapshotEngine:
 
         meta = await self._extract_meta()
         text_blocks = await self._extract_text_blocks()
-        links, controls = await self._extract_interactive(base_url or url, detail_level)
+        links, controls, forms = await self._extract_interactive(base_url or url, detail_level)
         raw_aria = await self._get_raw_aria()
         scripts = await self._extract_scripts(detail_level)
         comments = await self._extract_comments()       # T40c
@@ -157,6 +213,7 @@ class SnapshotEngine:
             controls=controls,
             scripts=scripts,
             comments=comments,
+            forms=forms,                                 # T42a
             detail_level=detail_level,
             meta=meta,
             raw_aria=raw_aria,
@@ -212,7 +269,7 @@ class SnapshotEngine:
             for b in raw
         ]
 
-    async def _extract_interactive(self, base_url: str, detail_level: str = "normal") -> tuple[list[LinkInfo], list[ControlInfo]]:
+    async def _extract_interactive(self, base_url: str, detail_level: str = "normal") -> tuple[list[LinkInfo], list[ControlInfo], list[FormInfo]]:
         """提取可操作元素并写入稳定 ref。
 
         Playwright Python 的 accessibility snapshot 不稳定携带 ref，
@@ -222,6 +279,8 @@ class SnapshotEngine:
         T39: 同时收集 form metadata (action/method/input_name) — default 模式.
               detail_level="deep" 时还填 raw_attrs + outerHTML.
         T40h: 穿透 shadow DOM (closed mode 除外) — 用 TreeWalker + 自定义 walk.
+        T42a: hidden 字段也抓 value (CSRF token 关键), 分类 form (login/search/upload/...).
+        T42h: <input type=file> 标 kind="file_upload" + accept/multiple 属性.
         """
         base_domain = urlparse(base_url).netloc
         raw = await self.page.evaluate(
@@ -229,6 +288,7 @@ class SnapshotEngine:
             const [baseDomain, deep] = args;
             const links = [];
             const controls = [];
+            const formsMap = new Map();
             const seenLinks = new Set();
             const controlSelector = [
                 'button', 'input', 'select', 'textarea',
@@ -239,20 +299,17 @@ class SnapshotEngine:
             ].join(', ');
 
             // T40h: 递归 walk — 穿透 shadow DOM (open 模式).
-            // closed shadow root 无法访问, 这是浏览器安全限制.
             const visit = (root, fn) => {
                 if (!root) return;
                 const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
                 let n = walker.currentNode || root;
                 while (n) {
                     fn(n);
-                    // 先遍历 light DOM, 再进入 shadow root (避免重复)
                     if (n.shadowRoot) {
                         visit(n.shadowRoot, fn);
                     }
                     n = walker.nextNode();
                 }
-                // 也遍历 root 自身 (walker.currentNode 默认不会触发 fn)
             };
 
             let idx = 0;
@@ -267,6 +324,37 @@ class SnapshotEngine:
             const visible = (el) => {
                 const style = window.getComputedStyle(el);
                 return style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            // T42a: 收集 form 数据 (按 form 自身的引用聚合)
+            const formKey = (f) => {
+                if (!f) return '__no_form__';
+                if (f.id) return 'id:' + f.id;
+                if (f.getAttribute('name')) return 'name:' + f.getAttribute('name');
+                return 'pos:' + Array.from(document.querySelectorAll('form')).indexOf(f);
+            };
+            const getOrInitForm = (f) => {
+                if (!f) return null;
+                const k = formKey(f);
+                if (!formsMap.has(k)) {
+                    formsMap.set(k, {
+                        form_id: f.id || '',
+                        action: (f.getAttribute('action') || '').substring(0, 200),
+                        method: (f.getAttribute('method') || 'get').toLowerCase(),
+                        enctype: f.getAttribute('enctype') || '',
+                        hidden_fields: [],
+                        input_names: [],
+                        field_count: 0,
+                        _has_password: false,
+                        _has_email: false,
+                        _has_textarea: false,
+                        _has_file: false,
+                        _has_credit: false,
+                        _has_address: false,
+                        _has_search_input: false,
+                        _has_password_confirm: false,
+                    });
+                }
+                return formsMap.get(k);
             };
 
             // T40h: 改 querySelectorAll 为递归 walk — shadow DOM 内 a[href] 也能拿到.
@@ -296,10 +384,42 @@ class SnapshotEngine:
 
             visit(document, (el) => {
                 if (!el.matches || !el.matches(controlSelector)) return;
-                if (!visible(el)) return;
                 const tag = el.tagName.toLowerCase();
                 const type = (el.getAttribute('type') || '').toLowerCase();
                 const role = el.getAttribute('role') || '';
+                const name = (el.getAttribute('name') || '').toLowerCase();
+
+                // T42a: hidden 字段不要求 visible — CSRF token 必须抓到, 即使 display:none
+                // 其它字段仍然要求 visible.
+                if (type !== 'hidden' && !visible(el)) return;
+
+                // T42a: form 元数据 + 字段类型聚合 (login/search/upload 分类用)
+                const formEl = el.closest('form');
+                const formInfo = getOrInitForm(formEl);
+                if (formInfo) {
+                    formInfo.field_count++;
+                    if (name) formInfo.input_names.push(name);
+                    if (tag === 'input' && type === 'password') formInfo._has_password = true;
+                    if (tag === 'input' && type === 'email') formInfo._has_email = true;
+                    if (tag === 'input' && type === 'file') formInfo._has_file = true;
+                    if (tag === 'input' && type === 'search') formInfo._has_search_input = true;
+                    if (name && /password.*confirm|confirm.*password|password2/.test(name)) {
+                        formInfo._has_password_confirm = true;
+                    }
+                    if (tag === 'textarea') formInfo._has_textarea = true;
+                    if (name && /(credit|card|cvv|ccv|cardnum)/.test(name)) formInfo._has_credit = true;
+                    if (name && /(address|zip|postal|street|city|state|country)/.test(name)) formInfo._has_address = true;
+                    if (name && /^(q|query|s|search|keyword)$/.test(name)) formInfo._has_search_input = true;
+                    // 收集 hidden 字段 — value 是关键 (CSRF token)
+                    if (type === 'hidden' && el.getAttribute('name')) {
+                        formInfo.hidden_fields.push({
+                            name: el.getAttribute('name'),
+                            value: (el.getAttribute('value') || '').substring(0, 500),
+                            type: 'hidden',
+                        });
+                    }
+                }
+
                 const label = (
                     el.getAttribute('aria-label') ||
                     el.getAttribute('placeholder') ||
@@ -310,13 +430,15 @@ class SnapshotEngine:
 
                 let kind = 'button';
                 if (tag === 'input') {
-                    kind = type === 'search' || role === 'searchbox' ? 'searchbox'
-                         : type === 'checkbox' ? 'checkbox'
-                         : type === 'radio' ? 'radio'
-                         : type === 'email' ? 'email'
-                         : type === 'password' ? 'password'
-                         : type === 'url' ? 'url'
-                         : 'textbox';
+                    if (type === 'hidden') kind = 'hidden';
+                    else if (type === 'search' || role === 'searchbox') kind = 'searchbox';
+                    else if (type === 'checkbox') kind = 'checkbox';
+                    else if (type === 'radio') kind = 'radio';
+                    else if (type === 'email') kind = 'email';
+                    else if (type === 'password') kind = 'password';
+                    else if (type === 'url') kind = 'url';
+                    else if (type === 'file') kind = 'file_upload';  // T42h
+                    else kind = 'textbox';
                 } else if (tag === 'select' || role === 'combobox' || role === 'listbox') {
                     kind = 'select';
                 } else if (tag === 'textarea') {
@@ -331,12 +453,11 @@ class SnapshotEngine:
                     kind = 'switch';
                 }
 
-                let form = el.closest('form');
                 let formAction = '', formMethod = '', formId = '', formParams = {};
-                if (form) {
-                    formAction = (form.getAttribute('action') || '').substring(0, 200);
-                    formMethod = (form.getAttribute('method') || 'get').toLowerCase();
-                    formId = form.getAttribute('id') || '';
+                if (formEl) {
+                    formAction = (formEl.getAttribute('action') || '').substring(0, 200);
+                    formMethod = (formEl.getAttribute('method') || 'get').toLowerCase();
+                    formId = formEl.getAttribute('id') || '';
                     if (formAction) {
                         try {
                             const formUrl = new URL(formAction, location.href);
@@ -368,9 +489,27 @@ class SnapshotEngine:
                     input_type: el.getAttribute('type') || '',
                     raw_attrs: rawAttrs,
                     outer_html: outerHtml,
+                    // T42a: hidden value (CSRF token)
+                    value: (el.getAttribute('value') || '').substring(0, 500),
+                    // T42h: file upload 限制
+                    accept: el.getAttribute('accept') || '',
+                    multiple: el.hasAttribute('multiple'),
                 });
             });
-            return {links, controls};
+            // T42a: form 分类
+            const forms = [];
+            for (const f of formsMap.values()) {
+                let classification = 'unknown';
+                if (f._has_password && f._has_password_confirm) classification = 'signup';
+                else if (f._has_password) classification = 'login';
+                else if (f._has_file) classification = 'upload';
+                else if (f._has_credit || f._has_address) classification = 'checkout';
+                else if (f._has_textarea && (f._has_email || /contact|message/.test(f.input_names.join(',')))) classification = 'contact';
+                else if (f._has_search_input || f.method === 'get' && f.input_names.some(n => /^(q|query|s|search|keyword)$/.test(n))) classification = 'search';
+                const { _has_password, _has_email, _has_textarea, _has_file, _has_credit, _has_address, _has_search_input, _has_password_confirm, ...rest } = f;
+                forms.push({...rest, classification});
+            }
+            return {links, controls, forms};
         }""", [base_domain, detail_level == "deep"])
 
         links = []
@@ -400,10 +539,28 @@ class SnapshotEngine:
                 input_type=c.get("input_type", ""),
                 raw_attrs=c.get("raw_attrs", {}),
                 outer_html=c.get("outer_html", ""),
+                # T42a: hidden value
+                value=c.get("value", ""),
+                # T42h: file upload 限制
+                accept=c.get("accept", ""),
+                multiple=c.get("multiple", False),
             )
             for c in raw.get("controls", [])
         ]
-        return links, controls
+        forms = [
+            FormInfo(
+                form_id=f.get("form_id", ""),
+                action=f.get("action", ""),
+                method=f.get("method", ""),
+                enctype=f.get("enctype", ""),
+                field_count=f.get("field_count", 0),
+                hidden_fields=f.get("hidden_fields", []),
+                input_names=f.get("input_names", []),
+                classification=f.get("classification", "unknown"),
+            )
+            for f in raw.get("forms", [])
+        ]
+        return links, controls, forms
 
     async def _get_raw_aria(self) -> str:
         """获取 Playwright aria snapshot 文本。"""
@@ -418,11 +575,13 @@ class SnapshotEngine:
         normal: 只列 src (让 agent 知道页面加载了哪些 JS — fingerprint 用).
         deep:   也抓 inline 源码 (deep 模式, agent 审计时开).
                 src 不抓内容 (太大), 让 agent 用 sb_get_script_source 单独按 URL 抓.
+        T42d: 同时收集 integrity 属性 (SRI) + 检查 mixed content (HTTPS 页面 HTTP 资源).
         """
         try:
             scripts_raw = await self.page.evaluate(
                 """(deep) => {
                     const out = [];
+                    const pageProto = location.protocol;
                     for (const s of document.querySelectorAll('script')) {
                         const src = s.getAttribute('src') || '';
                         const absSrc = src ? new URL(src, location.href).href : '';
@@ -430,7 +589,23 @@ class SnapshotEngine:
                         if (deep && !src) {
                             inline = (s.textContent || '').substring(0, 2000);
                         }
-                        out.push({src: absSrc, inline, has_src: !!src});
+                        // T42d: SRI
+                        const integrity = s.getAttribute('integrity') || '';
+                        // T42d: mixed content (HTTPS 页面加载 HTTP 脚本)
+                        let isMixed = false;
+                        if (pageProto === 'https:' && src) {
+                            try {
+                                isMixed = new URL(src, location.href).protocol === 'http:';
+                            } catch {}
+                        }
+                        out.push({
+                            src: absSrc,
+                            inline,
+                            has_src: !!src,
+                            has_integrity: !!integrity,
+                            integrity_hash: integrity.substring(0, 100),
+                            is_mixed_content: isMixed,
+                        });
                     }
                     return out;
                 }""",
@@ -441,6 +616,9 @@ class SnapshotEngine:
                     src=s.get("src", ""),
                     inline=s.get("inline", ""),
                     has_src=s.get("has_src", False),
+                    has_integrity=s.get("has_integrity", False),
+                    integrity_hash=s.get("integrity_hash", ""),
+                    is_mixed_content=s.get("is_mixed_content", False),
                 )
                 for s in scripts_raw
             ]

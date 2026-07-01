@@ -252,8 +252,19 @@ def rightclick(ctx, ref):
 @click.argument("to_ref")
 @click.pass_context
 def drag(ctx, from_ref, to_ref):
-    """T19: 拖拽 from_ref -> to_ref (HTML5 dnd 兼容 + 鼠标手势)."""
+    """T19+T28: 拖拽 from_ref -> to_ref (鼠标手势, 失败自动 HTML5 fallback)."""
     _print(_request("POST", "/drag",
+                    {"from_ref": from_ref, "to_ref": to_ref},
+                    base=ctx.obj["base"]))
+
+
+@tb.command("drag-html5")
+@click.argument("from_ref")
+@click.argument("to_ref")
+@click.pass_context
+def drag_html5(ctx, from_ref, to_ref):
+    """T28: 强制 HTML5 drag-and-drop (DataTransfer + dispatchEvent)."""
+    _print(_request("POST", "/drag/html5",
                     {"from_ref": from_ref, "to_ref": to_ref},
                     base=ctx.obj["base"]))
 

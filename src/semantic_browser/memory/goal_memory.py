@@ -57,7 +57,10 @@ class GoalMemory:
         mem.record(goal, result)
     """
 
-    def __init__(self, path: Path | str = DEFAULT_PATH) -> None:
+    def __init__(self, path: Path | str | None = None) -> None:
+        # 默认路径懒解析 (而不是在定义时) — 测试可 monkeypatch DEFAULT_PATH.
+        if path is None:
+            path = DEFAULT_PATH
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._entries: list[dict[str, Any]] = self._load()

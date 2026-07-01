@@ -36,6 +36,13 @@ def tmp_store(tmp_path):
     return MemoryStore(tmp_path / "test_memory.db")
 
 
+@pytest.fixture(autouse=True)
+def isolate_goal_memory(tmp_path, monkeypatch):
+    """把 GoalMemory 默认路径重定向到 tmp_path, 避免污染用户 home + 跨 session 误命中."""
+    import semantic_browser.memory.goal_memory as gm_mod
+    monkeypatch.setattr(gm_mod, "DEFAULT_PATH", tmp_path / "goal_memory.json")
+
+
 @pytest.fixture
 def classifier():
     return PageClassifier()
@@ -1475,6 +1482,84 @@ class TestActionPrimitives:
         ok = asyncio.run(ctrl.select_option("e8", ["us-east-1", "eu-west-1"]))
         assert ok is True
         assert captured["value"] == ["us-east-1", "eu-west-1"]
+
+    def test_drag_html5_dispatches_drag_events(self):
+        """T28: drag_html5() 用 DataTransfer + DragEvent 派发序列."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"evaluate_args": None, "evaluate_result": {"ok": True}}
+
+        class FakeFrame:
+            async def evaluate(self, script, arg):
+                captured["evaluate_args"] = (script, arg)
+                return captured["evaluate_result"]
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.drag_html5("e1", "e2"))
+        assert ok is True
+        # evaluate 收到 [from_sel, to_sel]
+        script, arg = captured["evaluate_args"]
+        assert arg == ['[data-sb-ref="e1"]', '[data-sb-ref="e2"]']
+        # 脚本里要构造 DataTransfer + dragstart/dragenter/dragover/drop/dragend
+        assert "DataTransfer" in script
+        assert "dragstart" in script
+        assert "drop" in script
+
+    def test_drag_html5_returns_false_on_missing_element(self):
+        """T28: 元素找不到时 evaluate 返回 {ok:false}, drag_html5 返回 False."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            async def evaluate(self, script, arg):
+                return {"ok": False, "error": "element not found"}
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.drag_html5("e1", "e2"))
+        assert ok is False
+
+    def test_drag_falls_back_to_html5_on_mouse_failure(self):
+        """T28: mouse 拖失败时 drag() 自动 fallback 到 drag_html5()."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        # mouse 拖时元素找不到 (bounding_box 返回 None)
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def bounding_box(self):
+                                return None  # 触发 RuntimeError
+                        return LL()
+                return FakeLocator()
+
+            async def evaluate(self, script, arg):
+                return {"ok": True}
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        ok = asyncio.run(ctrl.drag("e1", "e2"))
+        # mouse 失败 → 走 drag_html5 → 成功
+        assert ok is True
 
 
 class TestConsoleNetworkObservation:

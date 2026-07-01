@@ -483,9 +483,11 @@ class BrowserController:
             return False
 
     async def drag(self, from_ref: str, to_ref: str) -> bool:
-        """T19: 拖拽 from_ref 到 to_ref (人类拖文件 / 排序列表 / 移动卡片).
+        """T19 + T28: 拖拽 from_ref 到 to_ref. 鼠标手势 + HTML5 双策略.
 
-        HTML5 drag-and-drop + 鼠标手势都尝试, 用 mouse.down/move/up 兜底.
+        优先 mouse gesture (兼容 jQuery UI draggable, Sortable.js 老版本);
+        失败 fallback 到 HTML5 DataTransfer dispatch (React-dnd / 现代 dnd 库).
+        返回 True 表示任意一种方式触发了 drop event.
         """
         target = await self._active_page_or_frame()
         try:
@@ -510,10 +512,57 @@ class BrowserController:
             await target.mouse.move((sx + tx) / 2, (sy + ty) / 2, steps=10)
             await target.mouse.move(tx, ty, steps=10)
             await target.mouse.up()
-            logger.info("Dragged ref=%s -> ref=%s", from_ref, to_ref)
+            logger.info("Dragged (mouse) ref=%s -> ref=%s", from_ref, to_ref)
             return True
         except Exception as e:
-            logger.warning("Drag failed ref=%s->%s: %s", from_ref, to_ref, e)
+            logger.warning("Mouse drag failed ref=%s->%s: %s; trying HTML5", from_ref, to_ref, e)
+            return await self.drag_html5(from_ref, to_ref)
+
+    async def drag_html5(self, from_ref: str, to_ref: str) -> bool:
+        """T28: HTML5 drag-and-drop via DataTransfer + dispatchEvent.
+
+        解决 React-dnd / 现代 dnd 库对 mouse gesture 无响应的问题.
+        通过共享 DataTransfer 对象构造 dragstart → dragover → drop 序列.
+        """
+        target = await self._active_page_or_frame()
+        try:
+            from_sel = self._ref_to_selector(from_ref)
+            to_sel = self._ref_to_selector(to_ref)
+            # 在 page 上跑一段脚本: 用共享 DataTransfer 派发 dragstart/dragenter/dragover/drop
+            ok = await target.evaluate(
+                """([fromSel, toSel]) => {
+                    const from = document.querySelector(fromSel);
+                    const to = document.querySelector(toSel);
+                    if (!from || !to) return {ok: false, error: 'element not found'};
+                    const dt = new DataTransfer();
+                    const fire = (el, type) => {
+                        const r = el.getBoundingClientRect();
+                        const ev = new DragEvent(type, {
+                            bubbles: true, cancelable: true,
+                            dataTransfer: dt,
+                            clientX: r.left + r.width / 2,
+                            clientY: r.top + r.height / 2,
+                        });
+                        el.dispatchEvent(ev);
+                        return ev;
+                    };
+                    fire(from, 'dragstart');
+                    fire(to, 'dragenter');
+                    fire(to, 'dragover');
+                    fire(to, 'drop');
+                    fire(from, 'dragend');
+                    return {ok: true};
+                }""",
+                [from_sel, to_sel],
+            )
+            if isinstance(ok, dict) and ok.get("ok"):
+                logger.info("Dragged (html5) ref=%s -> ref=%s", from_ref, to_ref)
+                return True
+            err = ok.get("error") if isinstance(ok, dict) else "unknown"
+            logger.warning("HTML5 drag failed ref=%s->%s: %s", from_ref, to_ref, err)
+            return False
+        except Exception as e:
+            logger.warning("HTML5 drag exception ref=%s->%s: %s", from_ref, to_ref, e)
             return False
 
     async def select_option(self, ref: str, value: str | list[str]) -> bool:

@@ -149,6 +149,10 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._rightclick(args["ref"]))
         if method == "POST" and path == "/drag":
             return self.owner.run(self._drag(args["from_ref"], args["to_ref"]))
+        if method == "POST" and path == "/drag/html5":
+            return self.owner.run(self.owner.browser.controller.drag_html5(
+                args["from_ref"], args["to_ref"],
+            ))
         if method == "POST" and path == "/select-option":
             return self.owner.run(self._select_option(args["ref"], args["value"]))
         if method == "POST" and path == "/fill-form":

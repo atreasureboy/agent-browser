@@ -259,6 +259,8 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.type_into_active(
                 text, delay_ms=delay_ms,
             ))
+        if method == "POST" and path == "/agent/run":
+            return self.owner.run(self._run_agent(args))
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":
@@ -504,6 +506,18 @@ class TransparentBrowserDaemon:
         workflow = load_workflow(workflow_file)
         runner = WorkflowRunner(self.owner.browser.controller)
         result = await runner.run(workflow)
+        return result.to_dict()
+
+    async def _run_agent(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.agent import GoalAgent
+        agent = GoalAgent(
+            self.owner.browser.controller,
+            max_steps=int(args.get("max_steps", 20)),
+        )
+        result = await agent.run(
+            goal=args["goal"],
+            start_url=args.get("start_url") or None,
+        )
         return result.to_dict()
 
 

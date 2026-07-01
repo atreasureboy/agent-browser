@@ -887,6 +887,49 @@ def run_workflow(ctx, workflow_file, json_out):
            json_out=json_out)
 
 
+@tb.command("agent")
+@click.argument("goal")
+@click.option("--start-url", help="先打开这个 URL 再开始")
+@click.option("--max-steps", default=20, show_default=True,
+              help="最多步数 (LLM 决策循环)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def agent_cmd(ctx, goal, start_url, max_steps, json_out):
+    """T21: LLM-driven autonomous loop — 给个目标, agent 自主完成.
+
+    \b
+    需环境变量:
+      OPENAI_API_KEY  LLM API key
+      OPENAI_BASE_URL  API base URL (默认 https://api.deepseek.com/v1)
+      OPENAI_MODEL     模型名 (默认 deepseek-chat)
+
+    \b
+    Examples:
+      tb agent "find contact email" --start-url https://example.com
+      tb agent "搜 'deepseek' 并提取第一条结果的标题" --start-url https://www.google.com
+    """
+    body = {"goal": goal, "max_steps": max_steps}
+    if start_url:
+        body["start_url"] = start_url
+    data = _request("POST", "/agent/run", body, base=ctx.obj["base"])
+    if json_out:
+        _print(data, json_out=True)
+    else:
+        if data.get("success"):
+            click.echo(f"✓ 达成目标 (steps={data['total_steps']})")
+            if data.get("answer"):
+                click.echo(f"  答案: {data['answer']}")
+        else:
+            click.echo(f"✗ 未达成 (steps={data['total_steps']}): {data.get('reason','')}")
+        # 打印步骤轨迹
+        for s in data.get("steps", []):
+            mark = "✓" if s["success"] else "✗"
+            arg_str = json.dumps(s["args"], ensure_ascii=False)
+            click.echo(f"  [{s['step']}] {mark} {s['action']:12s} {arg_str}")
+            if s.get("thought"):
+                click.echo(f"      thought: {s['thought'][:80]}")
+
+
 def main():
     tb()
 

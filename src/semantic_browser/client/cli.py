@@ -212,6 +212,36 @@ def screenshot(ctx, path):
     _print(_request("POST", "/screenshot", {"path": path}, base=ctx.obj["base"]))
 
 
+@tb.command("annotated-screenshot")
+@click.argument("path", required=False)
+@click.option("--json-out", is_flag=True,
+              help="输出完整 JSON (含 png_base64 + sidecar). 默认只显示 sidecar + path.")
+@click.pass_context
+def annotated_screenshot(ctx, path, json_out):
+    """截图 + 在原图上叠加 ref 标签框 (T10). LLM 能直接看图 + 知道每个 ref 在哪。"""
+    data = _request("POST", "/screenshot/annotated", {"path": path}, base=ctx.obj["base"])
+    if json_out:
+        # full output, 包括 base64 PNG
+        import json as _json
+        click.echo(_json.dumps(data, ensure_ascii=False))
+    else:
+        # 不打印 base64 (太大), 只显示 sidecar 摘要
+        sidecar = data.get("sidecar", {})
+        click.echo(f"saved: {data.get('path')} ({data['bytes']} bytes)")
+        click.echo(f"  refs: {sidecar.get('visible_count', 0)}/{sidecar.get('ref_count', 0)} visible")
+        for r in sidecar.get("refs", [])[:8]:
+            click.echo(f"  [{r['ref']}] {r['kind']:8s} bbox={r['bbox']}  {r['label'][:40]}")
+        if sidecar.get("visible_count", 0) > 8:
+            click.echo(f"  ...and {sidecar['visible_count'] - 8} more")
+
+
+@tb.command("screenshot-sidecar")
+@click.pass_context
+def screenshot_sidecar(ctx):
+    """只要 ref 元素位置 JSON (不要 PNG), 供 LLM plan 行动。"""
+    _print(_request("POST", "/screenshot/sidecar", base=ctx.obj["base"]))
+
+
 @tb.group("state")
 def state_group():
     """Browser state commands."""

@@ -160,6 +160,12 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._forward())
         if method == "POST" and path == "/screenshot":
             return self.owner.run(self._screenshot(args.get("path")))
+        if method == "POST" and path == "/screenshot/annotated":
+            # 返回 PNG bytes (base64) + sidecar JSON
+            return self.owner.run(self._screenshot_annotated(args.get("path")))
+        if method == "POST" and path == "/screenshot/sidecar":
+            # 只要 sidecar (没 PNG), 给 LLM 用来 plan 操作
+            return self.owner.run(self._screenshot_sidecar())
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":
@@ -273,6 +279,52 @@ class TransparentBrowserDaemon:
     async def _screenshot(self, path: str | None) -> dict[str, Any]:
         data = await self.owner.browser.controller.screenshot(path=path)
         return {"path": path, "bytes": len(data)}
+
+    async def _screenshot_annotated(self, path: str | None) -> dict[str, Any]:
+        """带 ref 标签的截图: PNG base64 + sidecar (每个 ref 的 bbox+kind)."""
+        import base64
+        from semantic_browser.snapshot.annotate import (
+            collect_refs_from_page, annotate_screenshot,
+        )
+        page = self.owner.browser.controller.current_page
+        if page is None:
+            raise ValueError("no active page; call /open first")
+        png = await page.screenshot(path=path, full_page=False)
+        refs = collect_refs_from_page(page)
+        annotated, sidecar = annotate_screenshot(png, refs)
+        # 写文件 (如果指定了 path)
+        if path:
+            import os
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(annotated)
+        return {
+            "path": path,
+            "bytes": len(annotated),
+            "png_base64": base64.b64encode(annotated).decode("ascii"),
+            "sidecar": sidecar,
+        }
+
+    async def _screenshot_sidecar(self) -> dict[str, Any]:
+        """只拿 ref 元素位置信息 (不画图, 不传 PNG), 供 LLM plan."""
+        from semantic_browser.snapshot.annotate import collect_refs_from_page
+        page = self.owner.browser.controller.current_page
+        if page is None:
+            raise ValueError("no active page; call /open first")
+        refs = collect_refs_from_page(page)
+        sidecar = {
+            "image_size": [page.viewport_size["width"], page.viewport_size["height"]],
+            "ref_count": len(refs),
+            "visible_count": sum(1 for r in refs if r.visible),
+            "refs": [
+                {
+                    "ref": r.ref, "kind": r.kind, "label": r.label,
+                    "bbox": list(r.bbox),
+                }
+                for r in refs
+            ],
+        }
+        return sidecar
 
     async def _save_state(self, path: str | None) -> dict[str, Any]:
         saved = await self.owner.browser.save_storage_state(path)

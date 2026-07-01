@@ -5,6 +5,7 @@ Crawler 归一化/过滤逻辑, PageSnapshot 序列化, ClassificationResult。
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -767,3 +768,78 @@ class TestWorkflowRunner:
         r = await runner.run(wf)
         assert r.status == "completed"
         assert r.executed_steps == 3
+
+
+# ── T10: 标注截图 (PIL 操作, 不需 Playwright) ────────────────
+
+class TestAnnotatedScreenshot:
+    def _make_blank_png(self, w: int = 400, h: int = 300) -> bytes:
+        """生成一张简单空白 PNG (供 annotate 测试用)."""
+        from PIL import Image
+        img = Image.new("RGB", (w, h), (255, 255, 255))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+
+    def test_annotate_basic(self):
+        from semantic_browser.snapshot.annotate import annotate_screenshot, RefBox
+        png = self._make_blank_png(200, 200)
+        refs = [
+            RefBox(ref="e3", kind="link", label="Home", bbox=(10, 10, 80, 30), visible=True),
+            RefBox(ref="e4", kind="button", label="Submit", bbox=(10, 50, 80, 75), visible=True),
+        ]
+        annotated, sidecar = annotate_screenshot(png, refs)
+        assert isinstance(annotated, bytes) and len(annotated) > 100
+        assert sidecar["image_size"] == [200, 200]
+        assert sidecar["ref_count"] == 2
+        assert sidecar["visible_count"] == 2
+        assert sidecar["refs"][0]["ref"] == "e3"
+        assert sidecar["refs"][1]["kind"] == "button"
+        # bbox 应被原样保留
+        assert sidecar["refs"][0]["bbox"] == [10, 10, 80, 30]
+
+    def test_annotate_skips_tiny_elements(self):
+        from semantic_browser.snapshot.annotate import annotate_screenshot, RefBox
+        png = self._make_blank_png(100, 100)
+        refs = [
+            RefBox(ref="e1", kind="link", label="", bbox=(0, 0, 0, 0), visible=True),  # 0 像素
+            RefBox(ref="e2", kind="button", label="Big", bbox=(10, 10, 50, 40), visible=True),
+        ]
+        _, sidecar = annotate_screenshot(png, refs)
+        assert sidecar["visible_count"] == 1
+        assert sidecar["refs"][0]["ref"] == "e2"
+
+    def test_annotate_clamps_to_canvas(self):
+        """元素 bbox 超出画布时, 应被裁剪到画布内 (避免 out-of-bounds 报错)."""
+        from semantic_browser.snapshot.annotate import annotate_screenshot, RefBox
+        png = self._make_blank_png(100, 100)
+        refs = [
+            RefBox(ref="e1", kind="link", label="Edge",
+                   bbox=(90, 90, 200, 200), visible=True),  # 部分超界
+        ]
+        annotated, sidecar = annotate_screenshot(png, refs)
+        # bbox 应被 clamp 到画布内
+        bbox = sidecar["refs"][0]["bbox"]
+        assert bbox[2] <= 100  # right ≤ width
+        assert bbox[3] <= 100  # bottom ≤ height
+
+    def test_infer_kind_basic(self):
+        from semantic_browser.snapshot.annotate import _infer_kind
+        assert _infer_kind("a", "", "") == "link"
+        assert _infer_kind("button", "", "") == "button"
+        assert _infer_kind("input", "text", "") == "textbox"
+        assert _infer_kind("input", "submit", "") == "submit"
+        assert _infer_kind("input", "checkbox", "") == "checkbox"
+        assert _infer_kind("input", "search", "") == "search"
+        assert _infer_kind("textarea", "", "") == "textarea"
+        assert _infer_kind("select", "", "") == "select"
+        assert _infer_kind("div", "", "button") == "button"  # role 覆盖
+        assert _infer_kind("div", "", "") == "_default"
+
+    def test_annotate_output_is_valid_png(self):
+        """标注后的 PNG 仍是合法 PNG (Magic number)."""
+        from semantic_browser.snapshot.annotate import annotate_screenshot, RefBox
+        png = self._make_blank_png(300, 300)
+        refs = [RefBox(ref="e1", kind="link", label="X", bbox=(50, 50, 100, 80), visible=True)]
+        annotated, _ = annotate_screenshot(png, refs)
+        assert annotated[:8] == b"\x89PNG\r\n\x1a\n", "should be valid PNG"

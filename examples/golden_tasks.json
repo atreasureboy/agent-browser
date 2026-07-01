@@ -1,0 +1,22 @@
+[
+  {
+    "name": "extract_h1_example",
+    "goal": "extract the page h1 text",
+    "start_url": "https://example.com",
+    "expected": {
+      "answer_contains": "Example Domain",
+      "max_steps": 5
+    },
+    "tags": ["smoke", "fast", "extract"]
+  },
+  {
+    "name": "find_link_text",
+    "goal": "find any link text on the page",
+    "start_url": "https://example.com",
+    "expected": {
+      "answer_contains": "More information",
+      "max_steps": 5
+    },
+    "tags": ["smoke", "fast", "extract"]
+  }
+]

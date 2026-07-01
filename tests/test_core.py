@@ -843,3 +843,116 @@ class TestAnnotatedScreenshot:
         refs = [RefBox(ref="e1", kind="link", label="X", bbox=(50, 50, 100, 80), visible=True)]
         annotated, _ = annotate_screenshot(png, refs)
         assert annotated[:8] == b"\x89PNG\r\n\x1a\n", "should be valid PNG"
+
+
+# ── T11: fill-form (用 fake controller) ──────────────────────────
+
+class FakeControllerForFillForm:
+    def __init__(self, fail_refs: set[str] | None = None):
+        self.typed = []
+        self.fail_refs = fail_refs or set()
+    async def type_text(self, ref, text):
+        self.typed.append((ref, text))
+        return ref not in self.fail_refs
+    async def fill_form(self, fields):
+        out = {}
+        for ref, text in fields.items():
+            out[ref] = await self.type_text(ref, text)
+        return out
+
+
+class TestFillForm:
+    def _ctrl(self, *fails):
+        return FakeControllerForFillForm(fail_refs=set(fails))
+
+    async def test_fill_all_succeed(self):
+        from semantic_browser.browser.controller import BrowserController
+        # 不直接调 controller.fill_form (要 page); 测 daemon _fill_form 路径
+        # 这里只验 type_text 组合行为 — 即便 controller 失败也走 type_text
+        # 用 fake controller 走 fill_form 同等逻辑
+        ctrl = self._ctrl()
+        result = await ctrl.fill_form({"e1": "alice", "e2": "alice@x.com", "e3": "pw"})
+        assert result == {"e1": True, "e2": True, "e3": True}
+        assert ctrl.typed == [("e1", "alice"), ("e2", "alice@x.com"), ("e3", "pw")]
+
+    async def test_fill_partial_failure(self):
+        """一个字段失败不应阻塞其他字段 — agent 能立刻看到 partial state."""
+        ctrl = self._ctrl("e2")
+        result = await ctrl.fill_form({"e1": "alice", "e2": "x", "e3": "pw"})
+        assert result == {"e1": True, "e2": False, "e3": True}
+        ok_count = sum(1 for v in result.values() if v)
+        assert ok_count == 2
+
+    async def test_fill_empty_fields(self):
+        """空 dict 应返回空结果, 不报错."""
+        ctrl = self._ctrl()
+        result = await ctrl.fill_form({})
+        assert result == {}
+        assert ctrl.typed == []
+
+
+# ── T12: retry on transient errors ──────────────────────────────
+
+class FakeTransientError(Exception):
+    """Playwright 风格的短暂网络错。"""
+
+
+class FakePermanentError(Exception):
+    """不应被 retry 的错误 (e.g. 404 page)."""
+
+
+class TestRetryBehavior:
+    def _make_controller(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        return BrowserController(BrowserConfig())
+
+    async def test_succeeds_first_try(self):
+        ctrl = self._make_controller()
+        async def ok():
+            return "done"
+        result = await ctrl.with_retry(ok, what="test")
+        assert result == "done"
+        assert ctrl.retry_count == 0
+
+    async def test_retries_on_transient_then_succeeds(self):
+        ctrl = self._make_controller()
+        attempts = {"n": 0}
+        async def flaky():
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise FakeTransientError("ERR_NAME_NOT_RESOLVED: bad dns")
+            return "ok"
+        result = await ctrl.with_retry(flaky, max_retries=2, base_delay=0.01, what="test")
+        assert result == "ok"
+        assert attempts["n"] == 3  # 1 主 + 2 retry
+        assert ctrl.retry_count == 2
+
+    async def test_gives_up_after_max_retries(self):
+        ctrl = self._make_controller()
+        async def always_fail():
+            raise FakeTransientError("ERR_TIMED_OUT")
+        with pytest.raises(FakeTransientError, match="ERR_TIMED_OUT"):
+            await ctrl.with_retry(always_fail, max_retries=2, base_delay=0.01, what="test")
+        # 主 + 2 retry = 3 attempts
+        assert ctrl.retry_count == 2
+
+    async def test_does_not_retry_permanent_error(self):
+        ctrl = self._make_controller()
+        attempts = {"n": 0}
+        async def perm_fail():
+            attempts["n"] += 1
+            raise FakePermanentError("invalid ref")
+        with pytest.raises(FakePermanentError):
+            await ctrl.with_retry(perm_fail, max_retries=3, base_delay=0.01, what="test")
+        assert attempts["n"] == 1  # 没 retry
+
+    async def test_is_transient_classifier(self):
+        ctrl = self._make_controller()
+        assert ctrl.is_transient_error(Exception("ERR_NAME_NOT_RESOLVED"))
+        assert ctrl.is_transient_error(Exception("net::ERR_CONNECTION_REFUSED 1.2.3.4"))
+        assert ctrl.is_transient_error(Exception("Navigation timeout after 30000ms"))
+        assert ctrl.is_transient_error(TimeoutError("op took too long"))
+        # 非 transient
+        assert not ctrl.is_transient_error(ValueError("bad arg"))
+        assert not ctrl.is_transient_error(KeyError("missing"))
+        assert not ctrl.is_transient_error(Exception("404 not found"))

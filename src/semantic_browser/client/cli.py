@@ -190,6 +190,72 @@ def type_cmd(ctx, ref, text):
     _print(_request("POST", "/type", {"ref": ref, "text": text}, base=ctx.obj["base"]))
 
 
+@tb.command("fill-form")
+@click.option("--field", "fields", multiple=True, metavar="REF=TEXT",
+              help="填一个字段, 格式 e1=hello (可多次使用)")
+@click.option("--from-json", "json_path", type=click.Path(exists=True),
+              help="从 JSON 文件读 {ref: text} 映射")
+@click.pass_context
+def fill_form(ctx, fields, json_path):
+    """T11: 一次性填多个字段。
+
+    \b
+    Examples:
+      tb fill-form --field e1=alice --field e2=alice@x.com
+      tb fill-form --from-json form.json
+    """
+    field_map: dict[str, str] = {}
+    if fields:
+        for f in fields:
+            if "=" not in f:
+                raise click.ClickException(f"--field 格式必须是 REF=TEXT, got {f!r}")
+            ref, text = f.split("=", 1)
+            field_map[ref.strip()] = text
+    if json_path:
+        import json as _json
+        data = _json.loads(Path(json_path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise click.ClickException(f"--from-json 必须是 {{ref: text}} 对象, got {type(data).__name__}")
+        field_map.update(data)
+    if not field_map:
+        raise click.ClickException("至少需要一个 --field 或 --from-json")
+    _print(_request("POST", "/fill-form", {"fields": field_map}, base=ctx.obj["base"]))
+
+
+@tb.command("retry")
+@click.option("--action", required=True, type=click.Choice(["open", "click", "type"]),
+              help="要 retry 的动作类型")
+@click.option("--url", help="open 动作的 URL")
+@click.option("--ref", help="click/type 动作的 ref")
+@click.option("--text", help="type 动作的文本")
+@click.option("--max-retries", default=2, show_default=True,
+              help="最大 retry 次数 (额外调用)")
+@click.pass_context
+def retry_cmd(ctx, action, url, ref, text, max_retries):
+    """T12: 带 retry 包装的一个动作 (短错误自动重试, 指数 backoff).
+
+    \b
+    Examples:
+      tb retry --action open --url https://x.com
+      tb retry --action click --ref e3 --max-retries 3
+    """
+    if action == "open":
+        if not url:
+            raise click.ClickException("--action open 需要 --url")
+        args = {"url": url}
+    elif action == "click":
+        if not ref:
+            raise click.ClickException("--action click 需要 --ref")
+        args = {"ref": ref}
+    else:  # type
+        if not ref or text is None:
+            raise click.ClickException("--action type 需要 --ref 和 --text")
+        args = {"ref": ref, "text": text}
+    _print(_request("POST", "/with-retry",
+                    {"action": action, "args": args, "max_retries": max_retries},
+                    base=ctx.obj["base"]))
+
+
 @tb.command()
 @click.argument("direction", default="down")
 @click.argument("amount", type=int, default=500)

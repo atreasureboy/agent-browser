@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
 from playwright.async_api import (
@@ -315,6 +316,16 @@ class BrowserController:
             logger.warning("Type failed ref=%s: %s", ref, e)
             return False
 
+    async def fill_form(self, fields: dict[str, str]) -> dict[str, bool]:
+        """T11: 一次性填多个字段 (人类填表的"批量"动作)。
+
+        Returns {ref: ok} — agent 能立即看出哪些字段没填上, 再针对性 retry。
+        """
+        out: dict[str, bool] = {}
+        for ref, text in fields.items():
+            out[ref] = await self.type_text(ref, text)
+        return out
+
     async def press_key(self, key: str) -> None:
         """按键，如 Enter, Tab, Escape。"""
         page = await self._ensure_page()
@@ -388,3 +399,55 @@ class BrowserController:
     @property
     def current_page(self) -> Optional[Page]:
         return self._page
+
+    # ── T12: 通用 retry ─────────────────────────────────────────────
+
+    # 这些异常 / 错误信号被识别为"短暂错误" — 自动 retry 一次
+    _TRANSIENT_PHRASES = (
+        "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED",
+        "ERR_CONNECTION_RESET", "ERR_TIMED_OUT", "ERR_NETWORK_CHANGED",
+        "net::", "Navigation timeout", "TimeoutError",
+        "Element is not visible", "Element is detached",
+        "Target page, context or browser has been closed",
+    )
+
+    def is_transient_error(self, exc: BaseException) -> bool:
+        """判断一个异常是否属于短暂错误 (可 retry)."""
+        msg = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        return any(p in msg for p in self._TRANSIENT_PHRASES)
+
+    async def with_retry(
+        self,
+        action: Callable[[], Awaitable[Any]],
+        *,
+        max_retries: int = 2,
+        base_delay: float = 0.5,
+        what: str = "action",
+    ) -> Any:
+        """T12: 包裹 async action, 短暂错误自动 retry (指数 backoff).
+
+        max_retries=2 表示: 1 次主调用 + 最多 2 次 retry = 3 次机会。
+        base_delay 每次 * 2 (0.5s, 1s)。
+
+        返回 action 的结果; 不可恢复错误原样抛出。
+        返回值包装: 如果 agent 想要知道 retry 次数, 看 controller.retry_count (最后一次值).
+        """
+        last_exc: Optional[BaseException] = None
+        self.retry_count = 0
+        for attempt in range(max_retries + 1):
+            try:
+                return await action()
+            except Exception as e:
+                if not self.is_transient_error(e) or attempt == max_retries:
+                    raise
+                last_exc = e
+                self.retry_count = attempt + 1
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "%s 触发短暂错误 (第 %d 次重试, %.1fs 后): %s",
+                    what, attempt + 1, delay, e,
+                )
+                await asyncio.sleep(delay)
+        # 不会到这里 (最后那次若失败会 raise), 但类型检查器要 unbind
+        assert last_exc is not None
+        raise last_exc

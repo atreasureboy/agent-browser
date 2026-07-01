@@ -137,6 +137,14 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._click(args["ref"]))
         if method == "POST" and path == "/type":
             return self.owner.run(self._type(args["ref"], args["text"]))
+        if method == "POST" and path == "/fill-form":
+            return self.owner.run(self._fill_form(args["fields"]))
+        if method == "POST" and path == "/with-retry":
+            # body: {"action": "click|type|open", "args": {...}, "max_retries": 2}
+            action_name = args["action"]
+            action_args = args.get("args", {})
+            max_retries = int(args.get("max_retries", 2))
+            return self.owner.run(self._with_retry(action_name, action_args, max_retries))
         if method == "POST" and path == "/scroll":
             return self.owner.run(self._scroll(args.get("direction", "down"), int(args.get("amount", 500))))
         if method == "POST" and path == "/wait-for/text":
@@ -246,6 +254,32 @@ class TransparentBrowserDaemon:
     async def _type(self, ref: str, text: str) -> dict[str, Any]:
         ok = await self.owner.browser.controller.type_text(ref, text)
         return {"success": ok, "text_length": len(text)}
+
+    async def _fill_form(self, fields: dict[str, str]) -> dict[str, Any]:
+        result = await self.owner.browser.controller.fill_form(fields)
+        ok_count = sum(1 for v in result.values() if v)
+        return {"results": result, "ok_count": ok_count, "total": len(result)}
+
+    async def _with_retry(self, action_name: str, args: dict[str, Any], max_retries: int) -> dict[str, Any]:
+        """T12: 用 retry 包装一个动作。action_name ∈ {open, click, type}"""
+        ctrl = self.owner.browser.controller
+        async def _do():
+            if action_name == "open":
+                await ctrl.open(args["url"])
+                return {"ok": True, "url": args["url"]}
+            if action_name == "click":
+                ok = await ctrl.click(args["ref"])
+                if not ok:
+                    raise RuntimeError(f"click {args['ref']} failed")
+                return {"ok": True, "ref": args["ref"]}
+            if action_name == "type":
+                ok = await ctrl.type_text(args["ref"], args["text"])
+                if not ok:
+                    raise RuntimeError(f"type {args['ref']} failed")
+                return {"ok": True, "ref": args["ref"]}
+            raise ValueError(f"unsupported retry action: {action_name!r}")
+        result = await ctrl.with_retry(_do, max_retries=max_retries, what=action_name)
+        return {**result, "retries": ctrl.retry_count}
 
     async def _scroll(self, direction: str, amount: int) -> dict[str, Any]:
         await self.owner.browser.controller.scroll(direction, amount)

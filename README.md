@@ -317,6 +317,22 @@ tb check-subdomain-takeover example.com
 - `tb find-xss-sinks` 在 github.com 抓到 5 处 `document.cookie` 读取 + 3 处 `innerHTML` 赋值
 - `tb find-cloud-resources` 在 github.com 抓到 `github-cloud.s3.amazonaws.com`
 
+## T45 — 架构级别审计 (错误 / 重复 / 冲突)
+
+T40+T42+T43+T44 共 39 项工具加完后, 跑了一轮 AST 级 + 跨层一致性审计, **零 findings** — 代码库结构干净:
+
+| 检查项 | 结果 |
+|---|---|
+| 类内同名方法 (silent override) | 0 — 上次修过的 `get_storage` / `read_storage` 已稳定 |
+| Click 同一组内命令冲突 | 0 |
+| daemon 同一 if 链重复路径 | 0 |
+| MCP `sb_xxx` 重名 | 0 |
+| Module-level 死代码 | 0 (pyflakes: 0 unused imports / 0 undefined names) |
+| 长函数 (>180 行) | 3 (都是派发表 — `_dispatch` 393 / `_extract_interactive` 291 / `_call_tool` 255, 重构纯 cosmetic) |
+| `except Exception: pass` | 13 处全部合法 (重试循环 / URL parse 兜底 / per-element 迭代 / multi-strategy 软 404) |
+| T43+T44 跨层暴露 | 22/22 全栈覆盖 (controller → MCP / CLI / daemon / 测试) |
+| 全套测试 | 526 passed, 7 skipped (LLM e2e 需 OPENAI_API_KEY) |
+
 ## 后续路线
 
 - [ ] MCP Server 封装（作为 Hermes MCP 插件）

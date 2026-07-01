@@ -32,6 +32,7 @@ from semantic_browser.llm.service import LLMService, LLMUnavailableError, Tier
 from semantic_browser.llm.helpers import slice_refs_for_goal, build_smart_snapshot_excerpt
 from semantic_browser.llm.diagnostics import collect_diagnostics, format_diagnostics_for_llm
 from semantic_browser.memory.goal_memory import GoalMemory
+from semantic_browser.safety.guard import check_action
 from semantic_browser.snapshot.engine import PageSnapshot, SnapshotEngine
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,9 @@ class GoalAgent:
         goal_memory: GoalMemory | None = None,
         # T31: 流式进度回调 — 每步完成时调用 (StepRecord). 可传 async callable.
         on_step: "Optional[callable]" = None,
+        # T32: 危险动作守卫 — 默认开启 (需要人类 confirm)
+        safety_guard: bool = True,
+        allow_destructive: bool = False,
     ) -> None:
         self.controller = controller
         if llm_service is None:
@@ -173,6 +177,8 @@ class GoalAgent:
         self.use_memory = use_memory
         self.goal_memory = goal_memory or (GoalMemory() if use_memory else None)
         self.on_step = on_step
+        self.safety_guard = safety_guard
+        self.allow_destructive = allow_destructive
         self.history: list[StepRecord] = []
         # T26: 失败诊断累积 (LLM 下一步看)
         self.last_failure_diag: Optional[str] = None
@@ -313,6 +319,7 @@ Return a JSON plan with at most {max_steps} steps."""
         """执行 LLM 选的动作. Returns (success, error_or_output).
 
         click/type 默认用 self-healing 版本 (T22) — 失败自动 force / JS.
+        T32: 守卫在 _run_loop 里跑, 这里只做实际执行.
         """
         try:
             if action == "open":
@@ -445,7 +452,15 @@ Return a JSON plan with at most {max_steps} steps."""
                 )
 
             # 其他 action: 执行
-            ok, output = await self._execute_action(action, args)
+            # T32: 守卫在执行前拦截危险动作 (单独运行, 不在 _execute_action 里)
+            if self.safety_guard and not self.allow_destructive:
+                check = check_action(action, args)
+                if check.needs_confirm:
+                    ok, output = False, f"BLOCKED by safety guard: {check.reason}"
+                else:
+                    ok, output = await self._execute_action(action, args)
+            else:
+                ok, output = await self._execute_action(action, args)
             record = StepRecord(
                 step=step_num, thought=thought, action=action, args=args,
                 success=ok, error=None if ok else output,

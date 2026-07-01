@@ -573,6 +573,7 @@ class TransparentBrowserDaemon:
             use_smart_slicing=bool(args.get("use_smart_slicing", True)),
             use_failure_diagnostics=bool(args.get("use_failure_diagnostics", True)),
             on_step=on_step,
+            allow_destructive=bool(args.get("allow_destructive", False)),
         )
         result = await agent.run(
             goal=args["goal"],

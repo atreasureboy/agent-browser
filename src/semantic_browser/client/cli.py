@@ -944,13 +944,15 @@ def run_workflow(ctx, workflow_file, json_out):
               help="禁用 smart snapshot 切片 (默认开, 用 cheap 模型按 goal 过滤 ref)")
 @click.option("--no-diagnostics", is_flag=True,
               help="禁用失败时自动 dump diagnostics")
+@click.option("--allow-destructive", is_flag=True,
+              help="T32: 关闭危险动作守卫 (默认 type/click 含 delete 等关键词会被拦截)")
 @click.option("--dry-run", is_flag=True,
               help="T29: 只生成 plan 不执行 (用户先看再决定)")
 @click.option("--stream", is_flag=True,
               help="T31: 实时流式输出每步 (需要在同一台机器跑 daemon)")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, dry_run, stream, json_out):
+def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, allow_destructive, dry_run, stream, json_out):
     """T21 + T26: LLM-driven autonomous loop — 给个目标, agent 自主完成.
 
     \b
@@ -987,6 +989,7 @@ def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics,
         "tier": tier,
         "use_smart_slicing": not no_slicing,
         "use_failure_diagnostics": not no_diagnostics,
+        "allow_destructive": allow_destructive,
     }
     if start_url:
         body["start_url"] = start_url

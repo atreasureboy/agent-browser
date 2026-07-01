@@ -3505,3 +3505,138 @@ class TestGoalAgentStreaming:
 
         result = asyncio.run(agent.run("anything"))
         assert result.success is True
+
+
+
+class TestSafetyGuard:
+    """T32: destructive action guard — 拦截 type('delete...')/click('删除按钮')."""
+
+    def test_type_delete_keyword_blocked(self):
+        """type text 含 'delete' → needs_confirm."""
+        from semantic_browser.safety import check_action, SafetyCheck
+        result = check_action("type", {"ref": "e5", "text": "delete this"})
+        assert result.needs_confirm is True
+        assert "delete" in result.reason
+
+    def test_type_safe_text_allowed(self):
+        """type 普通 text → 不拦截."""
+        from semantic_browser.safety import check_action
+        result = check_action("type", {"ref": "e5", "text": "hello world"})
+        assert result.needs_confirm is False
+
+    def test_click_dangerous_label_blocked(self):
+        """click ref label 含 'Delete' → needs_confirm."""
+        from semantic_browser.safety import check_action
+        result = check_action("click", {"ref": "e5"}, ref_label="Delete Account")
+        assert result.needs_confirm is True
+
+    def test_click_safe_label_allowed(self):
+        """click 普通 label → 不拦截."""
+        from semantic_browser.safety import check_action
+        result = check_action("click", {"ref": "e5"}, ref_label="View Details")
+        assert result.needs_confirm is False
+
+    def test_drag_to_trash_blocked(self):
+        """drag to_ref 含 'trash' → needs_confirm."""
+        from semantic_browser.safety import check_action
+        result = check_action("drag", {"from_ref": "e1", "to_ref": "trash-bin"})
+        assert result.needs_confirm is True
+
+    def test_drag_safe_target_allowed(self):
+        """drag 普通目标 → 不拦截."""
+        from semantic_browser.safety import check_action
+        result = check_action("drag", {"from_ref": "e1", "to_ref": "dropzone"})
+        assert result.needs_confirm is False
+
+    def test_open_extract_done_always_safe(self):
+        """open/extract_text/done 永远 safe."""
+        from semantic_browser.safety import check_action
+        for action in ("open", "extract_text", "done"):
+            r = check_action(action, {"url": "x"})
+            assert r.needs_confirm is False
+            assert r.risk_level == "safe"
+
+
+class TestGoalAgentSafetyIntegration:
+    """T32: GoalAgent 在执行 action 时跑 safety_guard."""
+
+    def test_destructive_type_blocked(self):
+        """type('delete') 被 guard 拦截, agent 收到 error."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        decisions = [
+            {"thought": "type delete", "action": "type",
+             "args": {"ref": "e5", "text": "delete all"}},
+            {"thought": "give up", "action": "done",
+             "args": {"answer": "blocked by guard"}},
+        ]
+        async def fake_ask(goal, snap):
+            return decisions.pop(0)
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "- e5 input: name")
+        async def fake_execute(action, args):
+            return True, "should not reach"
+
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                          use_memory=False)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+        agent._execute_action = fake_execute  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.run("delete stuff"))
+        assert result.success is True
+        assert result.steps[0].success is False
+        assert "BLOCKED" in (result.steps[0].error or "")
+
+    def test_allow_destructive_bypasses_guard(self):
+        """allow_destructive=True → guard 放行."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        decisions = [
+            {"thought": "type delete", "action": "type",
+             "args": {"ref": "e5", "text": "delete all"}},
+            {"thought": "done", "action": "done",
+             "args": {"answer": "ok"}},
+        ]
+        async def fake_ask(goal, snap):
+            return decisions.pop(0)
+        async def fake_capture(goal=""):
+            return ("URL: x\n", "")
+        executed: list = []
+        async def fake_execute(action, args):
+            executed.append((action, args))
+            return True, ""
+
+        agent = GoalAgent(ctrl, llm_service=svc, max_steps=5,
+                          use_memory=False, allow_destructive=True)
+        agent._ask_llm = fake_ask  # type: ignore[method-assign]
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+        agent._execute_action = fake_execute  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.run("delete stuff"))
+        assert len(executed) == 1
+        assert executed[0] == ("type", {"ref": "e5", "text": "delete all"})
+
+    def test_safety_guard_disabled(self):
+        """safety_guard=False → guard 完全跳过."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+        agent = GoalAgent(ctrl, llm_service=svc, use_memory=False,
+                          safety_guard=False)
+        assert agent.safety_guard is False

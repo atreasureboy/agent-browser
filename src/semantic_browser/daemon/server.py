@@ -133,6 +133,13 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._snapshot(
                 detail_level=args.get("detail_level", "normal"),
             ))
+        if method == "GET" and path == "/snapshot-vision":
+            return self.owner.run(self._snapshot_vision(
+                goal=args.get("goal", ""),
+                provider=args.get("provider"),
+                model=args.get("model"),
+                full_page=bool(args.get("full_page", True)),
+            ))
         if method == "GET" and path == "/read":
             return self.owner.run(self._read(format=args.get("format", "markdown")))
         if method == "POST" and path == "/click":
@@ -392,6 +399,28 @@ class TransparentBrowserDaemon:
         return (await SnapshotEngine(page).capture(
             base_url=page.url, detail_level=detail_level,
         )).to_dict()
+
+    async def _snapshot_vision(
+        self,
+        *,
+        goal: str = "",
+        provider: str | None = None,
+        model: str | None = None,
+        full_page: bool = True,
+    ) -> dict[str, Any]:
+        """T38: 截图 → vision LLM → 结构化描述."""
+        from semantic_browser.snapshot.vision import capture_vision_snapshot
+        page = self.owner.browser.controller.current_page
+        if page is None:
+            raise ValueError("no active page; call /open first")
+        vsnap = await capture_vision_snapshot(
+            self.owner.browser.controller,
+            goal=goal,
+            provider=provider,
+            model=model,
+            full_page=full_page,
+        )
+        return vsnap.to_dict()
 
     async def _read(self, format: str = "markdown") -> dict[str, Any]:
         page = self.owner.browser.controller.current_page

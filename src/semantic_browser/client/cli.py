@@ -164,6 +164,27 @@ def snapshot(ctx, json_out):
     _print(_request("GET", "/snapshot", base=ctx.obj["base"]), json_out=json_out)
 
 
+@tb.command("vision-snapshot")
+@click.option("--goal", default="", help="可选 — 用户当前目标 (让 LLM 重点突出相关元素)")
+@click.option("--provider", default="",
+              type=click.Choice(["", "anthropic", "gemini"]),
+              help="强制选 vision provider (默认 auto-detect)")
+@click.option("--model", default="", help="强制选 vision 模型")
+@click.option("--full-page/--viewport-only", default=True,
+              help="是否整页截图 (默认是)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def vision_snapshot(ctx, goal, provider, model, full_page, json_out):
+    """T38: 截图 + vision LLM 描述页面 (canvas/SPA/shadow DOM fallback)."""
+    args: dict = {"goal": goal, "full_page": full_page}
+    if provider:
+        args["provider"] = provider
+    if model:
+        args["model"] = model
+    _print(_request("GET", "/snapshot-vision", args, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
 @tb.command()
 @click.option("--format", "fmt", default="markdown", type=click.Choice(["markdown", "json"]))
 @click.pass_context

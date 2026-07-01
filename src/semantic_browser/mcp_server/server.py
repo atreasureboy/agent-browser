@@ -77,6 +77,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                 "description": "逗号分隔的 ref 集合 (之前 snapshot 看到的)"}})},
     {"name": "sb_get_script_source", "description": "Deep 模式: 按 URL 抓 JS 源码 (httpx 绕过 CORS, 50K 上限).",
      "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    # T38: 视觉快照 fallback — DOM snapshot 不可用 (canvas/SPA/shadow DOM) 时用
+    {"name": "sb_snapshot_vision", "description": "截图 + vision LLM 描述页面 (Canvas/SPA fallback).",
+     "inputSchema": _schema({"goal": {"type": "string"},
+                             "provider": {"type": "string", "enum": ["anthropic", "gemini"]},
+                             "model": {"type": "string"},
+                             "full_page": {"type": "boolean"}})},
 ]
 
 
@@ -265,6 +271,17 @@ class MCPServer:
         if name == "sb_get_script_source":
             engine = await self._ensure_started()
             return {"source": await engine.controller.fetch_script_source(args["url"])}
+        if name == "sb_snapshot_vision":
+            engine = await self._ensure_started()
+            from semantic_browser.snapshot.vision import capture_vision_snapshot
+            vsnap = await capture_vision_snapshot(
+                engine.controller,
+                goal=args.get("goal", ""),
+                provider=args.get("provider"),
+                model=args.get("model"),
+                full_page=bool(args.get("full_page", True)),
+            )
+            return vsnap.to_dict()
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

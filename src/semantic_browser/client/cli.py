@@ -944,9 +944,11 @@ def run_workflow(ctx, workflow_file, json_out):
               help="禁用 smart snapshot 切片 (默认开, 用 cheap 模型按 goal 过滤 ref)")
 @click.option("--no-diagnostics", is_flag=True,
               help="禁用失败时自动 dump diagnostics")
+@click.option("--dry-run", is_flag=True,
+              help="T29: 只生成 plan 不执行 (用户先看再决定)")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, json_out):
+def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics, dry_run, json_out):
     """T21 + T26: LLM-driven autonomous loop — 给个目标, agent 自主完成.
 
     \b
@@ -959,7 +961,24 @@ def agent_cmd(ctx, goal, start_url, max_steps, tier, no_slicing, no_diagnostics,
       tb agent "find contact email" --start-url https://example.com
       tb agent "搜 'deepseek' 并提取第一条结果的标题" --start-url https://www.google.com
       tb agent "..." --tier cheap  (便宜模型跑, 适合简单任务)
+      tb agent "..." --dry-run  (只看 plan, 不执行)
     """
+    if dry_run:
+        body = {"goal": goal, "tier": tier}
+        if start_url:
+            body["start_url"] = start_url
+        data = _request("POST", "/agent/plan", body, base=ctx.obj["base"])
+        if data.get("error"):
+            click.echo(f"✗ plan failed: {data['error']}")
+            return
+        click.echo(f"Strategy: {data.get('thought','')}")
+        click.echo("Plan:")
+        for s in data.get("plan", []):
+            arg_str = json.dumps(s.get("args", {}), ensure_ascii=False)
+            why = s.get("why", "")
+            click.echo(f"  [{s.get('step','?')}] {s.get('action','?'):12s} {arg_str}  — {why}")
+        return
+
     body = {
         "goal": goal,
         "max_steps": max_steps,

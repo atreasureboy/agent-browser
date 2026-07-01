@@ -269,6 +269,9 @@ class TransparentBrowserDaemon:
             ))
         if method == "POST" and path == "/agent/run":
             return self.owner.run(self._run_agent(args))
+        # T29: dry-run plan preview
+        if method == "POST" and path == "/agent/plan":
+            return self.owner.run(self._plan_agent(args))
         # T27: 跨 session goal memory
         if method == "GET" and path == "/memory/stats":
             from semantic_browser.memory.goal_memory import GoalMemory
@@ -560,6 +563,17 @@ class TransparentBrowserDaemon:
             start_url=args.get("start_url") or None,
         )
         return result.to_dict()
+
+    async def _plan_agent(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.agent import GoalAgent
+        agent = GoalAgent(
+            self.owner.browser.controller,
+            tier=args.get("tier", "smart"),
+        )
+        return await agent.plan(
+            goal=args["goal"],
+            max_steps=int(args.get("max_plan_steps", 8)),
+        )
 
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service

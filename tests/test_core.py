@@ -3278,3 +3278,107 @@ class TestGoalAgentMemoryIntegration:
             hit = mem.lookup("compute pi")
             assert hit is not None
             assert hit["answer"] == "42"
+
+
+class TestGoalAgentPlanDryRun:
+    """T29: GoalAgent.plan() — dry-run 模式生成完整 plan 不执行."""
+
+    def test_plan_returns_strategy_and_steps(self):
+        """plan() 返回 dict 含 thought + plan 列表."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_complete_json(messages, **kwargs):
+            return {
+                "thought": "navigate then extract",
+                "plan": [
+                    {"step": 1, "action": "open", "args": {"url": "https://x.com"}, "why": "go to start"},
+                    {"step": 2, "action": "extract_text", "args": {"max_chars": 1000}, "why": "read content"},
+                    {"step": 3, "action": "done", "args": {"answer": "found"}, "why": "done"},
+                ],
+            }
+
+        svc.complete_json = fake_complete_json  # type: ignore[method-assign]
+
+        async def fake_capture(goal=""):
+            return ("URL: y\n", "- e1 link: Go")
+        agent = GoalAgent(ctrl, llm_service=svc, use_memory=False)
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.plan("find contact"))
+        assert result["thought"] == "navigate then extract"
+        assert len(result["plan"]) == 3
+        assert result["plan"][0]["action"] == "open"
+        assert result["plan"][2]["action"] == "done"
+        assert result["goal"] == "find contact"
+
+    def test_plan_truncates_to_max_steps(self):
+        """LLM 超长 plan → 自动截断到 max_steps."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_complete_json(messages, **kwargs):
+            return {
+                "thought": "long",
+                "plan": [{"step": i, "action": "click", "args": {"ref": f"e{i}"}, "why": "x"}
+                          for i in range(1, 20)],
+            }
+
+        svc.complete_json = fake_complete_json  # type: ignore[method-assign]
+
+        async def fake_capture(goal=""):
+            return ("URL: y\n", "")
+        agent = GoalAgent(ctrl, llm_service=svc, use_memory=False)
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.plan("do everything", max_steps=5))
+        assert len(result["plan"]) == 5  # 截断到 5
+
+    def test_plan_returns_error_when_llm_unavailable(self):
+        """LLM 没配时 plan() 返回 error key."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="", base_url="http://fake")
+        svc.api_key = ""  # 强制不可用
+
+        agent = GoalAgent(ctrl, llm_service=svc, use_memory=False)
+        result = asyncio.run(agent.plan("anything"))
+        assert result.get("error") is not None
+        assert result["plan"] == []
+
+    def test_plan_handles_llm_exception(self):
+        """LLM 抛异常时 plan() 不 crash, 返回 error key."""
+        import asyncio
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        async def fake_complete_json(messages, **kwargs):
+            raise RuntimeError("network down")
+        svc.complete_json = fake_complete_json  # type: ignore[method-assign]
+
+        async def fake_capture(goal=""):
+            return ("URL: y\n", "")
+        agent = GoalAgent(ctrl, llm_service=svc, use_memory=False)
+        agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+        result = asyncio.run(agent.plan("anything"))
+        assert "RuntimeError" in result.get("error", "")
+        assert result["plan"] == []

@@ -67,6 +67,28 @@ Rules:
 """
 
 
+_PLAN_SYSTEM_PROMPT = """You are a planning agent. Given a goal, you observe the current page and return a SEQUENCE of planned actions (NOT executed).
+
+You must respond with valid JSON only:
+{
+  "thought": "overall strategy",
+  "plan": [
+    {"step": 1, "action": "open", "args": {"url": "https://example.com"}, "why": "navigate to start"},
+    {"step": 2, "action": "click", "args": {"ref": "e5"}, "why": "open contact section"},
+    {"step": 3, "action": "extract_text", "args": {"max_chars": 2000}, "why": "read content"},
+    {"step": 4, "action": "done", "args": {"answer": "<expected>"}, "why": "goal achieved"}
+  ]
+}
+
+Allowed actions: open(url), click(ref), type(ref, text), extract_text(max_chars), done(answer)
+Rules:
+1. Plan 3-8 steps total. Don't over-engineer.
+2. First step: either open(start_url) or extract_text() if page already has content.
+3. If you can't determine the goal is achievable, end the plan with done(answer="unable to plan").
+4. Use refs ONLY if you can guess them confidently; otherwise plan extract_text() first to discover refs.
+"""
+
+
 @dataclass
 class StepRecord:
     """每一步的历史, 给 LLM 回看."""
@@ -232,6 +254,46 @@ What's the next single action? Respond with JSON only."""
             temperature=0.2,
             max_tokens=500,
         )
+
+    async def plan(self, goal: str, *, max_steps: int = 8) -> dict[str, Any]:
+        """T29: 让 LLM 一次性给完整 plan (不执行). 返回 dict 含 thought/plan 列表.
+
+        用于 dry-run 模式 — 用户先看 plan 再决定要不要执行.
+        max_steps: 计划步数上限 (避免 LLM 写无限长 plan).
+        """
+        if not self._is_available():
+            return {"thought": "", "plan": [],
+                    "error": "LLM not configured"}
+        snapshot_header, snapshot_excerpt = await self._capture_snapshot_excerpt(goal=goal)
+        user_prompt = f"""Goal: {goal}
+
+Current page snapshot:
+{snapshot_header}
+{snapshot_excerpt}
+
+Return a JSON plan with at most {max_steps} steps."""
+        try:
+            result = await self.llm.complete_json(
+                messages=[
+                    {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tier=self.tier,
+                temperature=0.3,
+                max_tokens=1500,
+            )
+        except Exception as e:
+            return {"thought": "", "plan": [],
+                    "error": f"{type(e).__name__}: {e}"[:200]}
+        # 截断到 max_steps (LLM 可能超长)
+        plan = result.get("plan", [])
+        if isinstance(plan, list):
+            plan = plan[:max_steps]
+        return {
+            "thought": result.get("thought", ""),
+            "plan": plan,
+            "goal": goal,
+        }
 
     async def _execute_action(self, action: str, args: dict[str, Any]) -> tuple[bool, str]:
         """执行 LLM 选的动作. Returns (success, error_or_output).

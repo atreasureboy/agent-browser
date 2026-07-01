@@ -132,7 +132,7 @@ def annotate_screenshot(
     }
 
 
-def collect_refs_from_page(
+async def collect_refs_from_page(
     page,
     snapshot_data: dict | None = None,
 ) -> list[RefBox]:
@@ -141,8 +141,8 @@ def collect_refs_from_page(
     通过 JS 在 DOM 上查 [data-sb-ref], 用 getBoundingClientRect() 取坐标。
     kind 推断: tagName + role + type.
     """
-    # 在 page 上跑 JS 拿所有 ref 元素的 rect
-    js_result = page.evaluate("""
+    # 在 page 上跑 JS 拿所有 ref 元素的 rect (async)
+    js_result = await page.evaluate("""
 () => {
     const out = [];
     document.querySelectorAll('[data-sb-ref]').forEach(el => {
@@ -204,11 +204,9 @@ def _infer_kind(tag: str, input_type: str, role: str) -> str:
     return "_default"
 
 
-def annotate_current_page(page, *, viewport_only: bool = True) -> tuple[bytes, dict[str, Any]]:
+async def annotate_current_page(page, *, viewport_only: bool = True) -> tuple[bytes, dict[str, Any]]:
     """便捷: 截当前页 + 标注。一次调用拿两样。"""
     import asyncio
-    png = asyncio.get_event_loop().run_until_complete(
-        page.screenshot(full_page=not viewport_only)
-    )
-    refs = collect_refs_from_page(page)
+    png = await page.screenshot(full_page=not viewport_only)
+    refs = await collect_refs_from_page(page)
     return annotate_screenshot(png, refs)

@@ -541,7 +541,7 @@ class TransparentBrowserDaemon:
         if page is None:
             raise ValueError("no active page; call /open first")
         png = await page.screenshot(path=path, full_page=False)
-        refs = collect_refs_from_page(page)
+        refs = await collect_refs_from_page(page)
         annotated, sidecar = annotate_screenshot(png, refs)
         # 写文件 (如果指定了 path)
         if path:
@@ -562,7 +562,7 @@ class TransparentBrowserDaemon:
         page = self.owner.browser.controller.current_page
         if page is None:
             raise ValueError("no active page; call /open first")
-        refs = collect_refs_from_page(page)
+        refs = await collect_refs_from_page(page)
         sidecar = {
             "image_size": [page.viewport_size["width"], page.viewport_size["height"]],
             "ref_count": len(refs),

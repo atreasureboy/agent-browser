@@ -234,10 +234,16 @@ class GoalAgent:
                 logger.warning("smart slicing failed, falling back: %s", e)
 
         # 兜底: 原 flat 列表 (无 goal 或 slicing 失败)
+        from semantic_browser.snapshot.engine import LinkInfo
         all_refs = list(snap.links) + list(snap.controls)
         refs = []
         for c in all_refs[:self.snapshot_ref_limit]:
-            refs.append(f"  - {c.ref} {c.kind}: {c.label or c.href or ''}")
+            if isinstance(c, LinkInfo):
+                # 链接: 没 kind/label, 用 text + href
+                refs.append(f"  - {c.ref} link: {c.text or c.href or ''}")
+            else:
+                # ControlInfo: kind + label
+                refs.append(f"  - {c.ref} {c.kind}: {c.label or ''}")
         excerpt = "\n".join(refs) if refs else "(no interactive elements)"
         excerpt += aria_block
         header = f"URL: {url}\nTitle: {title}\n\nInteractive refs ({len(refs)} shown):"

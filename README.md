@@ -215,27 +215,37 @@ asyncio.run(main())
 - ✅ 持久浏览器 daemon (`tb-daemon` HTTP server, 7/7 e2e 测试通过)
 - ✅ `--json-out` valid JSON (含 CJK / 转义符 / 嵌套数组)
 
-## 安全审计增强套件 (T40)
+## 安全审计增强套件 (T40 + T42)
 
 给 agent / 安全审计工具用的站点情报扩展。所有工具都同时通过 MCP / CLI / daemon 三层暴露：
 
 ```bash
 # T40a: 客户端存储探针 (local/session/cookies)
-tb storage
+tb dump-storage
 # T40b: 隐藏路径探针 (well_known/discovery/admin)
-tb probe-paths https://example.com
+# T42f: 加上 debug/actuator 类 (/actuator/* /phpinfo /swagger ...)
+tb probe-paths https://example.com --categories well_known,discovery,admin,debug
 # T40c: HTML 注释提取 (含 shadow root)
 # T40d: URL 参数解析 (链接 + form action)
 # T40e: Frame inventory (depth/cross-origin/child_count)
 tb list-frames
 # T40f: CSP/HSTS/XFO 结构化
+# T42c: 加上 CORS 风险评估 (high/medium/low/none)
 tb security-headers https://example.com
 # T40g: 从 JS 提取 API endpoints (fetch/axios/XHR)
 tb extract-api-endpoints
 # T40h: Shadow DOM 穿透 (snapshot 递归)
+# T42d: SRI coverage + mixed content
 # T40i: WebSocket 连接监控
 tb websockets
+# T42a: snapshot 含 hidden form 字段 + form 分类 (login/search/upload/...)
+# T42b: 识别 JS 库版本 + 已知 CVE (jQuery 3.4.0 → CVE-2020-11022/11023)
+tb extract-js-libraries
+# T42g: GraphQL introspection (dump schema types/queries)
+tb detect-graphql https://api.example.com/graphql
 ```
+
+T42 补的是 pen-tester 视角盲点 (CSRF token 抓不到 / JS lib CVE 不识别 / CORS misconfig 不报警 / SRI 不检查 / soft-404 不识别 / debug 端点不探 / GraphQL schema 不 dump / 上传字段不标) — 实测在 GitHub 上成功抓到 `authenticity_token` CSRF token.
 
 ## 后续路线
 

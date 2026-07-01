@@ -58,6 +58,11 @@ class BrowserController:
         self._page: Optional[Page] = None
         self._active_idx: int = 0  # T7: 当前活跃 tab 在 self._pages 中的下标
         self._frame = None  # T15: 当前活跃 FramePage; None = 顶层
+        # T18: 累积式 console + network 缓冲 (给 agent 当调试器)
+        self._console_messages: list[dict[str, Any]] = []
+        self._network_requests: list[dict[str, Any]] = []
+        self._page_errors: list[dict[str, Any]] = []
+        self._max_event_buffer = 1000  # 防无限增长
 
     async def start(self) -> None:
         """启动浏览器。"""
@@ -77,6 +82,12 @@ class BrowserController:
             context_kwargs["storage_state"] = self.config.storage_state_path
         self._context = await self._browser.new_context(**context_kwargs)
         self._context.set_default_timeout(self.config.timeout)
+        # T18: 全局监听 console / network / pageerror (适用于 context 内所有页)
+        self._context.on("console", self._on_console)
+        self._context.on("request", self._on_request)
+        self._context.on("requestfailed", self._on_request_failed)
+        self._context.on("response", self._on_response)
+        self._context.on("weberror", self._on_web_error)
         logger.info("BrowserController started (headless=%s)", self.config.headless)
 
     async def close(self) -> None:
@@ -563,6 +574,116 @@ class BrowserController:
     @property
     def current_page(self) -> Optional[Page]:
         return self._page
+
+    # ── T18: Console / Network / PageError 观察 ─────────────────
+
+    def _on_console(self, msg: Any) -> None:
+        """console.log/warn/error/info → 缓存. agent 调试时 dump."""
+        try:
+            entry = {
+                "type": msg.type,
+                "text": msg.text,
+                "location": str(msg.location) if msg.location else None,
+            }
+        except Exception:
+            entry = {"type": "log", "text": str(msg), "location": None}
+        self._console_messages.append(entry)
+        self._trim_buffer(self._console_messages)
+
+    def _on_request(self, req: Any) -> None:
+        """每个 HTTP 请求开始时记录."""
+        try:
+            entry = {
+                "method": req.method,
+                "url": req.url,
+                "resource_type": req.resource_type,
+                "ts": time.time(),
+            }
+        except Exception:
+            entry = {"method": "?", "url": str(req), "resource_type": "?", "ts": time.time()}
+        self._network_requests.append(entry)
+        self._trim_buffer(self._network_requests)
+
+    def _on_response(self, resp: Any) -> None:
+        """每个响应回填 status, 改最后一条同 url+method 的未完成 request."""
+        try:
+            url = resp.url
+            status = resp.status
+            method = resp.request.method if resp.request else None
+        except Exception:
+            return
+        for entry in reversed(self._network_requests):
+            if entry.get("url") == url and entry.get("method") == method and "status" not in entry:
+                entry["status"] = status
+                break
+
+    def _on_request_failed(self, req: Any) -> None:
+        """请求失败 (网络/超时/CORS/404 等)."""
+        try:
+            failure = req.failure
+        except Exception:
+            failure = "?"
+        # 找到最近一条匹配 request 并标记
+        for entry in reversed(self._network_requests):
+            if (entry.get("url") == req.url
+                    and entry.get("method") == req.method
+                    and "status" not in entry):
+                entry["status"] = -1
+                entry["failure"] = str(failure)[:200] if failure else "unknown"
+                break
+
+    def _on_web_error(self, err: Any) -> None:
+        """未捕获 JS exception (page.on('pageerror'))."""
+        try:
+            err_obj = err.error
+            entry = {
+                "name": type(err_obj).__name__ if err_obj else "Error",
+                "message": str(err_obj)[:300] if err_obj else "?",
+                "page": err.page.url if hasattr(err, "page") and err.page else None,
+            }
+        except Exception:
+            entry = {"name": "Error", "message": str(err)[:300], "page": None}
+        self._page_errors.append(entry)
+        self._trim_buffer(self._page_errors)
+
+    def _trim_buffer(self, buf: list) -> None:
+        """防无限增长; 超过 max 截断到 max (FIFO)."""
+        if len(buf) > self._max_event_buffer:
+            del buf[: len(buf) - self._max_event_buffer]
+
+    def get_console_messages(
+        self, type_filter: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """返回最近的 console 消息. type_filter: 'log'/'warn'/'error'/'info'/'debug'."""
+        out = self._console_messages
+        if type_filter:
+            out = [m for m in out if m.get("type") == type_filter]
+        return out[-limit:]
+
+    def get_network_requests(
+        self,
+        *,
+        only_failed: bool = False,
+        method: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """返回最近的 network 请求. only_failed: 只看 status=-1 或 4xx/5xx."""
+        out = self._network_requests
+        if method:
+            out = [r for r in out if r.get("method", "").upper() == method.upper()]
+        if only_failed:
+            out = [r for r in out if r.get("status", 0) < 0 or r.get("status", 0) >= 400]
+        return out[-limit:]
+
+    def get_page_errors(self, limit: int = 50) -> list[dict[str, Any]]:
+        """返回未捕获 JS 异常."""
+        return self._page_errors[-limit:]
+
+    def clear_event_buffer(self) -> None:
+        """清空所有事件缓冲 (导航到新页时常用)."""
+        self._console_messages.clear()
+        self._network_requests.clear()
+        self._page_errors.clear()
 
     # ── T15: Frame (iframe) 支持 ─────────────────────────────
 

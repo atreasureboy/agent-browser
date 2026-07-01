@@ -192,6 +192,26 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/screenshot/sidecar":
             # 只要 sidecar (没 PNG), 给 LLM 用来 plan 操作
             return self.owner.run(self._screenshot_sidecar())
+        # T18: 调试接口 — agent 看 JS console / network / page error
+        if method == "GET" and path == "/console":
+            type_filter = args.get("type") or None
+            limit = int(args.get("limit", 100))
+            return self.owner.browser.controller.get_console_messages(
+                type_filter=type_filter, limit=limit,
+            )
+        if method == "GET" and path == "/network":
+            only_failed = args.get("only_failed", "false").lower() in ("1", "true", "yes")
+            method_filter = args.get("method") or None
+            limit = int(args.get("limit", 100))
+            return self.owner.browser.controller.get_network_requests(
+                only_failed=only_failed, method=method_filter, limit=limit,
+            )
+        if method == "GET" and path == "/errors":
+            limit = int(args.get("limit", 50))
+            return self.owner.browser.controller.get_page_errors(limit=limit)
+        if method == "POST" and path == "/debug/clear":
+            self.owner.browser.controller.clear_event_buffer()
+            return {"cleared": True}
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":

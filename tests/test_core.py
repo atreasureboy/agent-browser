@@ -1474,3 +1474,219 @@ class TestActionPrimitives:
         ok = asyncio.run(ctrl.select_option("e8", ["us-east-1", "eu-west-1"]))
         assert ok is True
         assert captured["value"] == ["us-east-1", "eu-west-1"]
+
+
+class TestConsoleNetworkObservation:
+    """T18: console / network / page error 观察 — agent 调试核心能力."""
+
+    def test_initial_buffers_empty(self):
+        """初始时所有缓冲都是空."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        assert ctrl._console_messages == []
+        assert ctrl._network_requests == []
+        assert ctrl._page_errors == []
+        assert ctrl.get_console_messages() == []
+        assert ctrl.get_network_requests() == []
+        assert ctrl.get_page_errors() == []
+
+    def test_console_buffer_accepts_messages(self):
+        """_on_console 累加消息, get_console_messages 返回."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeMsg:
+            def __init__(self, type_, text, location=None):
+                self.type = type_
+                self.text = text
+                self.location = location
+
+        ctrl._on_console(FakeMsg("log", "hello"))
+        ctrl._on_console(FakeMsg("error", "boom"))
+        ctrl._on_console(FakeMsg("warn", "careful"))
+
+        all_msgs = ctrl.get_console_messages()
+        assert len(all_msgs) == 3
+        assert [m["type"] for m in all_msgs] == ["log", "error", "warn"]
+        assert all_msgs[0]["text"] == "hello"
+        assert all_msgs[1]["text"] == "boom"
+
+        # 类型过滤
+        errors = ctrl.get_console_messages(type_filter="error")
+        assert len(errors) == 1
+        assert errors[0]["text"] == "boom"
+
+    def test_network_buffer_accepts_requests(self):
+        """_on_request 累加 + _on_response 回填 status."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            def __init__(self, method, url, resource_type="fetch"):
+                self.method = method
+                self.url = url
+                self.resource_type = resource_type
+
+        class FakeResp:
+            def __init__(self, url, status, method):
+                self.url = url
+                self.status = status
+                self.request = FakeReq(method, url)  # 模拟 Playwright resp.request
+
+        ctrl._on_request(FakeReq("GET", "https://api.example.com/users"))
+        ctrl._on_request(FakeReq("POST", "https://api.example.com/users"))
+        ctrl._on_response(FakeResp("https://api.example.com/users", 200, "GET"))
+
+        all_reqs = ctrl.get_network_requests()
+        assert len(all_reqs) == 2
+        # POST 没响应
+        post_req = [r for r in all_reqs if r["method"] == "POST"][0]
+        assert "status" not in post_req
+        # GET 有响应
+        get_req = [r for r in all_reqs if r["method"] == "GET"][0]
+        assert get_req["status"] == 200
+
+    def test_network_only_failed_filter(self):
+        """only_failed=True 过滤 4xx/5xx/网络失败."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            def __init__(self, url, method="GET"):
+                self.method = method
+                self.url = url
+                self.resource_type = "fetch"
+
+        class FakeResp:
+            def __init__(self, url, status, method="GET"):
+                self.url = url
+                self.status = status
+                self.request = FakeReq(url, method)
+
+        ctrl._on_request(FakeReq("https://x.com/ok"))
+        ctrl._on_request(FakeReq("https://x.com/notfound"))
+        ctrl._on_request(FakeReq("https://x.com/server-error"))
+        ctrl._on_response(FakeResp("https://x.com/ok", 200))
+        ctrl._on_response(FakeResp("https://x.com/notfound", 404))
+        ctrl._on_response(FakeResp("https://x.com/server-error", 500))
+
+        failed = ctrl.get_network_requests(only_failed=True)
+        urls = [r["url"] for r in failed]
+        assert "https://x.com/ok" not in urls
+        assert "https://x.com/notfound" in urls
+        assert "https://x.com/server-error" in urls
+
+    def test_network_method_filter(self):
+        """method='POST' 过滤."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            def __init__(self, method, url):
+                self.method = method
+                self.url = url
+                self.resource_type = "fetch"
+
+        ctrl._on_request(FakeReq("GET", "https://x.com/a"))
+        ctrl._on_request(FakeReq("POST", "https://x.com/b"))
+        ctrl._on_request(FakeReq("PUT", "https://x.com/c"))
+
+        only_post = ctrl.get_network_requests(method="POST")
+        assert len(only_post) == 1
+        assert only_post[0]["url"] == "https://x.com/b"
+
+    def test_page_errors_buffer(self):
+        """_on_web_error 累加 JS 异常."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        # 用真实 TypeError 异常对象, 让 type(err_obj).__name__ == 'TypeError'
+        real_err_obj = TypeError("x is not a function")
+
+        class FakeWebError:
+            def __init__(self, err_obj, page_url):
+                self.error = err_obj
+                self.page = type("P", (), {"url": page_url})()
+
+        ctrl._on_web_error(FakeWebError(real_err_obj, "https://x.com/page"))
+        errs = ctrl.get_page_errors()
+        assert len(errs) == 1
+        assert errs[0]["name"] == "TypeError"
+        assert "x is not a function" in errs[0]["message"]
+        assert errs[0]["page"] == "https://x.com/page"
+
+    def test_clear_event_buffer_resets_all(self):
+        """clear_event_buffer 同时清空三个缓冲."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeMsg:
+            type = "log"
+            text = "x"
+            location = None
+        class FakeReq:
+            method = "GET"
+            url = "https://x.com"
+            resource_type = "fetch"
+        ctrl._on_console(FakeMsg())
+        ctrl._on_request(FakeReq())
+        assert len(ctrl._console_messages) == 1
+        assert len(ctrl._network_requests) == 1
+
+        ctrl.clear_event_buffer()
+        assert ctrl._console_messages == []
+        assert ctrl._network_requests == []
+        assert ctrl._page_errors == []
+
+    def test_trim_buffer_caps_size(self):
+        """_trim_buffer 防止无限增长, 截断到 max."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        ctrl._max_event_buffer = 10  # 缩小方便测
+
+        class FakeMsg:
+            type = "log"
+            text = "x"
+            location = None
+        for _ in range(50):
+            ctrl._on_console(FakeMsg())
+        # 超过 max (10) 时截断到恰好 max; 50 次后剩 10
+        assert len(ctrl._console_messages) == 10
+
+    def test_request_failed_marks_status_negative(self):
+        """_on_request_failed 标记 status=-1 + failure 原因."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeReq:
+            def __init__(self, url, failure=None):
+                self.method = "GET"
+                self.url = url
+                self.resource_type = "fetch"
+                self.failure = failure
+
+        ctrl._on_request(FakeReq("https://unreachable.example.com"))
+        ctrl._on_request_failed(FakeReq("https://unreachable.example.com", "net::ERR_NAME_NOT_RESOLVED"))
+
+        reqs = ctrl.get_network_requests(only_failed=True)
+        assert len(reqs) == 1
+        assert reqs[0]["status"] == -1
+        assert "ERR_NAME_NOT_RESOLVED" in reqs[0]["failure"]
+
+    def test_get_console_messages_limit(self):
+        """limit 参数控制返回数量."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeMsg:
+            def __init__(self, i):
+                self.type = "log"
+                self.text = f"msg-{i}"
+                self.location = None
+
+        for i in range(20):
+            ctrl._on_console(FakeMsg(i))
+        # limit=5 只看最近 5 条 (msg-15..msg-19)
+        recent = ctrl.get_console_messages(limit=5)
+        assert len(recent) == 5
+        assert recent[-1]["text"] == "msg-19"

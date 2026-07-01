@@ -383,6 +383,75 @@ def screenshot_sidecar(ctx):
     _print(_request("POST", "/screenshot/sidecar", base=ctx.obj["base"]))
 
 
+@tb.group()
+def debug():
+    """T18: Console / Network / PageError 调试接口."""
+
+
+@debug.command("console")
+@click.option("--type", "msg_type",
+              type=click.Choice(["log", "warn", "error", "info", "debug"]),
+              help="按 console 类型过滤")
+@click.option("--limit", default=100, show_default=True)
+@click.pass_context
+def debug_console(ctx, msg_type, limit):
+    """最近 console.log/warn/error (默认 100 条)."""
+    data = _request("GET", "/console", {"type": msg_type, "limit": limit}, base=ctx.obj["base"])
+    if not data:
+        click.echo("(no console messages)")
+        return
+    for m in data:
+        loc = f"  @{m['location']}" if m.get("location") else ""
+        click.echo(f"[{m['type']:5s}] {m['text']}{loc}")
+
+
+@debug.command("network")
+@click.option("--only-failed", is_flag=True, help="只看 4xx/5xx/网络失败")
+@click.option("--method", help="按 HTTP method 过滤 (GET/POST/...)")
+@click.option("--limit", default=100, show_default=True)
+@click.pass_context
+def debug_network(ctx, only_failed, method, limit):
+    """最近 network 请求."""
+    q = {"limit": limit}
+    if only_failed:
+        q["only_failed"] = "true"
+    if method:
+        q["method"] = method
+    data = _request("GET", "/network", q, base=ctx.obj["base"])
+    if not data:
+        click.echo("(no requests)")
+        return
+    for r in data:
+        status = r.get("status", "?")
+        marker = "✗" if (isinstance(status, int) and (status < 0 or status >= 400)) else "✓"
+        click.echo(
+            f"{marker} [{r.get('method','?'):6s}] {status} "
+            f"{r.get('resource_type','?'):10s} {r.get('url','')[:80]}"
+        )
+
+
+@debug.command("errors")
+@click.option("--limit", default=50, show_default=True)
+@click.pass_context
+def debug_errors(ctx, limit):
+    """未捕获 JS 异常 (page.on('pageerror'))."""
+    data = _request("GET", "/errors", {"limit": limit}, base=ctx.obj["base"])
+    if not data:
+        click.echo("(no JS errors)")
+        return
+    for e in data:
+        click.echo(f"[{e.get('name','Error')}] {e.get('message','')}")
+        if e.get("page"):
+            click.echo(f"  page: {e['page']}")
+
+
+@debug.command("clear")
+@click.pass_context
+def debug_clear(ctx):
+    """清空 console/network/error 缓冲 (通常在导航后调用)."""
+    _print(_request("POST", "/debug/clear", base=ctx.obj["base"]))
+
+
 @tb.group("state")
 def state_group():
     """Browser state commands."""

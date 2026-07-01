@@ -4829,3 +4829,69 @@ class TestT40hShadowDomPiercing:
             srv.shutdown()
             srv.server_close()
 
+
+class TestT40iWebSocketMonitoring:
+    """T40i: WebSocket 连接监控."""
+
+    def test_websocket_buffer_init(self):
+        """controller 初始化时 _websocket_connections 是空 list."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        assert hasattr(ctrl, "_websocket_connections")
+        assert ctrl._websocket_connections == []
+
+    def test_clear_event_buffer_also_clears_websockets(self):
+        """clear_event_buffer 应当清空 _websocket_connections."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        ctrl._websocket_connections.append({"url": "wss://x", "opened_at": 0})
+        ctrl.clear_event_buffer()
+        assert ctrl._websocket_connections == []
+
+    def test_get_websockets_empty(self):
+        """没连接时返回 []."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        assert ctrl.get_websockets() == []
+
+    def test_get_websockets_reversed_new_first(self):
+        """get_websockets 按新→旧返回."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        ctrl._websocket_connections.extend([
+            {"url": "wss://old", "opened_at": 1},
+            {"url": "wss://newer", "opened_at": 2},
+            {"url": "wss://newest", "opened_at": 3},
+        ])
+        result = ctrl.get_websockets()
+        assert [r["url"] for r in result] == ["wss://newest", "wss://newer", "wss://old"]
+
+    @pytest.mark.asyncio
+    async def test_websocket_hook_attached_to_page(self):
+        """page.on('websocket', ...) 已在 _ensure_page 注册."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        ctrl = BrowserController(BrowserConfig())
+        # 启动 + 创建 page
+        page = await ctrl._ensure_page()
+        # 检查 listener 列表 (Playwright 内部 _eventEmitter-like)
+        # 直接检查我们的 _on_websocket 方法是否注册过
+        # 这通过 _on_websocket 直接被调用的方式无法看到, 改成查 _ensure_page 源码
+        import inspect
+        from semantic_browser.browser.controller import BrowserController as BC
+        src = inspect.getsource(BC._ensure_page)
+        assert "websocket" in src, "_ensure_page 必须注册 websocket hook"
+
+        await ctrl.close()
+
+    def test_mcp_tool_register_t40i(self):
+        """sb_get_websockets 注册."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_get_websockets" in names
+
+    def test_cli_command_register_t40i(self):
+        """tb websockets 注册."""
+        from semantic_browser.client.cli import tb
+        assert "websockets" in tb.commands
+

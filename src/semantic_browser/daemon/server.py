@@ -267,6 +267,10 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)
+        # T40i: WebSocket 连接列表
+        if method == "GET" and path == "/websockets":
+            limit = int(args.get("limit", 100))
+            return self.owner.browser.controller.get_websockets(limit=limit)
         if method == "POST" and path == "/debug/clear":
             self.owner.browser.controller.clear_event_buffer()
             return {"cleared": True}

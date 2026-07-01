@@ -98,6 +98,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({"name_or_url": {"type": "string"}}, ["name_or_url"])},
     {"name": "sb_extract_api_endpoints", "description": "T40g: 从页面 JS 中提取 API endpoints (fetch/axios/XHR 模式).",
      "inputSchema": _schema({})},
+    {"name": "sb_get_websockets", "description": "T40i: 返回当前累积的 WebSocket 连接列表 (wss:// URLs).",
+     "inputSchema": _schema({"limit": {"type": "integer"}})},
 ]
 
 
@@ -317,6 +319,9 @@ class MCPServer:
         if name == "sb_extract_api_endpoints":
             engine = await self._ensure_started()
             return await engine.controller.extract_api_endpoints()
+        if name == "sb_get_websockets":
+            engine = await self._ensure_started()
+            return engine.controller.get_websockets(limit=int(args.get("limit", 100)))
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

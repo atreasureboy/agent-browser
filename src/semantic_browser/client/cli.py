@@ -626,6 +626,16 @@ def extract_api_endpoints(ctx, json_out):
            json_out=json_out)
 
 
+@tb.command("websockets")
+@click.option("--limit", default=100, type=int)
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def websockets(ctx, limit, json_out):
+    """T40i: 返回累积的 WebSocket 连接列表 (wss://)."""
+    _print(_request("GET", "/websockets", {"limit": limit}, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

@@ -168,6 +168,8 @@ class BrowserController:
         self._console_messages: list[dict[str, Any]] = []
         self._network_requests: list[dict[str, Any]] = []
         self._page_errors: list[dict[str, Any]] = []
+        # T40i: WebSocket 观察 — 每个 (url, opened_at) 一条
+        self._websocket_connections: list[dict[str, Any]] = []
         self._max_event_buffer = 1000  # 防无限增长
 
     async def start(self) -> None:
@@ -264,6 +266,7 @@ class BrowserController:
         if self._context is None:
             await self.start()
         page = await self._context.new_page()
+        page.on("websocket", self._on_websocket)  # T40i
         if url:
             await page.goto(url, wait_until="networkidle")
         # 新建后自动成为当前活跃 tab (Playwright 默认就是, 但 explicit set 更稳)
@@ -325,6 +328,8 @@ class BrowserController:
                 else:
                     await self.start()
             self._page = await self._context.new_page()
+            # T40i: WebSocket 监控 (per-page, open 握手触发)
+            self._page.on("websocket", self._on_websocket)
             self._active_idx = 0
         return self._page
 
@@ -1405,6 +1410,31 @@ class BrowserController:
         self._page_errors.append(entry)
         self._trim_buffer(self._page_errors)
 
+    # ── T40i: WebSocket 观察 ────────────────────────────────
+
+    def _on_websocket(self, ws: Any) -> None:
+        """page.on('websocket') — 每个 WS 连接 open 时记录.
+        ws.url: wss://... 目标
+        ws.on('framesent', ...) / ws.on('framereceived', ...) 可选,
+        这里只记录 URL + 时间, 不抓 payload (可能很大/敏感).
+        """
+        try:
+            entry: dict[str, Any] = {
+                "url": ws.url,
+                "opened_at": time.time(),
+                "page": None,
+            }
+        except Exception:
+            entry = {"url": str(ws), "opened_at": time.time(), "page": None}
+        self._websocket_connections.append(entry)
+        self._trim_buffer(self._websocket_connections)
+
+    def get_websockets(self, limit: int = 100) -> list[dict[str, Any]]:
+        """T40i: 返回累积的 WebSocket 连接列表 (新→旧).
+        给 agent 看页面建立了哪些 WS 通道 (chat/live/realtime API).
+        """
+        return list(reversed(self._websocket_connections[-limit:]))
+
     def _trim_buffer(self, buf: list) -> None:
         """防无限增长; 超过 max 截断到 max (FIFO)."""
         if len(buf) > self._max_event_buffer:
@@ -1443,6 +1473,7 @@ class BrowserController:
         self._console_messages.clear()
         self._network_requests.clear()
         self._page_errors.clear()
+        self._websocket_connections.clear()  # T40i
 
     # ── T17: Cookie / Storage 管理 ───────────────────────────
 

@@ -287,6 +287,45 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/debug/clear":
             self.owner.browser.controller.clear_event_buffer()
             return {"cleared": True}
+        # T43a: 子域名枚举
+        if method == "GET" and path == "/enumerate-subdomains":
+            return self.owner.run(self.owner.browser.controller.enumerate_subdomains(
+                host=args["host"],
+                include_tls_san=str(args.get("include_tls_san", "true")).lower() != "false",
+            ))
+        # T43b: JS secret 扫描
+        if method == "GET" and path == "/extract-secrets-from-js":
+            return self.owner.run(self.owner.browser.controller.extract_secrets_from_js())
+        # T43c: WAF 指纹
+        if method == "GET" and path == "/detect-waf":
+            return self.owner.run(self.owner.browser.controller.detect_waf())
+        # T43d: 开放重定向 sink
+        if method == "GET" and path == "/find-open-redirect-sinks":
+            return self.owner.run(self.owner.browser.controller.find_open_redirect_sinks())
+        # T43e: 敏感信息泄露
+        if method == "GET" and path == "/find-disclosure":
+            return self.owner.run(self.owner.browser.controller.find_disclosure())
+        # T43f: 备份/源码/配置文件
+        if method == "GET" and path == "/analyze-exposed-files":
+            return self.owner.run(self.owner.browser.controller.analyze_exposed_files(
+                base_url=args.get("base_url") or None,
+            ))
+        # T43g: OpenAPI/Swagger 发现
+        if method == "GET" and path == "/discover-api-specs":
+            return self.owner.run(self.owner.browser.controller.discover_api_specs(
+                base_url=args.get("base_url") or None,
+            ))
+        # T43h: TLS 证书 SAN
+        if method == "GET" and path == "/tls-subdomains":
+            return self.owner.run(self.owner.browser.controller.tls_subdomains(
+                host=args["host"], port=int(args.get("port", 443)),
+            ))
+        # T43i: 技术栈指纹
+        if method == "GET" and path == "/fingerprint-tech":
+            return self.owner.run(self.owner.browser.controller.fingerprint_tech())
+        # T43j: JWT 解码
+        if method == "GET" and path == "/decode-jwts":
+            return self.owner.run(self.owner.browser.controller.decode_jwts())
         # T17: cookie / storage 管理
         if method == "GET" and path == "/cookies":
             url = args.get("url") or None
@@ -307,7 +346,7 @@ class TransparentBrowserDaemon:
             return {"cleared": n}
         if method == "GET" and path == "/storage":
             kind = args.get("kind", "local")
-            return self.owner.run(self.owner.browser.controller.get_storage(kind=kind))
+            return self.owner.run(self.owner.browser.controller.read_storage(kind=kind))
         if method == "POST" and path == "/storage/set":
             return self.owner.run(self.owner.browser.controller.set_storage(
                 key=args["key"], value=args["value"], kind=args.get("kind", "local"),

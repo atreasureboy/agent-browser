@@ -655,6 +655,104 @@ def websockets(ctx, limit, json_out):
            json_out=json_out)
 
 
+@tb.command("enumerate-subdomains")
+@click.argument("host")
+@click.option("--no-tls-san", is_flag=True, help="跳过 TLS cert SAN 检查 (只跑 crt.sh)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def enumerate_subdomains(ctx, host, no_tls_san, json_out):
+    """T43a: 子域名枚举 — crt.sh + (默认) TLS cert SAN."""
+    _print(_request("GET", "/enumerate-subdomains",
+                    {"host": host, "include_tls_san": not no_tls_san},
+                    base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("extract-secrets-from-js")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def extract_secrets_from_js(ctx, json_out):
+    """T43b: 扫当前页所有 <script src> 找硬编码 secret (AWS / GitHub / Bearer / api_key / 私钥)."""
+    _print(_request("GET", "/extract-secrets-from-js", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("detect-waf")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def detect_waf(ctx, json_out):
+    """T43c: WAF 指纹 — Cloudflare / Akamai / Imperva / AWS WAF / Fastly / Vercel / Netlify..."""
+    _print(_request("GET", "/detect-waf", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("find-open-redirect-sinks")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def find_open_redirect_sinks(ctx, json_out):
+    """T43d: 扫链接/form action 找开放重定向/SSRF sink (returnUrl, redirect, next, ...)."""
+    _print(_request("GET", "/find-open-redirect-sinks", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("find-disclosure")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def find_disclosure(ctx, json_out):
+    """T43e: 扫页面找敏感泄露 (email / 内网 IP / AWS key / GitHub token / 私钥 / 调试堆栈)."""
+    _print(_request("GET", "/find-disclosure", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("analyze-exposed-files")
+@click.option("--base-url", help="以另一 URL 为基准 (默认当前页 origin)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def analyze_exposed_files(ctx, base_url, json_out):
+    """T43f: 探常见备份/源码/配置文件 (.git/HEAD, .env, phpinfo, .DS_Store...)."""
+    _print(_request("GET", "/analyze-exposed-files",
+                    {"base_url": base_url} if base_url else None,
+                    base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("discover-api-specs")
+@click.option("--base-url", help="以另一 URL 为基准 (默认当前页 origin)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def discover_api_specs(ctx, base_url, json_out):
+    """T43g: 探 OpenAPI / Swagger 端点 (swagger.json, openapi.json, v3/api-docs...)."""
+    _print(_request("GET", "/discover-api-specs",
+                    {"base_url": base_url} if base_url else None,
+                    base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("tls-subdomains")
+@click.argument("host")
+@click.option("--port", default=443, type=int)
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def tls_subdomains(ctx, host, port, json_out):
+    """T43h: TLS 证书解析 — issuer / 有效期 / SAN → 子域."""
+    _print(_request("GET", "/tls-subdomains",
+                    {"host": host, "port": port}, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("fingerprint-tech")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def fingerprint_tech(ctx, json_out):
+    """T43i: 技术栈指纹 — Server / X-Powered-By / meta generator / 框架 cookie."""
+    _print(_request("GET", "/fingerprint-tech", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("decode-jwts")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def decode_jwts(ctx, json_out):
+    """T43j: 在 storage/cookie/页面里找 JWT, 解码 header + payload (不验签)."""
+    _print(_request("GET", "/decode-jwts", base=ctx.obj["base"]), json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

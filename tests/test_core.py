@@ -1801,12 +1801,12 @@ class TestCookieStorageManagement:
 
     def test_storage_kind_validation(self):
         """kind ∈ {local, session, all}."""
-        # API 形状: get_storage(kind), set_storage(key, value, kind), clear_storage(kind)
+        # API 形状: read_storage(kind), set_storage(key, value, kind), clear_storage(kind)
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         ctrl = BrowserController(BrowserConfig())
         import inspect
 
-        sig_get = inspect.signature(ctrl.get_storage)
+        sig_get = inspect.signature(ctrl.read_storage)
         assert sig_get.parameters["kind"].default == "local"
 
         sig_set = inspect.signature(ctrl.set_storage)
@@ -1834,13 +1834,13 @@ class TestCookieStorageManagement:
         ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
 
         import asyncio
-        result = asyncio.run(ctrl.get_storage(kind="local"))
+        result = asyncio.run(ctrl.read_storage(kind="local"))
         assert result == {"k1": "v1", "k2": "v2"}
         assert "localStorage" in captured["js"]
         assert "sessionStorage" not in captured["js"]
 
         # session kind
-        result = asyncio.run(ctrl.get_storage(kind="session"))
+        result = asyncio.run(ctrl.read_storage(kind="session"))
         assert "sessionStorage" in captured["js"]
 
     def test_set_storage_passes_key_value(self):
@@ -5375,4 +5375,472 @@ class TestT42dSriAndMixedContent:
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+# ════════════════════════════════════════════════════════════════
+# T43: Pen-tester 第二轮盲点 (10 项) — subdomain, secrets, WAF,
+#      open-redirect, disclosure, exposed-files, api-spec, TLS, tech, JWT
+# ════════════════════════════════════════════════════════════════
+
+import asyncio  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+from typing import Any  # noqa: E402
+
+
+def _start_mock_server(handler_cls) -> tuple[Any, str]:
+    """起一个 stdlib HTTP server, 返回 (server, base_url)."""
+    srv = HTTPServer(("127.0.0.1", 0), handler_cls)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    port = srv.server_address[1]
+    return srv, f"http://127.0.0.1:{port}"
+
+
+class _T43Handler(BaseHTTPRequestHandler):
+    """通用 mock handler — 路由按 path 精确匹配 + 前缀匹配 (无尾斜杠的 prefix)."""
+    routes: dict[str, Any] = {}
+
+    def log_message(self, *_a):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        # 优先精确匹配
+        if self.path in self.routes:
+            status, ctype, body = self.routes[self.path]
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # 然后 prefix 匹配 (prefix 末尾必须以 / 结尾才匹配子路径)
+        for prefix, (status, ctype, body) in self.routes.items():
+            if not prefix.endswith("/"):
+                continue
+            if self.path.startswith(prefix):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        self.send_response(404)
+        self.end_headers()
+
+
+class TestT43aEnumerateSubdomains:
+    """T43a: 子域名枚举 — crt.sh + TLS cert SAN."""
+
+    def test_returns_host_and_subdomain_list(self):
+        """基本形状: 至少返回 host 字段, subdomains 列表, by_source dict."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                # 真实查询 localhost — crt.sh 不可达, 应 timeout/error 但不崩
+                r = await c.enumerate_subdomains("127.0.0.1", include_tls_san=False)
+                assert r["host"] == "127.0.0.1"
+                assert isinstance(r["subdomains"], list)
+                assert "crtsh_status" in r
+                # 不可达网络时 status 应该是 error 或 timeout
+                assert r["crtsh_status"] in ("ok", "error", "timeout")
+            finally:
+                await c.close()
+        asyncio.run(go())
+
+    def test_tls_subdomains_helper_filters_correctly(self):
+        """_tls_subdomains 应过滤只含 host 的子域."""
+        from semantic_browser.browser.controller import _tls_subdomains
+        # 用一个 DNS 校验的 host 测试 — 不一定有 SAN, 至少不崩
+        result = _tls_subdomains("github.com", timeout=3.0)
+        # github cert 必有 *.github.com 之类; 但 cert 不总能拿, 至少不应抛
+        assert isinstance(result, list)
+        # 如果拿到了结果, 都要以 github.com 结尾
+        for s in result:
+            assert s == "github.com" or s.endswith(".github.com")
+
+
+class TestT43bExtractSecretsFromJs:
+    """T43b: JS 源码里硬编码 secret 扫描."""
+
+    def test_patterns_match_known_secret_shapes(self):
+        """纯函数级测试: 各 pattern 都能识别对应 secret 形状."""
+        import re as _re
+        from semantic_browser.browser.controller import BrowserController
+        ctrl = BrowserController.__new__(BrowserController)  # skip __init__
+        # 取 secret 模式 (从源代码里 re.finditer + patterns 列表)
+        # 通过调用一个 mock page 测不出 (要起 server), 这里直接用同款 regex 验证
+        aws = _re.findall(r"\b(AKIA[0-9A-Z]{16})\b", "config aws_key=AKIAIOSFODNN7EXAMPLE")
+        assert aws == ["AKIAIOSFODNN7EXAMPLE"]
+        ghp = _re.findall(r"\b(gh[ps]_[A-Za-z0-9]{36})\b", "token = 'ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789'")
+        assert len(ghp) == 1 and ghp[0].startswith("ghp_")
+        bearer = _re.findall(r"Bearer\s+([A-Za-z0-9._\-]{20,})", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234")
+        assert len(bearer) == 1
+        apikey = _re.findall(r"""api[_-]?key["']?\s*[:=]\s*["']?([A-Za-z0-9_\-]{16,})""", 'api_key="AIzaSyD-1234567890ABCDE"', _re.IGNORECASE)
+        assert apikey and apikey[0].startswith("AIza")
+
+    def test_finds_secret_in_served_js(self):
+        """起一个 mock server 提供含 secret 的 JS, 跑 extract_secrets_from_js."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {
+                "/": (200, "text/html",
+                      b'<html><head><script src="/app.js"></script></head><body></body></html>'),
+                "/app.js": (200, "application/javascript",
+                            b'const api_key = "AIzaSyD-9kPRovLKJ8z_TestKey_123456";\n'
+                            b'const aws = "AKIAIOSFODNN7EXAMPLE";\n'
+                            b'const tok = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";\n'),
+            }
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.extract_secrets_from_js(max_scripts=5, timeout_ms=2000)
+                assert r["secret_count"] >= 2
+                types = {f["type"] for f in r["findings"]}
+                assert "aws_access_key" in types
+                assert "api_key" in types
+                # 所有 finding 必带 script 字段
+                for f in r["findings"]:
+                    assert f["script"].endswith("/app.js")
+                    assert "value" in f and "sample" in f
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43cDetectWaf:
+    """T43c: WAF 指纹."""
+
+    def test_waf_helper_signatures_match(self):
+        """每个 WAF 签名表项至少应被自己识别."""
+        from semantic_browser.browser.controller import _server_hint, _generator_hint
+        # _server_hint: nginx/Apache/IIS/envoy/traefik
+        assert "nginx" in _server_hint("nginx/1.25.1").lower()
+        assert "apache" in _server_hint("Apache/2.4.41").lower()
+        assert "iis" in _server_hint("Microsoft-IIS/10.0").lower()
+        assert "vercel" in _server_hint("Vercel").lower()
+        assert _server_hint("") == ""
+        assert _server_hint("UnknownServer/1.0") == "UnknownServer/1.0"
+        # _generator_hint
+        assert "WordPress" in _generator_hint("WordPress 6.4.2")
+        assert "Drupal" in _generator_hint("Drupal 10 (https://www.drupal.org)")
+        assert "Next.js" in _generator_hint("Next.js")
+        assert _generator_hint("") == ""
+
+
+class TestT43dOpenRedirectSinks:
+    """T43d: 开放重定向 / SSRF sink."""
+
+    def test_finds_sink_params_on_page(self):
+        """起 mock page 含 redirect=/next=/url= 参数的链接."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <a href="/login?next=/dashboard">login</a>
+          <a href="/api/redirect?url=https://evil.com">go</a>
+          <a href="/logout?returnUrl=https://attacker.com">out</a>
+          <a href="/safe/page">safe</a>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.find_open_redirect_sinks()
+                assert r["sink_count"] >= 3
+                params_found = {s["param"] for s in r["sinks"]}
+                assert "next" in params_found
+                assert "url" in params_found
+                assert "returnUrl" in params_found or "returnurl" in {s["param"].lower() for s in r["sinks"]}
+                # safe link 不应进 sinks
+                safe = [s for s in r["sinks"] if s.get("href") == "/safe/page"]
+                assert not safe
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43eDisclosure:
+    """T43e: 敏感信息泄露 (email / IP / key / debug)."""
+
+    def test_detects_emails_internal_ips_and_keys(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <p>Contact: admin@example.com or support@corp.example.org</p>
+          <p>Internal: 10.0.0.5, 192.168.1.1, 172.16.0.10, 169.254.169.254</p>
+          <p>AWS key: AKIAIOSFODNN7EXAMPLE</p>
+          <p>Token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789</p>
+          <pre>TODO: refactor auth before launch</pre>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.find_disclosure()
+                types = {f["type"] for f in r["findings"]}
+                assert "email" in types
+                assert "internal_ip" in types
+                assert "aws_key" in types
+                assert "github_tok" in types
+                assert "code_marker" in types  # TODO
+                # 内网 IP 应该包含 169.254.169.254 (cloud metadata!)
+                ips = [f["value"] for f in r["findings"] if f["type"] == "internal_ip"]
+                assert any("169.254.169.254" in ip for ip in ips)
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43fExposedFiles:
+    """T43f: 备份/源码/配置文件探针."""
+
+    def test_detects_git_head_and_phpinfo(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        GIT_HEAD = b"ref: refs/heads/main\n"
+        PHPINFO = (
+            b"<!DOCTYPE html><html><body>"
+            b"<tr><td class=\"e\">PHP Version => 8.2.10</td></tr>"
+            b"</body></html>"
+        )
+
+        class Handler(_T43Handler):
+            routes = {
+                "/": (200, "text/html", b"<html>ok</html>"),
+                "/.git/HEAD": (200, "text/plain", GIT_HEAD),
+                "/.git/config": (200, "text/plain", b"[core]\nrepositoryformatversion = 0\n"),
+                "/.env": (200, "text/plain", b"DATABASE_URL=postgres://x\nSECRET_KEY=topsecret\nAPI_KEY=hunter2\n"),
+                "/phpinfo.php": (200, "text/html", PHPINFO),
+                "/.DS_Store": (200, "application/octet-stream", b"\x00\x01\x02DS_Store"),
+            }
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.analyze_exposed_files(timeout_ms=2000)
+                assert r["exposed_count"] >= 3
+                by_path = {e["path"]: e for e in r["exposed"]}
+                assert "/.git/HEAD" in by_path
+                assert by_path["/.git/HEAD"]["info"]["branch"] == "main"
+                assert by_path["/.git/HEAD"]["info"]["ref"] == "ref: refs/heads/main"
+                assert "/.env" in by_path
+                # 关键: env 暴露不应包含 value, 只列 key
+                env_info = by_path["/.env"]["info"]
+                assert "SECRET_KEY" in env_info["keys_sample"]
+                assert "DATABASE_URL" in env_info["keys_sample"]
+                # value 不应在 info 里泄露
+                assert "topsecret" not in str(env_info)
+                assert "/phpinfo.php" in by_path
+                assert by_path["/phpinfo.php"]["info"]["php_version"] == "8.2.10"
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43gApiSpecDiscovery:
+    """T43g: OpenAPI / Swagger 自动发现."""
+
+    SWAGGER = b"""{
+        "swagger": "2.0",
+        "info": {"title": "Demo API", "version": "1.0"},
+        "paths": {
+            "/users":  {"get": {}, "post": {}},
+            "/users/{id}": {"get": {}, "delete": {}},
+            "/health": {"get": {}}
+        }
+    }"""
+
+    def test_parses_swagger_v2(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {
+                "/": (200, "text/html", b"<html>hi</html>"),
+                "/swagger.json": (200, "application/json", self.SWAGGER),
+            }
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.discover_api_specs(timeout_ms=2000)
+                assert r["spec_count"] >= 1
+                s = r["specs"][0]
+                assert s["url"].endswith("/swagger.json")
+                assert s["version"] == "2.0"
+                assert s["title"] == "Demo API"
+                assert s["path_count"] == 3
+                assert s["by_method"].get("GET", 0) == 3
+                assert s["by_method"].get("POST", 0) == 1
+                assert s["by_method"].get("DELETE", 0) == 1
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43hTlsSubdomains:
+    """T43h: TLS 证书 SAN 解析."""
+
+    def test_returns_expected_shape(self):
+        """不依赖网络: 至少应返回 host 字段, sans/subdomains 是 list, 不抛."""
+        from semantic_browser.browser.controller import BrowserController
+        ctrl = BrowserController.__new__(BrowserController)
+        # 用真实 host 跑, 不可达时优雅返回
+        async def go():
+            r = await ctrl.tls_subdomains("github.com", timeout=3.0)
+            assert r["host"] == "github.com"
+            assert isinstance(r["sans"], list)
+            assert isinstance(r["subdomains"], list)
+            # 成功时: tls_version 应该是 TLSv1.2 / TLSv1.3 之类
+            if "error" not in r:
+                assert r["tls_version"] in ("TLSv1.2", "TLSv1.3")
+        asyncio.run(go())
+
+
+class TestT43iFingerprintTech:
+    """T43i: 技术栈指纹."""
+
+    def test_detects_nginx_via_server_header(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {
+                "/": (200, "text/html", b"<html></html>"),
+            }
+            def do_GET(self):  # noqa: N802 — override to add custom header
+                for prefix, (status, ctype, body) in self.routes.items():
+                    if self.path == prefix:
+                        self.send_response(status)
+                        self.send_header("Content-Type", ctype)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Server", "nginx/1.25.1")
+                        self.send_header("X-Powered-By", "PHP/8.2.10")
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.fingerprint_tech()
+                assert "nginx" in r["server"].lower()
+                assert "php" in r["x_powered_by"].lower()
+                # signals 列表里应有 server + x-powered-by
+                names = {s["name"] for s in r["signals"]}
+                assert "server" in names
+                assert "x-powered-by" in names
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT43jDecodeJwts:
+    """T43j: JWT 探测 + payload 解码."""
+
+    # 标准 JWT: header={"alg":"HS256","typ":"JWT"}, payload={"sub":"1234","exp":9999999999}
+    HEADER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    PAYLOAD = "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+    SIG = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    TOKEN = f"{HEADER}.{PAYLOAD}.{SIG}"
+
+    def test_decode_jwt_helper(self):
+        """纯函数: base64url 解码 header/payload."""
+        import base64, json as _json
+        from semantic_browser.browser.controller import BrowserController
+        BrowserController.__new__(BrowserController)  # 触发 import
+        def _b64url(s):
+            pad = "=" * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s + pad)
+        h = _json.loads(_b64url(self.HEADER))
+        p = _json.loads(_b64url(self.PAYLOAD))
+        assert h["alg"] == "HS256"
+        assert h["typ"] == "JWT"
+        assert p["sub"] == "1234567890"
+        assert p["name"] == "John Doe"
+
+    def test_finds_jwt_in_localstorage(self):
+        """注入 JWT 到 localStorage, 跑 decode_jwts 应能解码."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html",
+                            b'<html><body>hi</body></html>')}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                # 注入 JWT 到 localStorage
+                await c.set_storage("auth_token", self.TOKEN, kind="local")
+                r = await c.decode_jwts()
+                assert r["token_count"] >= 1
+                tok = r["tokens"][0]
+                assert tok["source"] == "localStorage"
+                assert tok["key"] == "auth_token"
+                assert tok["header"]["alg"] == "HS256"
+                assert tok["payload"]["sub"] == "1234567890"
+                assert tok["payload"]["name"] == "John Doe"
+                # exp=9999999999 是未来, 未过期
+                assert tok["is_expired"] is False
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
 

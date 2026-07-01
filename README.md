@@ -247,6 +247,36 @@ tb detect-graphql https://api.example.com/graphql
 
 T42 补的是 pen-tester 视角盲点 (CSRF token 抓不到 / JS lib CVE 不识别 / CORS misconfig 不报警 / SRI 不检查 / soft-404 不识别 / debug 端点不探 / GraphQL schema 不 dump / 上传字段不标) — 实测在 GitHub 上成功抓到 `authenticity_token` CSRF token.
 
+## T43 — Pen-tester 第二轮盲点 (10 项)
+
+用户第一轮"全修"之后再次以 agent 身份对真实站点跑全套 T40+T42, 又发现 10 个缺失能力:
+
+```bash
+# T43a: 子域名枚举 — crt.sh (Certificate Transparency) + TLS cert SAN
+tb enumerate-subdomains github.com
+# T43b: JS 源码硬编码 secret 扫描 (AWS key / GitHub token / Bearer / api_key / 私钥)
+tb extract-secrets-from-js
+# T43c: WAF 指纹 (Cloudflare / Akamai / Imperva / AWS WAF / Fastly / Vercel / Netlify / Sucuri)
+tb detect-waf
+# T43d: 开放重定向 / SSRF sink 检测 (returnUrl, redirect, next, url, callback, ...)
+tb find-open-redirect-sinks
+# T43e: 敏感信息泄露 (email / 内网 IP / AWS key / GitHub token / 私钥 / 调试堆栈 / TODO)
+tb find-disclosure
+# T43f: 备份/源码/配置文件暴露分析 (.git/HEAD / .env / phpinfo / .DS_Store)
+#       注: .env 解析只列 key 不列 value, 避免误报出真密码
+tb analyze-exposed-files
+# T43g: OpenAPI / Swagger 自动发现 + 解析 (paths / methods / by_method)
+tb discover-api-specs
+# T43h: TLS 证书解析 — issuer / 有效期 / SAN → 子域
+tb tls-subdomains github.com
+# T43i: 技术栈指纹 (Server / X-Powered-By / meta generator / 框架 cookie)
+tb fingerprint-tech
+# T43j: JWT 探测 + payload 解码 (在 storage/cookie/页面里找, 不验签)
+tb decode-jwts
+```
+
+覆盖的是 pen-tester recon 阶段最常用的能力: 子域扫描、敏感泄露、技术栈识别、secret 抓取。所有 10 项同时通过 MCP / CLI / daemon 三层暴露。
+
 ## 后续路线
 
 - [ ] MCP Server 封装（作为 Hermes MCP 插件）

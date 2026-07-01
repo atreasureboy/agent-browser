@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
@@ -1881,10 +1883,11 @@ class BrowserController:
         await self._context.clear_cookies()
         return before
 
-    async def get_storage(self, kind: str = "local") -> dict[str, str]:
+    async def read_storage(self, kind: str = "local") -> dict[str, str]:
         """读 localStorage / sessionStorage. kind: 'local' or 'session'.
 
         Returns {key: value} (value 是 str; 复杂类型可能需要 agent 自己 parse).
+        注: T40a 完整版 (含 cookies) 用 get_storage() (无 kind 参数).
         """
         target = await self._active_page_or_frame()
         storage_kind = "localStorage" if kind == "local" else "sessionStorage"
@@ -2121,6 +2124,929 @@ class BrowserController:
             return self._frame
         return await self._ensure_page()
 
+    # ── T43a: 子域名枚举 (crt.sh + TLS cert SAN) ──────────
+
+    async def enumerate_subdomains(
+        self,
+        host: str,
+        *,
+        include_tls_san: bool = True,
+        crtsh_timeout: float = 12.0,
+    ) -> dict[str, Any]:
+        """T43a: 子域名枚举 — pen-tester recon 第一步.
+
+        1. crt.sh JSON API (Certificate Transparency logs)
+        2. 可选: TLS cert SAN 解析 (fallback / 补全)
+
+        Returns {
+          "host",
+          "subdomains": [sorted unique list ending in host],
+          "by_source": {"crtsh": N, "tls_san": M},
+          "crtsh_status": "ok" | "timeout" | "error",
+          "crtsh_error": str | None,
+          "subdomain_count": int,
+        }
+        """
+        import json as _json
+        import re as _re
+        from urllib.request import urlopen, Request
+        from urllib.error import URLError
+
+        seen: dict[str, set[str]] = {}
+        crtsh_status = "ok"
+        crtsh_error: str | None = None
+
+        # 1) crt.sh
+        try:
+            url = f"https://crt.sh/?q={host}&output=json"
+            req = Request(url, headers={"User-Agent": "semantic-browser-recon/1.0"})
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urlopen(req, timeout=crtsh_timeout, context=ctx) as r:  # noqa: S310 - intentional CT log query
+                body = r.read()
+            entries = _json.loads(body)
+            for e in entries:
+                nv = e.get("name_value") or ""
+                for s in nv.split("\n"):
+                    s = s.strip().lower().lstrip("*.")
+                    if not s or s == host:
+                        continue
+                    if s.endswith("." + host) or s == host:
+                        seen.setdefault(s, set()).add("crtsh")
+        except (URLError, TimeoutError, ValueError) as e:
+            crtsh_status = "error" if "timeout" not in str(e).lower() else "timeout"
+            crtsh_error = str(e)[:200]
+
+        # 2) TLS SAN (optional)
+        if include_tls_san:
+            for s in _tls_subdomains(host):
+                seen.setdefault(s, set()).add("tls_san")
+
+        subdomains = sorted(seen.keys())
+        by_source: dict[str, int] = {}
+        for srcs in seen.values():
+            for src in srcs:
+                by_source[src] = by_source.get(src, 0) + 1
+        return {
+            "host": host,
+            "subdomains": subdomains,
+            "by_source": by_source,
+            "crtsh_status": crtsh_status,
+            "crtsh_error": crtsh_error,
+            "subdomain_count": len(subdomains),
+        }
+
+    # ── T43b: JS 源码硬编码 secret 扫描 ────────────────────
+
+    async def extract_secrets_from_js(
+        self,
+        *,
+        max_scripts: int = 20,
+        max_body: int = 200_000,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        r"""T43b: 扫页面所有 <script src> 源码, 找硬编码 secret.
+
+        模式:
+          - AWS access key:    AKIA[0-9A-Z]{16}
+          - AWS secret key:    [A-Za-z0-9/+=]{40} 紧跟 aws_secret
+          - GitHub token:      ghp_[A-Za-z0-9]{36} / gho_/ghs_/ghr_
+          - Slack token:       xox[baprs]-[A-Za-z0-9-]+
+          - Google API key:    AIza[0-9A-Za-z_-]{35}
+          - Generic Bearer:    Bearer [A-Za-z0-9._-]{20,}
+          - api_key=:          api[_-]?key["']?\s*[:=]\s*["']?([A-Za-z0-9_\-]{16,})
+          - password=:         (?:password|passwd|pwd)\s*[:=]\s*["']([^"']{6,})["']
+          - private key:       -----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----
+
+        Returns {
+          "page_url",
+          "scripts_scanned", "scripts_failed",
+          "findings": [
+            {"type", "value" (truncated 80), "script", "sample" (50 chars around match)},
+            ...
+          ],
+          "by_type": {"aws_access_key": N, "github_token": M, ...},
+          "secret_count": int,
+        }
+        """
+        import re as _re
+        from urllib.parse import urljoin
+        import httpx
+
+        page = await self._ensure_page()
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            return out;
+        }""")
+        scripts = scripts[:max_scripts]
+        page_url = page.url
+        abs_urls = [urljoin(page_url, s) for s in scripts if s]
+
+        # secret patterns: (name, regex, group_idx_for_value)
+        patterns: list[tuple[str, _re.Pattern[str], int]] = [
+            ("aws_access_key", _re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), 1),
+            ("github_token",   _re.compile(r"\b(gh[ps]_[A-Za-z0-9]{36})\b"), 1),
+            ("slack_token",    _re.compile(r"\b(xox[baprs]-[A-Za-z0-9-]{10,})\b"), 1),
+            ("google_api_key", _re.compile(r"\b(AIza[0-9A-Za-z_-]{35})\b"), 1),
+            ("bearer",         _re.compile(r"Bearer\s+([A-Za-z0-9._\-]{20,})"), 1),
+            ("api_key",        _re.compile(r"""api[_-]?key["']?\s*[:=]\s*["']?([A-Za-z0-9_\-]{16,})""", _re.IGNORECASE), 1),
+            ("password",       _re.compile(r"""(?:password|passwd|pwd)\s*[:=]\s*["']([^"']{6,})["']""", _re.IGNORECASE), 1),
+            ("private_key",    _re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"), 0),
+        ]
+
+        findings: list[dict[str, Any]] = []
+        scripts_scanned = 0
+        scripts_failed = 0
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-probe/1.0"},
+            follow_redirects=True,
+        ) as client:
+            for url in abs_urls:
+                try:
+                    r = await client.get(url)
+                    body = r.text[:max_body]
+                    scripts_scanned += 1
+                except Exception:
+                    scripts_failed += 1
+                    continue
+                for name, pat, g in patterns:
+                    for m in pat.finditer(body):
+                        val = m.group(g) if g else m.group(0)
+                        start = max(0, m.start() - 30)
+                        end = min(len(body), m.end() + 30)
+                        sample = body[start:end].replace("\n", " ")
+                        findings.append({
+                            "type": name,
+                            "value": (val or "")[:80],
+                            "script": url,
+                            "sample": sample[:120],
+                        })
+
+        # dedup by (type, value, script)
+        seen = set()
+        uniq = []
+        for f in findings:
+            k = (f["type"], f["value"], f["script"])
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(f)
+
+        by_type: dict[str, int] = {}
+        for f in uniq:
+            by_type[f["type"]] = by_type.get(f["type"], 0) + 1
+        return {
+            "page_url": page_url,
+            "scripts_scanned": scripts_scanned,
+            "scripts_failed": scripts_failed,
+            "findings": uniq,
+            "by_type": by_type,
+            "secret_count": len(uniq),
+        }
+
+    # ── T43c: WAF 指纹 ────────────────────────────────
+
+    async def detect_waf(self) -> dict[str, Any]:
+        """T43c: WAF 指纹 — 综合 response headers / cookies / 页面内容.
+
+        检测对象: Cloudflare, Akamai, Imperva, AWS WAF, Fastly, Vercel, Netlify, Sucuri.
+
+        Returns {
+          "page_url",
+          "detected": [waf_name, ...],     # 可能多个 (WAF 链)
+          "signals": [{waf, indicator, value, kind: "header"|"cookie"|"content"}],
+          "confidence": "high" | "medium" | "low" | "none",
+        }
+        """
+        page = await self._ensure_page()
+        # 1) 当前页的 response headers (来自最近一次请求)
+        try:
+            resp = await page.request.fetch(page.url, method="GET", max_redirects=5)
+            headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+        except Exception:
+            headers = {}
+        # 也加上 document 的 main resource headers
+        try:
+            main_resource = await page.evaluate("() => performance.getEntriesByType('navigation')[0] || {}")
+            for k, v in (main_resource or {}).items():
+                if isinstance(v, str) and ":" in v:
+                    pass  # not standard headers
+        except Exception:
+            pass
+
+        # 2) cookies
+        try:
+            cookies = await self._context.cookies()
+            cookie_names = {c.get("name", "").lower() for c in cookies}
+        except Exception:
+            cookie_names = set()
+
+        # 3) 页面内容 (title + meta)
+        try:
+            content = await page.content()
+        except Exception:
+            content = ""
+        content_lower = content[:20000].lower()
+
+        # WAF signatures: (name, header_pattern, cookie_pattern, content_pattern)
+        # pattern = None means skip
+        waf_sigs: list[tuple[str, str | None, str | None, str | None]] = [
+            ("Cloudflare", r"cloudflare|cf-ray|cf-cache-status", r"__cfuid|cf_clearance|cf_bm", r"cloudflare"),
+            ("Akamai",     r"akamai|x-akamai", r"_abck|ak_bmsc|bmuid", r"akamai"),
+            ("Imperva",    r"x-iinfo|x-cdn|incapsula", r"incap_ses|visid_incap|nlbi_", r"incapsula|imperva"),
+            ("AWS WAF",    r"x-amzn-waf|awsalb|awselb|x-amz-cf-id", r"awsalb|awselb", None),
+            ("Fastly",     r"x-served-by|x-fastly|x-fasto", r"fastly", None),
+            ("Vercel",     r"x-vercel-id|server:\s*vercel", r"__vercel", None),
+            ("Netlify",    r"server:\s*netlify|x-nf-request-id", r"netlify", None),
+            ("Sucuri",     r"x-sucuri-id|x-sucuri-cache", r"sucuri", r"sucuri"),
+            ("CloudFront", r"x-amz-cf-id|x-amz-cf-pop|via:\s*cloudfront", None, None),
+            ("Wordfence",  None, r"wfwaf-authcookie|wfvt_", r"wordfence"),
+        ]
+
+        signals: list[dict[str, str]] = []
+        detected: list[str] = []
+        import re as _re
+        for waf, hp, cp, ctp in waf_sigs:
+            hit = False
+            if hp:
+                for k, v in headers.items():
+                    if _re.search(hp, f"{k}: {v}", _re.IGNORECASE):
+                        signals.append({"waf": waf, "indicator": f"{k}: {v[:60]}", "kind": "header"})
+                        hit = True
+                        break
+            if not hit and cp:
+                for cn in cookie_names:
+                    if _re.search(cp, cn, _re.IGNORECASE):
+                        signals.append({"waf": waf, "indicator": f"cookie: {cn}", "kind": "cookie"})
+                        hit = True
+                        break
+            if not hit and ctp and _re.search(ctp, content_lower, _re.IGNORECASE):
+                signals.append({"waf": waf, "indicator": f"content match: {ctp}", "kind": "content"})
+                hit = True
+            if hit:
+                detected.append(waf)
+
+        if len(detected) >= 2:
+            confidence = "high"
+        elif len(detected) == 1:
+            # 多个 signals → high, 单 signal → medium
+            waf_signals = [s for s in signals if s["waf"] == detected[0]]
+            confidence = "high" if len(waf_signals) >= 2 else "medium"
+        else:
+            confidence = "none"
+        return {
+            "page_url": page.url,
+            "detected": detected,
+            "signals": signals,
+            "confidence": confidence,
+        }
+
+    # ── T43d: 开放重定向 / SSRF sink 检测 ─────────────────
+
+    async def find_open_redirect_sinks(self) -> dict[str, Any]:
+        """T43d: 扫页面所有链接 + form action, 找可能开放重定向/SSRF 的参数.
+
+        Sink params: returnUrl, redirect, url, next, return, return_to, continue,
+                     back, target, redir, redirect_uri, callback, image, fetch
+        Sink 路径:   /api/redirect?url=, /login?next=, /logout?redirect=
+        Returns {
+          "page_url",
+          "sinks": [
+            {"source": "link" | "form", "href": "...", "param": "next", "value": "/dashboard"},
+            ...
+          ],
+          "sink_count": int,
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        # 抓所有 link href + form action
+        links = await page.evaluate("""() => {
+            const out = [];
+            for (const a of document.querySelectorAll('a[href]')) {
+                const h = a.getAttribute('href');
+                if (h) out.push(h);
+            }
+            for (const f of document.querySelectorAll('form[action]')) {
+                const a = f.getAttribute('action');
+                if (a) out.push(a);
+            }
+            return out;
+        }""")
+        # sink param names (lowercase)
+        SINK_PARAMS = {
+            "returnurl", "redirect", "url", "next", "return",
+            "return_to", "continue", "back", "target", "redir",
+            "redirect_uri", "callback", "image", "fetch", "site",
+            "view", "page", "dest", "destination", "out",
+        }
+        # sink path patterns
+        SINK_PATHS = _re.compile(r"/(?:api/redirect|login|logout|oauth/authorize|auth/callback)", _re.IGNORECASE)
+
+        sinks: list[dict[str, str]] = []
+        seen = set()
+        for href in links:
+            # 拆 query
+            if "?" not in href:
+                # 也看 path 模式
+                if SINK_PATHS.search(href):
+                    key = ("path", href)
+                    if key not in seen:
+                        seen.add(key)
+                        sinks.append({"source": "path", "href": href[:300], "param": "path", "value": href[:120]})
+                continue
+            path_part, _, query = href.partition("?")
+            try:
+                from urllib.parse import parse_qs
+                params = parse_qs(query)
+            except Exception:
+                continue
+            for k, vals in params.items():
+                if k.lower() in SINK_PARAMS:
+                    v = vals[0] if vals else ""
+                    key = (k, v, path_part[:80])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    sinks.append({
+                        "source": "query",
+                        "href": href[:300],
+                        "param": k,
+                        "value": v[:200],
+                    })
+            if SINK_PATHS.search(path_part):
+                key = ("path", path_part)
+                if key not in seen:
+                    seen.add(key)
+                    sinks.append({
+                        "source": "path",
+                        "href": href[:300],
+                        "param": "path",
+                        "value": path_part[:200],
+                    })
+        return {
+            "page_url": page.url,
+            "sinks": sinks[:100],
+            "sink_count": len(sinks),
+        }
+
+    # ── T43e: 敏感信息泄露扫描 ────────────────────────
+
+    async def find_disclosure(self) -> dict[str, Any]:
+        """T43e: 扫页面 HTML 找敏感泄露.
+
+        检测:
+          - email
+          - 内网 IP (RFC1918 + 127.x + 169.254.x)
+          - AWS access key (AKIA[0-9A-Z]{16})
+          - GitHub token (gh*_*)
+          - Private key header
+          - debug 字符串 ("Stack trace", "Exception in", "DEBUG =", "Traceback")
+          - 注释里的 TODO/FIXME/HACK/XXX
+
+        Returns {
+          "page_url",
+          "findings": [{type, value, context}],
+          "by_type": {email: N, internal_ip: M, ...},
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        content = await page.content()
+
+        patterns: list[tuple[str, _re.Pattern[str], int]] = [
+            ("email",       _re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), 0),
+            ("internal_ip", _re.compile(r"\b(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|127\.\d+\.\d+\.\d+|169\.254\.\d+\.\d+)\b"), 0),
+            ("aws_key",     _re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), 1),
+            ("github_tok",  _re.compile(r"\b(gh[ps]_[A-Za-z0-9]{36})\b"), 1),
+            ("private_key", _re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"), 0),
+            ("debug_str",   _re.compile(r"(?i)(?:stack trace|traceback \(most recent|exception in|debug\s*=\s*True|tb_last)"), 0),
+            ("code_marker", _re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s]"), 0),
+        ]
+
+        findings: list[dict[str, str]] = []
+        seen = set()
+        for name, pat, g in patterns:
+            for m in pat.finditer(content):
+                val = m.group(g) if g else m.group(0)
+                start = max(0, m.start() - 30)
+                end = min(len(content), m.end() + 30)
+                ctx = content[start:end].replace("\n", " ")[:120]
+                k = (name, val[:80])
+                if k in seen:
+                    continue
+                seen.add(k)
+                findings.append({
+                    "type": name,
+                    "value": (val or "")[:120],
+                    "context": ctx,
+                })
+        by_type: dict[str, int] = {}
+        for f in findings:
+            by_type[f["type"]] = by_type.get(f["type"], 0) + 1
+        return {
+            "page_url": page.url,
+            "findings": findings[:200],
+            "by_type": by_type,
+            "finding_count": len(findings),
+        }
+
+    # ── T43f: 备份/源码/配置文件暴露分析 ───────────────
+
+    async def analyze_exposed_files(
+        self,
+        base_url: str | None = None,
+        *,
+        timeout_ms: int = 4000,
+    ) -> dict[str, Any]:
+        """T43f: 探常见备份/源码/配置文件, 解析暴露内容.
+
+        探针:
+          /.git/HEAD, /.git/config, /.svn/entries
+          /.env, /.env.local, /.env.production
+          /.DS_Store, /Thumbs.db
+          /backup.zip, /backup.tar.gz, /dump.sql, /db.sqlite
+          /phpinfo.php, /server-status, /server-info
+          /wp-config.php.bak, /config.php.bak, /config.yml.bak
+
+        Returns {
+          "base_url",
+          "exposed": [
+            {"path", "status", "size", "kind": "git"|"env"|"backup"|"config"|"other", "info": {...}}
+          ],
+          "exposed_count": int,
+        }
+        """
+        import re as _re
+        from urllib.parse import urlparse
+        import httpx
+
+        page = await self._ensure_page()
+        if not base_url:
+            base_url = page.url
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port and not (
+            (parsed.scheme == "http" and parsed.port == 80)
+            or (parsed.scheme == "https" and parsed.port == 443)
+        ):
+            origin += f":{parsed.port}"
+
+        PROBES = [
+            ("/.git/HEAD", "git"),
+            ("/.git/config", "git"),
+            ("/.svn/entries", "svn"),
+            ("/.env", "env"),
+            ("/.env.local", "env"),
+            ("/.env.production", "env"),
+            ("/.DS_Store", "macos"),
+            ("/Thumbs.db", "windows"),
+            ("/backup.zip", "backup"),
+            ("/backup.tar.gz", "backup"),
+            ("/dump.sql", "backup"),
+            ("/db.sqlite", "backup"),
+            ("/db.sqlite3", "backup"),
+            ("/phpinfo.php", "phpinfo"),
+            ("/server-status", "apache"),
+            ("/server-info", "apache"),
+            ("/wp-config.php.bak", "config"),
+            ("/config.php.bak", "config"),
+            ("/config.yml.bak", "config"),
+            ("/.htaccess", "htaccess"),
+            ("/web.config", "config"),
+        ]
+
+        exposed: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-recon/1.0"},
+            follow_redirects=False,
+        ) as client:
+            for path, kind in PROBES:
+                url = origin + path
+                try:
+                    r = await client.get(url)
+                except Exception:
+                    continue
+                if r.status_code >= 400:
+                    continue
+                body = r.content[:20000]
+                size = len(body)
+                info: dict[str, Any] = {}
+                if kind == "git":
+                    text = body.decode("utf-8", errors="ignore").strip()
+                    info["ref"] = text[:120]
+                    if text.startswith("ref:"):
+                        info["branch"] = text.split("/")[-1].strip()
+                elif kind == "env":
+                    text = body.decode("utf-8", errors="ignore")
+                    # 只列 key 不列 value (避免误报出真密码)
+                    keys = []
+                    for line in text.splitlines():
+                        if "=" in line and not line.strip().startswith("#"):
+                            k = line.split("=", 1)[0].strip()
+                            if k and _re.match(r"^[A-Z_][A-Z0-9_]*$", k):
+                                keys.append(k)
+                    info["key_count"] = len(keys)
+                    info["keys_sample"] = keys[:10]
+                elif kind == "phpinfo":
+                    text = body.decode("utf-8", errors="ignore")
+                    v = _re.search(r"PHP Version\s*=>\s*([\d.]+)", text)
+                    if v:
+                        info["php_version"] = v.group(1)
+                    else:
+                        info["php_version"] = "unknown"
+                elif kind == "apache":
+                    text = body.decode("utf-8", errors="ignore")
+                    if "Apache" in text:
+                        info["server"] = "Apache (status page exposed)"
+                elif kind in ("backup", "svn", "macos", "windows", "config", "htaccess"):
+                    text = body.decode("utf-8", errors="ignore")
+                    if kind == "htaccess":
+                        # 只看第一行 (RewriteRule / Deny / AuthType)
+                        info["first_line"] = text.splitlines()[0][:120] if text else ""
+                exposed.append({
+                    "path": path,
+                    "status": r.status_code,
+                    "size": size,
+                    "kind": kind,
+                    "info": info,
+                })
+        return {
+            "base_url": base_url,
+            "exposed": exposed,
+            "exposed_count": len(exposed),
+        }
+
+    # ── T43g: OpenAPI / Swagger 自动发现 + 解析 ────────────
+
+    async def discover_api_specs(
+        self,
+        base_url: str | None = None,
+        *,
+        timeout_ms: int = 4000,
+    ) -> dict[str, Any]:
+        """T43g: 探常见 OpenAPI / Swagger 路径, 解析 path + method.
+
+        探针:
+          /swagger.json, /openapi.json, /api/swagger.json,
+          /api/openapi.json, /api/v1/openapi.json, /api/v2/openapi.json,
+          /v3/api-docs, /api-docs, /swagger/v1/swagger.json
+
+        Returns {
+          "base_url",
+          "specs": [
+            {"url", "version", "title", "path_count", "method_count", "by_method": {GET:N,POST:M}}
+          ],
+          "spec_count": int,
+        }
+        """
+        import json as _json
+        from urllib.parse import urlparse
+        import httpx
+
+        page = await self._ensure_page()
+        if not base_url:
+            base_url = page.url
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port and not (
+            (parsed.scheme == "http" and parsed.port == 80)
+            or (parsed.scheme == "https" and parsed.port == 443)
+        ):
+            origin += f":{parsed.port}"
+
+        PROBES = [
+            "/swagger.json", "/openapi.json",
+            "/api/swagger.json", "/api/openapi.json",
+            "/api/v1/openapi.json", "/api/v2/openapi.json",
+            "/api/v1/swagger.json",
+            "/v3/api-docs", "/api-docs",
+            "/swagger/v1/swagger.json",
+        ]
+
+        specs: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-recon/1.0", "Accept": "application/json"},
+            follow_redirects=True,
+        ) as client:
+            for path in PROBES:
+                url = origin + path
+                try:
+                    r = await client.get(url)
+                except Exception:
+                    continue
+                if r.status_code != 200:
+                    continue
+                try:
+                    doc = r.json()
+                except Exception:
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                # OpenAPI 3: doc.get("openapi").startswith("3.")
+                # Swagger 2:  doc.get("swagger") == "2.0"
+                is_spec = (
+                    (isinstance(doc.get("openapi"), str) and doc["openapi"].startswith("3."))
+                    or doc.get("swagger") == "2.0"
+                    or (isinstance(doc.get("paths"), dict) and doc["paths"])
+                )
+                if not is_spec:
+                    continue
+                paths = doc.get("paths", {}) or {}
+                by_method: dict[str, int] = {}
+                for p, ops in paths.items():
+                    if isinstance(ops, dict):
+                        for m in ops:
+                            if m.lower() in ("get", "post", "put", "delete", "patch", "options", "head"):
+                                by_method[m.upper()] = by_method.get(m.upper(), 0) + 1
+                info = doc.get("info", {}) or {}
+                specs.append({
+                    "url": url,
+                    "version": doc.get("openapi") or doc.get("swagger") or "unknown",
+                    "title": info.get("title", ""),
+                    "path_count": len(paths),
+                    "method_count": sum(by_method.values()),
+                    "by_method": by_method,
+                    "sample_paths": list(paths.keys())[:5],
+                })
+        return {
+            "base_url": base_url,
+            "specs": specs,
+            "spec_count": len(specs),
+        }
+
+    # ── T43h: TLS 证书 SAN → 子域 ──────────────────────
+
+    async def tls_subdomains(self, host: str, port: int = 443, timeout: float = 5.0) -> dict[str, Any]:
+        """T43h: TLS 证书 SAN 解析 — 取 subjectAltName / issuer / 有效期.
+
+        Returns {
+          "host", "tls_version", "issuer" (str), "not_before", "not_after",
+          "sans" (sorted unique DNS list), "san_count",
+          "subdomains" (sans ending with host),
+        }
+        """
+        from datetime import datetime, timezone
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                    der = ss.getpeercert(binary_form=True)
+                    cert = ss.getpeercert(binary_form=False) or {}
+                    tls_version = ss.version()
+            # parse SANs from binary form via regex on DER (subjectAltName ext OID 2.5.29.17)
+            import re as _re
+            sans = []
+            # 1) 优先用 binary_form=True 的 SAN
+            try:
+                for entry in cert.get("subjectAltName", []):
+                    if entry and entry[0].lower() == "dns":
+                        sans.append(entry[1].lower())
+            except Exception:
+                pass
+            # 2) fallback: parse DER bytes for SAN extension (crude: 找 DNS: 后的 host)
+            if not sans and der:
+                text = der.decode("latin-1", errors="ignore")
+                # 找 DNS: 后的 fqdn 字符
+                for m in _re.finditer(r"DNS:([A-Za-z0-9._-]+)", text):
+                    sans.append(m.group(1).lower())
+            sans = sorted(set(sans))
+            # issuer
+            issuer = ""
+            try:
+                iret = cert.get("issuer", ())
+                if iret:
+                    parts = []
+                    for tup in iret:
+                        for k, v in tup:
+                            if k == "commonName":
+                                parts.append(v)
+                            elif k == "organizationName":
+                                parts.insert(0, v)
+                    issuer = ", ".join(parts)
+            except Exception:
+                pass
+            # not_before / not_after → ISO
+            def _parse_dt(s: str | None) -> str | None:
+                if not s:
+                    return None
+                try:
+                    return datetime.strptime(s, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc).isoformat()
+                except Exception:
+                    return s
+            subs = sorted({s for s in sans if s == host or s.endswith("." + host)})
+            return {
+                "host": host,
+                "tls_version": tls_version,
+                "issuer": issuer,
+                "not_before": _parse_dt(cert.get("notBefore")),
+                "not_after": _parse_dt(cert.get("notAfter")),
+                "sans": sans,
+                "san_count": len(sans),
+                "subdomains": subs,
+            }
+        except Exception as e:
+            return {
+                "host": host,
+                "error": str(e)[:200],
+                "sans": [],
+                "san_count": 0,
+                "subdomains": [],
+            }
+
+    # ── T43i: 技术栈指纹 ────────────────────────────────
+
+    async def fingerprint_tech(self) -> dict[str, Any]:
+        """T43i: 综合 meta / cookie / header 推断技术栈.
+
+        检测:
+          - Server / X-Powered-By / X-AspNet-Version / X-Runtime (Rails)
+          - meta name=generator (WordPress / Drupal / Ghost 版本)
+          - 框架 session cookie: PHPSESSID, JSESSIONID, ASP.NET_SessionId, _rails_session, connect.sid, JSESSIONID
+          - 已知 meta name 模式
+
+        Returns {
+          "page_url",
+          "server": str, "x_powered_by": str, "generator": str,
+          "framework_cookies": [name, ...],
+          "signals": [{kind, name, value, hint}],
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        # 1) headers from current page response
+        try:
+            resp = await page.request.fetch(page.url, method="GET", max_redirects=5)
+            headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+        except Exception:
+            headers = {}
+        # 2) meta generator
+        generator = ""
+        try:
+            generator = await page.evaluate("""() => {
+                const m = document.querySelector('meta[name="generator"]');
+                return m ? m.getAttribute('content') || '' : '';
+            }""")
+        except Exception:
+            generator = ""
+        # 3) cookies
+        try:
+            cookies = await self._context.cookies()
+            cookie_names = [c.get("name", "") for c in cookies]
+        except Exception:
+            cookie_names = []
+
+        # 框架 cookie 签名
+        FRAMEWORK_COOKIE_HINTS = {
+            "PHPSESSID": "PHP",
+            "JSESSIONID": "Java (Tomcat/jetty)",
+            "ASP.NET_SessionId": "ASP.NET",
+            "_rails_session": "Ruby on Rails",
+            "connect.sid": "Express (Node.js)",
+            "sessionid": "Django",
+            "csrftoken": "Django / generic",
+            "laravel_session": "Laravel (PHP)",
+            "XSRF-TOKEN": "Laravel / generic",
+            "wp-settings-": "WordPress",
+            "wordpress_logged_in": "WordPress",
+            "ghost": "Ghost (blog)",
+            "shopify_session": "Shopify",
+            "mage-cache-storage": "Magento",
+        }
+        framework_cookies: list[dict[str, str]] = []
+        for cn in cookie_names:
+            cn_l = cn.lower()
+            for sig, hint in FRAMEWORK_COOKIE_HINTS.items():
+                if sig.lower() in cn_l:
+                    framework_cookies.append({"name": cn, "hint": hint})
+                    break
+
+        signals: list[dict[str, str]] = []
+        srv = headers.get("server", "")
+        if srv:
+            signals.append({"kind": "header", "name": "server", "value": srv, "hint": _server_hint(srv)})
+        xpb = headers.get("x-powered-by", "")
+        if xpb:
+            signals.append({"kind": "header", "name": "x-powered-by", "value": xpb, "hint": xpb})
+        aspv = headers.get("x-aspnet-version") or headers.get("x-aspnetmvc-version")
+        if aspv:
+            signals.append({"kind": "header", "name": "x-aspnet-version", "value": aspv, "hint": "ASP.NET"})
+        runtime = headers.get("x-runtime", "")
+        if runtime:
+            signals.append({"kind": "header", "name": "x-runtime", "value": runtime, "hint": "Ruby/Rails"})
+        if generator:
+            signals.append({"kind": "meta", "name": "generator", "value": generator, "hint": _generator_hint(generator)})
+        for fc in framework_cookies:
+            signals.append({"kind": "cookie", "name": fc["name"], "value": "", "hint": fc["hint"]})
+        return {
+            "page_url": page.url,
+            "server": srv,
+            "x_powered_by": xpb,
+            "generator": generator,
+            "framework_cookies": framework_cookies,
+            "signals": signals,
+        }
+
+    # ── T43j: JWT 探测 + payload 解码 (无签名校验) ────────────
+
+    async def decode_jwts(self) -> dict[str, Any]:
+        """T43j: 在 localStorage / sessionStorage / cookie / 页面内容中找 JWT, 解码 payload.
+
+        JWT 格式: header.payload.signature (base64url 编码)
+        解码 header + payload (不做签名校验, 仅供 agent 看清结构).
+        Returns {
+          "page_url",
+          "tokens": [
+            {"source": "localStorage"|"cookie"|"page", "key": "name", "token": "...", "header": {...}, "payload": {...}, "is_expired": bool}
+          ],
+          "token_count": int,
+        }
+        """
+        import re as _re
+        import base64
+        import json as _json
+        page = await self._ensure_page()
+        # 1) storage
+        storage = await self.get_storage()
+        # 2) page content (HTML + inline scripts)
+        try:
+            content = await page.content()
+        except Exception:
+            content = ""
+        # 3) cookies
+        cookies = storage.get("cookies", []) or []
+
+        def _b64url_decode(s: str) -> bytes | None:
+            try:
+                pad = "=" * (-len(s) % 4)
+                return base64.urlsafe_b64decode(s + pad)
+            except Exception:
+                return None
+
+        JWT_RE = _re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,})\.(eyJ[A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\b")
+        tokens: list[dict[str, Any]] = []
+        seen = set()
+
+        def _record(source: str, key: str, token: str) -> None:
+            if token in seen:
+                return
+            seen.add(token)
+            h, p, s = token.split(".", 2)
+            header_raw = _b64url_decode(h)
+            payload_raw = _b64url_decode(p)
+            try:
+                header = _json.loads(header_raw) if header_raw else {}
+            except Exception:
+                header = {"_raw": header_raw.decode("utf-8", errors="ignore")[:80]}
+            try:
+                payload = _json.loads(payload_raw) if payload_raw else {}
+            except Exception:
+                payload = {"_raw": payload_raw.decode("utf-8", errors="ignore")[:200]}
+            expired = False
+            if isinstance(payload, dict):
+                exp = payload.get("exp")
+                if isinstance(exp, (int, float)):
+                    import time as _t
+                    expired = exp < _t.time()
+            tokens.append({
+                "source": source,
+                "key": key,
+                "token": token[:80] + ("..." if len(token) > 80 else ""),
+                "header": header,
+                "payload": payload,
+                "is_expired": expired,
+            })
+
+        # localStorage / sessionStorage
+        for kind in ("localStorage", "sessionStorage"):
+            for k, v in (storage.get(kind) or {}).items():
+                for m in JWT_RE.finditer(v or ""):
+                    _record(kind, k, m.group(0))
+        # cookies (value 直接是 JWT 或含 JWT)
+        for c in cookies:
+            v = c.get("value", "") or ""
+            for m in JWT_RE.finditer(v):
+                _record("cookie", c.get("name", ""), m.group(0))
+        # page content
+        for m in JWT_RE.finditer(content):
+            _record("page", "(html)", m.group(0))
+
+        return {
+            "page_url": page.url,
+            "tokens": tokens,
+            "token_count": len(tokens),
+        }
+
     # ── T12: 通用 retry ─────────────────────────────────────────────
 
     # 这些异常 / 错误信号被识别为"短暂错误" — 自动 retry 一次
@@ -2207,3 +3133,98 @@ def _version_lt(a: str, b: str) -> bool:
         return ap < bp
     except Exception:
         return False
+
+
+# ── T43a: TLS cert SAN helper (module-level) ─────────────
+
+def _tls_subdomains(host: str, port: int = 443, timeout: float = 5.0) -> list[str]:
+    """连 host:port 取证书, 解析 SAN 列表, 过滤出 host 的子域.
+
+    返回 lowercased 去重子域列表 (含 host 本身如果出现在 SAN 里).
+    """
+    import re as _re
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                cert = ss.getpeercert(binary_form=False) or {}
+                der = ss.getpeercert(binary_form=True) or b""
+        sans: list[str] = []
+        for entry in cert.get("subjectAltName", []):
+            if entry and entry[0].lower() == "dns":
+                sans.append(entry[1].lower())
+        if not sans and der:
+            text = der.decode("latin-1", errors="ignore")
+            for m in _re.finditer(r"DNS:([A-Za-z0-9._-]+)", text):
+                sans.append(m.group(1).lower())
+        # 过滤 host 的子域
+        return sorted({s for s in sans if s == host or s.endswith("." + host)})
+    except Exception:
+        return []
+
+
+# ── T43i: Server / Generator hint helpers ─────────────
+
+_SERVER_HINTS = (
+    (r"(?i)\bnginx\b",        "nginx"),
+    (r"(?i)\bapache\b",       "Apache"),
+    (r"(?i)\biis\b",          "IIS (Microsoft)"),
+    (r"(?i)\benvoy\b",        "Envoy (often behind K8s)"),
+    (r"(?i)\btraefik\b",      "Traefik"),
+    (r"(?i)\bhaproxy\b",      "HAProxy"),
+    (r"(?i)\bcaddy\b",        "Caddy"),
+    (r"(?i)\bcloudfront\b",   "AWS CloudFront"),
+    (r"(?i)\bgfe\b",          "Google Frontend (GFE)"),
+    (r"(?i)\blite-?speed\b",  "LiteSpeed"),
+    (r"(?i)\bgunicorn\b",     "gunicorn (Python)"),
+    (r"(?i)\buwsgi\b",        "uWSGI (Python)"),
+    (r"(?i)\bjetty\b",        "Jetty (Java)"),
+    (r"(?i)\btomcat\b",       "Tomcat (Java)"),
+    (r"(?i)\bopenresty\b",    "OpenResty (Lua/nginx)"),
+    (r"(?i)\bvercel\b",       "Vercel"),
+    (r"(?i)\bnetlify\b",      "Netlify"),
+)
+
+
+def _server_hint(server_header: str) -> str:
+    """从 Server header 推断 web server. 失败 → ''."""
+    import re as _re
+    if not server_header:
+        return ""
+    for pat, name in _SERVER_HINTS:
+        if _re.search(pat, server_header):
+            return name
+    return server_header[:60]
+
+
+_GENERATOR_HINTS = (
+    (r"(?i)wordpress\s*([\d.]+)?",  "WordPress"),
+    (r"(?i)drupal\s*([\d.]+)?",     "Drupal"),
+    (r"(?i)joomla\s*([\d.]+)?",     "Joomla"),
+    (r"(?i)ghost\s*([\d.]+)?",      "Ghost"),
+    (r"(?i)hugo\s*([\d.]+)?",       "Hugo (static)"),
+    (r"(?i)jekyll\s*([\d.]+)?",     "Jekyll (static)"),
+    (r"(?i)eleventy\s*([\d.]+)?",   "Eleventy (static)"),
+    (r"(?i)next\.?js",              "Next.js"),
+    (r"(?i)nuxt",                   "Nuxt.js"),
+    (r"(?i)gatsby",                 "Gatsby"),
+    (r"(?i)hexo",                   "Hexo"),
+    (r"(?i)typecho",                "Typecho"),
+    (r"(?i)mediawiki",              "MediaWiki"),
+    (r"(?i)discuz",                 "Discuz!"),
+)
+
+
+def _generator_hint(generator: str) -> str:
+    """从 <meta name='generator'> 内容推断 CMS / 框架."""
+    import re as _re
+    if not generator:
+        return ""
+    for pat, name in _GENERATOR_HINTS:
+        m = _re.search(pat, generator)
+        if m:
+            ver = m.group(1) if m.lastindex and m.group(1) else ""
+            return f"{name} {ver}".strip()
+    return generator[:60]

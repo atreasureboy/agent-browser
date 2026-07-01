@@ -104,6 +104,27 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({"endpoint": {"type": "string"}}, ["endpoint"])},
     {"name": "sb_get_websockets", "description": "T40i: 返回当前累积的 WebSocket 连接列表 (wss:// URLs).",
      "inputSchema": _schema({"limit": {"type": "integer"}})},
+    # T43
+    {"name": "sb_enumerate_subdomains", "description": "T43a: 子域名枚举 (crt.sh + TLS cert SAN).",
+     "inputSchema": _schema({"host": {"type": "string"}, "include_tls_san": {"type": "boolean"}}, ["host"])},
+    {"name": "sb_extract_secrets_from_js", "description": "T43b: 扫当前页所有 <script src> 找硬编码 secret (AWS/GitHub/Bearer/api_key/私钥).",
+     "inputSchema": _schema({})},
+    {"name": "sb_detect_waf", "description": "T43c: WAF 指纹 (Cloudflare/Akamai/Imperva/AWS WAF/Fastly/Vercel/Netlify).",
+     "inputSchema": _schema({})},
+    {"name": "sb_find_open_redirect_sinks", "description": "T43d: 扫链接/form action 找开放重定向/SSRF sink (returnUrl, redirect, next, ...).",
+     "inputSchema": _schema({})},
+    {"name": "sb_find_disclosure", "description": "T43e: 扫页面找敏感泄露 (email/内网IP/AWS key/GitHub token/私钥/调试堆栈).",
+     "inputSchema": _schema({})},
+    {"name": "sb_analyze_exposed_files", "description": "T43f: 探常见备份/源码/配置文件 (.git/HEAD, .env, phpinfo, .DS_Store...).",
+     "inputSchema": _schema({"base_url": {"type": "string"}})},
+    {"name": "sb_discover_api_specs", "description": "T43g: 探 OpenAPI / Swagger 端点 (swagger.json, openapi.json, v3/api-docs).",
+     "inputSchema": _schema({"base_url": {"type": "string"}})},
+    {"name": "sb_tls_subdomains", "description": "T43h: TLS 证书解析 — issuer / 有效期 / SAN → 子域.",
+     "inputSchema": _schema({"host": {"type": "string"}, "port": {"type": "integer"}}, ["host"])},
+    {"name": "sb_fingerprint_tech", "description": "T43i: 技术栈指纹 (Server / X-Powered-By / meta generator / 框架 cookie).",
+     "inputSchema": _schema({})},
+    {"name": "sb_decode_jwts", "description": "T43j: 在 storage/cookie/页面里找 JWT, 解码 header + payload (不验签).",
+     "inputSchema": _schema({})},
 ]
 
 
@@ -332,6 +353,46 @@ class MCPServer:
         if name == "sb_get_websockets":
             engine = await self._ensure_started()
             return engine.controller.get_websockets(limit=int(args.get("limit", 100)))
+        # T43
+        if name == "sb_enumerate_subdomains":
+            engine = await self._ensure_started()
+            return await engine.controller.enumerate_subdomains(
+                host=args["host"],
+                include_tls_san=bool(args.get("include_tls_san", True)),
+            )
+        if name == "sb_extract_secrets_from_js":
+            engine = await self._ensure_started()
+            return await engine.controller.extract_secrets_from_js()
+        if name == "sb_detect_waf":
+            engine = await self._ensure_started()
+            return await engine.controller.detect_waf()
+        if name == "sb_find_open_redirect_sinks":
+            engine = await self._ensure_started()
+            return await engine.controller.find_open_redirect_sinks()
+        if name == "sb_find_disclosure":
+            engine = await self._ensure_started()
+            return await engine.controller.find_disclosure()
+        if name == "sb_analyze_exposed_files":
+            engine = await self._ensure_started()
+            return await engine.controller.analyze_exposed_files(
+                base_url=args.get("base_url") or None,
+            )
+        if name == "sb_discover_api_specs":
+            engine = await self._ensure_started()
+            return await engine.controller.discover_api_specs(
+                base_url=args.get("base_url") or None,
+            )
+        if name == "sb_tls_subdomains":
+            engine = await self._ensure_started()
+            return await engine.controller.tls_subdomains(
+                host=args["host"], port=int(args.get("port", 443)),
+            )
+        if name == "sb_fingerprint_tech":
+            engine = await self._ensure_started()
+            return await engine.controller.fingerprint_tech()
+        if name == "sb_decode_jwts":
+            engine = await self._ensure_started()
+            return await engine.controller.decode_jwts()
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

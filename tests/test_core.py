@@ -3711,3 +3711,140 @@ class TestGoalAgentAriaIntegration:
         agent = GoalAgent(ctrl, llm_service=svc, use_memory=False,
                           aria_max_chars=100)
         assert agent.aria_max_chars == 100
+
+
+
+class TestSiteDiscovery:
+    """T30: live 站点图自动发现."""
+
+    def test_discover_bfs_visits_pages(self):
+        """discover() BFS 爬 max_pages, 记录 visited."""
+        import asyncio
+        from semantic_browser.graph.discoverer import discover
+
+        ctrl = _make_fake_controller([
+            ("https://x.com/", ["https://x.com/a", "https://x.com/b"]),
+            ("https://x.com/a", ["https://x.com/c"]),
+            ("https://x.com/b", []),
+            ("https://x.com/c", []),
+        ])
+        result = asyncio.run(discover(ctrl, "https://x.com/", max_pages=10, max_depth=2, delay_ms=0))
+        assert len(result.pages_visited) == 4
+        assert "https://x.com/" in result.pages_visited
+        assert "https://x.com/c" in result.pages_visited
+
+    def test_discover_respects_max_pages(self):
+        """超过 max_pages 时停止, 不全爬."""
+        import asyncio
+        from semantic_browser.graph.discoverer import discover
+
+        # 5 页, max_pages=3 → 只能爬 3 页
+        ctrl = _make_fake_controller([
+            ("https://x.com/", [f"https://x.com/p{i}" for i in range(5)]),
+            ("https://x.com/p0", []), ("https://x.com/p1", []),
+            ("https://x.com/p2", []), ("https://x.com/p3", []),
+            ("https://x.com/p4", []),
+        ])
+        result = asyncio.run(discover(ctrl, "https://x.com/", max_pages=3, max_depth=2, delay_ms=0))
+        assert len(result.pages_visited) <= 3
+
+    def test_discover_same_domain_filter(self):
+        """same_domain_only=True 时不跳外站."""
+        import asyncio
+        from semantic_browser.graph.discoverer import discover
+
+        ctrl = _make_fake_controller([
+            ("https://x.com/", ["https://x.com/a", "https://evil.com/b"]),
+            ("https://x.com/a", []),
+            # evil.com 不应该被访问
+        ])
+        result = asyncio.run(discover(ctrl, "https://x.com/", max_pages=10, max_depth=2, delay_ms=0))
+        urls = result.pages_visited
+        assert "https://x.com/a" in urls
+        assert "https://evil.com/b" not in urls
+
+    def test_discover_records_failures(self):
+        """页面打开失败时记到 pages_failed, 不中断."""
+        import asyncio
+        from semantic_browser.graph.discoverer import discover
+
+        # 第一个页面 open 抛异常
+        class BrokenCtrl:
+            async def open(self, url):
+                raise RuntimeError("net down")
+        result = asyncio.run(discover(BrokenCtrl(), "https://x.com/", max_pages=5, max_depth=2, delay_ms=0))
+        assert len(result.pages_failed) == 1
+        assert "https://x.com/" in [u for u, _ in result.pages_failed]
+
+    def test_discover_builds_graph_edges(self):
+        """discover 把链接记成 graph edge."""
+        import asyncio
+        from semantic_browser.graph.discoverer import discover
+
+        ctrl = _make_fake_controller([
+            ("https://x.com/", ["https://x.com/a"]),
+            ("https://x.com/a", []),
+        ])
+        result = asyncio.run(discover(ctrl, "https://x.com/", max_pages=5, max_depth=1, delay_ms=0))
+        edges = result.graph.edges
+        # root → a
+        assert any(e[0] == "https://x.com/" and e[1] == "https://x.com/a"
+                   for e in edges)
+
+    def test_format_for_llm_includes_summary(self):
+        """format_for_llm 输出包含 tree + failures."""
+        from semantic_browser.graph.discoverer import format_for_llm, DiscoveryResult
+        from semantic_browser.graph.builder import SiteGraph
+        result = DiscoveryResult(
+            root_url="https://x.com/",
+            pages_visited=["https://x.com/", "https://x.com/a"],
+            pages_failed=[("https://x.com/b", "404")],
+        )
+        result.graph = SiteGraph(root_url="https://x.com/", domain="x.com")
+        text = format_for_llm(result)
+        assert "Site map for" in text
+        assert "Pages discovered: 2" in text
+        assert "Failures:" in text
+        assert "404" in text
+
+
+def _make_fake_controller(pages: list[tuple[str, list[str]]]):
+    """Helper: 构造 fake controller, pages = [(url, [links])]."""
+    page_map = {url: links for url, links in pages}
+    current = {"url": ""}
+
+    class FakePage:
+        def __init__(self, url):
+            self.url = url
+        async def title(self):
+            return f"Page {self.url}"
+
+    class FakeCtrl:
+        @property
+        def current_page(self):
+            return FakePage(current["url"]) if current["url"] else None
+        async def open(self, url):
+            current["url"] = url
+
+    # Patch SnapshotEngine via monkey patch
+    from semantic_browser.graph import discoverer as disc_mod
+    original_engine = disc_mod.SnapshotEngine
+
+    class FakeEngine:
+        def __init__(self, page):
+            self.page = page
+        async def capture(self, base_url=""):
+            from semantic_browser.snapshot.engine import (
+                PageSnapshot, LinkInfo,
+            )
+            url = self.page.url
+            hrefs = page_map.get(url, [])
+            return PageSnapshot(
+                url=url, title=f"Page {url}", domain="x.com",
+                links=[LinkInfo(ref=f"e{i}", href=h, text=h) for i, h in enumerate(hrefs)],
+                controls=[],
+                meta={}, raw_aria="",
+            )
+    disc_mod.SnapshotEngine = FakeEngine  # type: ignore[assignment]
+
+    return FakeCtrl()

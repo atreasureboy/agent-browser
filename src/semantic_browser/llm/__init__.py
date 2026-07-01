@@ -35,3 +35,13 @@ __all__ = [
     "collect_diagnostics",
     "format_diagnostics_for_llm",
 ]
+
+
+# T30: 站点图自动发现
+from semantic_browser.graph.discoverer import (
+    discover,
+    DiscoveryResult,
+    format_for_llm as format_sitemap_for_llm,
+)
+
+__all__ += ["discover", "DiscoveryResult", "format_sitemap_for_llm"]

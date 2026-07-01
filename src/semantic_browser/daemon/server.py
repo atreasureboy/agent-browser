@@ -323,6 +323,9 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/graph":
             url = args.get("url") or self.owner.run(self.owner.browser.controller.get_url())
             return self.owner.browser.get_site_graph(url).to_dict()
+        # T30: live site map discovery (vs /graph 走历史库)
+        if method == "POST" and path == "/discover":
+            return self.owner.run(self._discover(args))
         if method == "POST" and path == "/find":
             url = args["url"]
             keyword = args["keyword"]
@@ -594,6 +597,26 @@ class TransparentBrowserDaemon:
             goal=args["goal"],
             max_steps=int(args.get("max_plan_steps", 8)),
         )
+
+    async def _discover(self, args: dict[str, Any]) -> dict[str, Any]:
+        from semantic_browser.llm import discover, format_sitemap_for_llm
+        result = await discover(
+            self.owner.browser.controller,
+            start_url=args["start_url"],
+            max_pages=int(args.get("max_pages", 15)),
+            max_depth=int(args.get("max_depth", 2)),
+            same_domain_only=bool(args.get("same_domain_only", True)),
+            delay_ms=int(args.get("delay_ms", 100)),
+        )
+        return {
+            "root_url": result.root_url,
+            "pages_visited": result.pages_visited,
+            "pages_failed": [{"url": u, "error": e} for u, e in result.pages_failed],
+            "flat_list": result.flat_list,
+            "tree_text": result.tree_text,
+            "llm_summary": format_sitemap_for_llm(result),
+            "graph_dict": result.graph.to_dict(),
+        }
 
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service

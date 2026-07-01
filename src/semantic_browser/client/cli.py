@@ -1161,6 +1161,44 @@ def memory_clear(ctx):
         click.echo("cleared (local)")
 
 
+@tb.command("discover")
+@click.argument("start_url")
+@click.option("--max-pages", default=15, show_default=True,
+              help="最多爬多少页 (防失控)")
+@click.option("--max-depth", default=2, show_default=True,
+              help="BFS 深度 (从 start_url = 0)")
+@click.option("--delay-ms", default=100, show_default=True,
+              help="每页之间延迟 (礼貌爬取)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def discover_cmd(ctx, start_url, max_pages, max_depth, delay_ms, json_out):
+    """T30: 现场爬站点, 生成导航图给 agent 当参考.
+
+    \b
+    Examples:
+      tb discover https://example.com
+      tb discover https://example.com --max-pages 30 --max-depth 3
+    """
+    body = {
+        "start_url": start_url,
+        "max_pages": max_pages,
+        "max_depth": max_depth,
+        "delay_ms": delay_ms,
+    }
+    data = _request("POST", "/discover", body, base=ctx.obj["base"])
+    if json_out:
+        _print(data, json_out=True)
+        return
+    click.echo(f"Pages visited: {len(data.get('pages_visited', []))}")
+    click.echo(f"Pages failed:  {len(data.get('pages_failed', []))}")
+    click.echo("")
+    click.echo(data.get("tree_text", "(empty)"))
+    if data.get("llm_summary"):
+        click.echo("")
+        click.echo("--- LLM summary (for agent) ---")
+        click.echo(data["llm_summary"])
+
+
 def main():
     tb()
 

@@ -1,0 +1,22 @@
+[project]
+name = "semantic-browser"
+version = "0.1.0"
+description = "Agent-readable semantic browser layer for AI agents"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "click>=8.0",
+    "rich>=13.0",
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+sb = "semantic_browser.cli:main"
+tb = "semantic_browser.client.cli:main"
+tb-daemon = "semantic_browser.daemon.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

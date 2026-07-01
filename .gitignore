@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+build/
+dist/
+
+# Virtual env (huge, has binaries, not source)
+.venv/
+venv/
+env/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Runtime data (per-user, not source)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+storage-state.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Internal project tracking (not source of truth; lives outside the repo in normal use)
+.progress.json
+plan-*.md

@@ -1,0 +1,203 @@
+"""
+MCP Server — SemanticBrowser 的 Model Context Protocol 适配层。
+
+stdio JSON-RPC 2.0 server with lazy SemanticBrowser startup.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import sys
+from typing import Any, Optional
+
+from semantic_browser.engine import SemanticBrowser
+from semantic_browser.snapshot.engine import SnapshotEngine
+
+logger = logging.getLogger(__name__)
+
+SERVER_INFO = {"name": "semantic-browser", "version": "0.1.0"}
+PROTOCOL_VERSION = "2024-11-05"
+
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
+
+def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": required or []}
+
+
+TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {"name": "sb_browse", "description": "打开 URL 并返回完整语义浏览结果。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    {"name": "sb_snapshot", "description": "打开 URL 并返回语义快照。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    {"name": "sb_click", "description": "通过 eN ref 点击元素。", "inputSchema": _schema({"ref": {"type": "string"}}, ["ref"])},
+    {"name": "sb_type", "description": "通过 eN ref 输入文本。", "inputSchema": _schema({"ref": {"type": "string"}, "text": {"type": "string"}}, ["ref", "text"])},
+    {"name": "sb_scroll", "description": "滚动页面。", "inputSchema": _schema({"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}})},
+    {"name": "sb_back", "description": "浏览器后退。", "inputSchema": _schema({})},
+    {"name": "sb_forward", "description": "浏览器前进。", "inputSchema": _schema({})},
+    {"name": "sb_screenshot", "description": "截图；可传 path 保存，否则返回 base64。", "inputSchema": _schema({"path": {"type": "string"}})},
+    {"name": "sb_press_key", "description": "发送键盘按键。", "inputSchema": _schema({"key": {"type": "string"}}, ["key"])},
+    {"name": "sb_graph", "description": "从记忆库构建站点拓扑图。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
+    {"name": "sb_history", "description": "返回访问历史；可按 domain 过滤。", "inputSchema": _schema({"domain": {"type": "string"}})},
+    {"name": "sb_stats", "description": "返回记忆库统计。", "inputSchema": _schema({})},
+]
+
+
+class MCPServer:
+    def __init__(self, engine: Optional[SemanticBrowser] = None) -> None:
+        self._engine = engine
+
+    async def _ensure_started(self) -> SemanticBrowser:
+        if self._engine is None:
+            self._engine = SemanticBrowser()
+        await self._engine.start()
+        return self._engine
+
+    def _ensure_engine(self) -> SemanticBrowser:
+        if self._engine is None:
+            self._engine = SemanticBrowser()
+        return self._engine
+
+    async def handle(self, request: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(request, dict):
+            return self._error(None, INVALID_REQUEST, "Request must be an object")
+        req_id = request.get("id")
+        if request.get("jsonrpc") != "2.0":
+            return self._error(req_id, INVALID_REQUEST, 'jsonrpc must be "2.0"')
+        method = request.get("method")
+        params = request.get("params") or {}
+        if not isinstance(method, str):
+            return self._error(req_id, INVALID_REQUEST, "method must be a string")
+        if method.startswith("notifications/"):
+            return None
+        if method == "initialize":
+            return self._ok(req_id, {"protocolVersion": PROTOCOL_VERSION, "serverInfo": SERVER_INFO, "capabilities": {"tools": {}}})
+        if method == "ping":
+            return self._ok(req_id, {})
+        if method == "tools/list":
+            return self._ok(req_id, {"tools": TOOL_DEFINITIONS})
+        if method == "tools/call":
+            return await self._handle_tool_call(req_id, params)
+        return self._error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+
+    async def _handle_tool_call(self, req_id: Any, params: Any) -> dict[str, Any]:
+        if not isinstance(params, dict):
+            return self._error(req_id, INVALID_PARAMS, "params must be an object")
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if not isinstance(name, str):
+            return self._error(req_id, INVALID_PARAMS, "params.name must be a string")
+        if not isinstance(args, dict):
+            return self._error(req_id, INVALID_PARAMS, "params.arguments must be an object")
+        try:
+            result = await self._call_tool(name, args)
+        except KeyError as e:
+            return self._error(req_id, INVALID_PARAMS, f"Missing required argument: {e.args[0]}")
+        except ValueError as e:
+            return self._error(req_id, INVALID_PARAMS, str(e))
+        except Exception as e:
+            logger.exception("Tool %s failed", name)
+            return self._error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}")
+        return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}], "isError": False})
+
+    async def _call_tool(self, name: str, args: dict[str, Any]) -> Any:
+        if name == "sb_browse":
+            engine = await self._ensure_started()
+            return (await engine.browse(args["url"])).to_dict()
+        if name == "sb_snapshot":
+            engine = await self._ensure_started()
+            await engine.controller.open(args["url"])
+            page = engine.controller.current_page
+            if page is None:
+                raise RuntimeError("No active page")
+            return (await SnapshotEngine(page).capture(base_url=args["url"])).to_dict()
+        if name == "sb_click":
+            engine = await self._ensure_started()
+            ok = await engine.controller.click(args["ref"])
+            return {"ref": args["ref"], "success": ok, "url": await engine.controller.get_url()}
+        if name == "sb_type":
+            engine = await self._ensure_started()
+            ok = await engine.controller.type_text(args["ref"], args["text"])
+            return {"ref": args["ref"], "success": ok, "text_length": len(args["text"])}
+        if name == "sb_scroll":
+            engine = await self._ensure_started()
+            direction = args.get("direction", "down")
+            amount = int(args.get("amount", 500))
+            await engine.controller.scroll(direction, amount)
+            return {"direction": direction, "amount": amount}
+        if name == "sb_back":
+            engine = await self._ensure_started()
+            await engine.controller.back()
+            return {"url": await engine.controller.get_url()}
+        if name == "sb_forward":
+            engine = await self._ensure_started()
+            await engine.controller.forward()
+            return {"url": await engine.controller.get_url()}
+        if name == "sb_screenshot":
+            engine = await self._ensure_started()
+            path = args.get("path")
+            data = await engine.controller.screenshot(path=path)
+            return {"path": path, "bytes": len(data), "base64": None if path else base64.b64encode(data).decode("ascii")}
+        if name == "sb_press_key":
+            engine = await self._ensure_started()
+            await engine.controller.press_key(args["key"])
+            return {"key": args["key"]}
+        if name == "sb_graph":
+            return self._ensure_engine().get_site_graph(args["url"]).to_dict()
+        if name == "sb_history":
+            domain = args.get("domain", "")
+            pages = self._ensure_engine().get_visited_pages(domain)
+            return {"pages": pages, "count": len(pages)}
+        if name == "sb_stats":
+            return self._ensure_engine().get_memory_stats()
+        raise ValueError(f"Unknown tool: {name}")
+
+    async def run(self, stdin=None, stdout=None) -> None:
+        stdin = stdin or sys.stdin
+        stdout = stdout or sys.stdout
+        try:
+            while True:
+                line = await asyncio.to_thread(stdin.readline)
+                if line == "":
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    request = json.loads(line)
+                except json.JSONDecodeError as e:
+                    response = self._error(None, PARSE_ERROR, f"Parse error: {e}")
+                else:
+                    response = await self.handle(request)
+                if response is not None:
+                    stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                    stdout.flush()
+        finally:
+            if self._engine is not None:
+                await self._engine.close()
+
+    @staticmethod
+    def _ok(req_id: Any, result: Any) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    @staticmethod
+    def _error(req_id: Any, code: int, message: str) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+async def amain() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    await MCPServer().run()
+
+
+def main() -> None:
+    asyncio.run(amain())
+
+
+if __name__ == "__main__":
+    main()

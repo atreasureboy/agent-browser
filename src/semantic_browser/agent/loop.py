@@ -161,6 +161,9 @@ class GoalAgent:
         # T32: 危险动作守卫 — 默认开启 (需要人类 confirm)
         safety_guard: bool = True,
         allow_destructive: bool = False,
+        # T34: ARIA 语义树注入 snapshot. 默认开 (LLM 拿到更丰富的语义信息).
+        include_aria: bool = True,
+        aria_max_chars: int = 2000,
     ) -> None:
         self.controller = controller
         if llm_service is None:
@@ -179,6 +182,8 @@ class GoalAgent:
         self.on_step = on_step
         self.safety_guard = safety_guard
         self.allow_destructive = allow_destructive
+        self.include_aria = include_aria
+        self.aria_max_chars = aria_max_chars
         self.history: list[StepRecord] = []
         # T26: 失败诊断累积 (LLM 下一步看)
         self.last_failure_diag: Optional[str] = None
@@ -192,6 +197,7 @@ class GoalAgent:
         """拿当前 snapshot (URL + title + 主要 ref 列表); 超大时截断.
 
         T26: 如果 use_smart_slicing=True, 用 cheap 模型给 goal 挑 top-K refs.
+        T34: include_aria=True 时, 把 raw_aria 也喂给 LLM (语义树, role/name/state).
         返回 (header, body) 两段; 调用者拼起来给 LLM 看.
         """
         page = self.controller.current_page
@@ -205,6 +211,12 @@ class GoalAgent:
         except Exception as e:
             return f"(snapshot error: {e})", ""
 
+        # T34: ARIA 语义树注入 (header 后, body 前 — LLM 同时看到 ref 列表和语义)
+        aria_block = ""
+        if self.include_aria and snap.raw_aria:
+            # 截断到 aria_max_chars 防止 prompt 爆炸
+            aria_block = f"\nARIA semantic tree:\n{snap.raw_aria[:self.aria_max_chars]}\n"
+
         # T26: smart slicing (用 cheap 模型按 goal 切片)
         if self.use_smart_slicing and goal:
             try:
@@ -215,7 +227,7 @@ class GoalAgent:
                     tier=self.slice_tier,
                 )
                 if useful:
-                    body = build_smart_snapshot_excerpt(snap, useful)
+                    body = build_smart_snapshot_excerpt(snap, useful) + aria_block
                     header = f"URL: {url}\nTitle: {title}\n\n(sliced: {len(useful)}/{len(snap.links) + len(snap.controls)} refs relevant)"
                     return header, body
             except Exception as e:
@@ -227,6 +239,7 @@ class GoalAgent:
         for c in all_refs[:self.snapshot_ref_limit]:
             refs.append(f"  - {c.ref} {c.kind}: {c.label or c.href or ''}")
         excerpt = "\n".join(refs) if refs else "(no interactive elements)"
+        excerpt += aria_block
         header = f"URL: {url}\nTitle: {title}\n\nInteractive refs ({len(refs)} shown):"
         return header, excerpt
 

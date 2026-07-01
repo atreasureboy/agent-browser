@@ -861,6 +861,134 @@ class BrowserController:
         except Exception as e:
             return f"(fetch failed: {type(e).__name__}: {e})"
 
+    # ── T40g: API endpoint extraction ─────────────────────────
+
+    # 简单 regex 模式 — 不追求穷举, 抓常见 fetch/XHR/axios/$.ajax 即可
+    _API_PATTERNS: tuple[tuple[str, str], ...] = (
+        # fetch("...") / fetch(`...`)
+        (r'''fetch\s*\(\s*[`"']([^`"']{3,300})[`"']''', "fetch"),
+        # axios.<method>("...")
+        (r'''axios\.(?:get|post|put|delete|patch|head|options)\s*\(\s*[`"']([^`"']{3,300})[`"']''', "axios"),
+        # xhr.open("METHOD", "URL")
+        (r'''\.open\s*\(\s*[`"'](?:GET|POST|PUT|DELETE|PATCH|HEAD)["']\s*,\s*[`"']([^`"']{3,300})[`"']''', "xhr"),
+        # $.ajax({url: "..."})
+        (r'''\$\.ajax\s*\(\s*\{[^}]*?url\s*:\s*[`"']([^`"']{3,300})[`"']''', "jquery"),
+        # superagent / got: .get("/api/...") .post("/api/...")
+        (r'''\.(?:get|post|put|delete|patch)\s*\(\s*[`"'](/[a-zA-Z][^`"']{2,300})[`"']''', "rest-method"),
+    )
+
+    async def extract_api_endpoints(
+        self,
+        *,
+        max_scripts: int = 25,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """T40g: 从页面 JS 中提取 API endpoint.
+
+        流程:
+          1. page.evaluate 列出所有 <script src=...> (含 inline src)
+          2. httpx 直抓每个 JS 源码 (避开 CORS)
+          3. 走 _API_PATTERNS regex, 提取候选 URL/path
+          4. 去重 + 分类 + 返回
+
+        Returns {
+          "page_url",
+          "scripts_scanned": int,
+          "scripts_failed": int,
+          "endpoints": [
+            {"value": "/api/users", "method": "GET", "sources": ["fetch"], "script": "https://..."},
+            ...
+          ],
+          "by_method": {"GET": N, "POST": M, ...},
+        }
+        """
+        import re
+        import httpx
+        from urllib.parse import urljoin
+
+        page = await self._ensure_page()
+
+        # 1. 列出 scripts (只 external, inline 太难 dedup)
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            return out;
+        }""")
+        # 限制总数
+        scripts = scripts[:max_scripts]
+
+        # 2. 转绝对 URL
+        page_url = page.url
+        abs_urls = [urljoin(page_url, s) for s in scripts if s]
+
+        endpoints: dict[str, dict[str, Any]] = {}
+        scripts_scanned = 0
+        scripts_failed = 0
+
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-probe/1.0"},
+            follow_redirects=True,
+        ) as client:
+            for url in abs_urls:
+                try:
+                    r = await client.get(url)
+                    body = r.text[:200000]  # 200K 上限
+                    scripts_scanned += 1
+                except Exception:
+                    scripts_failed += 1
+                    continue
+
+                for pat, source in self._API_PATTERNS:
+                    for m in re.finditer(pat, body, re.DOTALL):
+                        val = m.group(1).strip()
+                        if not val:
+                            continue
+                        # 过滤: 必须以 / 开头 (path) 或 http 开头 (absolute url)
+                        if not (val.startswith("/") or val.startswith("http")):
+                            continue
+                        # 跳过太短/太通用
+                        if len(val) < 3:
+                            continue
+                        if val in ("/", "//"):
+                            continue
+                        # 截断模板字符串 (含 ${} 或 backtick 不完整)
+                        val = val.split("${")[0].rstrip("/")
+                        if not val:
+                            continue
+                        ep = endpoints.setdefault(val, {
+                            "value": val,
+                            "sources": set(),
+                            "scripts": set(),
+                            "first_method": source,
+                        })
+                        ep["sources"].add(source)
+                        ep["scripts"].add(url)
+
+        # 3. 序列化 + 简单分类
+        out_list = []
+        by_source: dict[str, int] = {}
+        for v, ep in sorted(endpoints.items()):
+            out_list.append({
+                "value": ep["value"],
+                "sources": sorted(ep["sources"]),
+                "scripts_count": len(ep["scripts"]),
+            })
+            for s in ep["sources"]:
+                by_source[s] = by_source.get(s, 0) + 1
+
+        return {
+            "page_url": page_url,
+            "scripts_scanned": scripts_scanned,
+            "scripts_failed": scripts_failed,
+            "endpoint_count": len(out_list),
+            "endpoints": out_list,
+            "by_source": by_source,
+        }
+
     # ── T40a: 客户端存储 ─────────────────────────────────
 
     async def get_storage(self) -> dict[str, Any]:

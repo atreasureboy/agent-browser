@@ -96,6 +96,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({})},
     {"name": "sb_switch_frame", "description": "T40e: 切换活跃 frame (按 name substring 或 url substring).",
      "inputSchema": _schema({"name_or_url": {"type": "string"}}, ["name_or_url"])},
+    {"name": "sb_extract_api_endpoints", "description": "T40g: 从页面 JS 中提取 API endpoints (fetch/axios/XHR 模式).",
+     "inputSchema": _schema({})},
 ]
 
 
@@ -312,6 +314,9 @@ class MCPServer:
         if name == "sb_switch_frame":
             engine = await self._ensure_started()
             return await engine.controller.switch_frame(args["name_or_url"])
+        if name == "sb_extract_api_endpoints":
+            engine = await self._ensure_started()
+            return await engine.controller.extract_api_endpoints()
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

@@ -4647,3 +4647,120 @@ class TestT40eFrameInventory:
         assert "list-frames" in tb.commands
         assert "switch-frame" in tb.commands
 
+
+class TestT40gApiEndpointExtraction:
+    """T40g: 从页面 JS 中提取 API endpoints (fetch/axios/XHR 模式)."""
+
+    def test_api_patterns_defined(self):
+        """_API_PATTERNS 至少含 fetch + axios."""
+        from semantic_browser.browser.controller import BrowserController
+        pats = BrowserController._API_PATTERNS
+        sources = {s for _, s in pats}
+        assert "fetch" in sources
+        assert "axios" in sources
+        assert "xhr" in sources
+
+    def test_extract_endpoints_parses_fetch_and_axios(self):
+        """regex 模块验证 fetch + axios 都被识别."""
+        import re
+        from semantic_browser.browser.controller import BrowserController
+        sample_js = '''
+        fetch("/api/users");
+        fetch('/api/posts/123');
+        axios.get("/api/comments");
+        axios.post("/api/login", {user: "x"});
+        xhr.open("GET", "/api/orders");
+        $.ajax({url: "/api/admin"});
+        '''
+        endpoints = set()
+        for pat, source in BrowserController._API_PATTERNS:
+            for m in re.finditer(pat, sample_js, re.DOTALL):
+                val = m.group(1).strip()
+                if val.startswith("/"):
+                    endpoints.add(val)
+        # 应当找到 /api/users /api/posts/123 /api/comments /api/login /api/orders /api/admin
+        assert "/api/users" in endpoints
+        assert "/api/posts/123" in endpoints
+        assert "/api/comments" in endpoints
+        assert "/api/login" in endpoints
+        assert "/api/orders" in endpoints
+        assert "/api/admin" in endpoints
+
+    def test_extract_endpoints_filters_generic(self):
+        """过滤: 不以 / 开头的字符串不入 endpoint 集合."""
+        import re
+        from semantic_browser.browser.controller import BrowserController
+        sample_js = 'fetch("data:text/plain,abc");\nconst x = "javascript:void(0)";'
+        endpoints = set()
+        for pat, source in BrowserController._API_PATTERNS:
+            for m in re.finditer(pat, sample_js, re.DOTALL):
+                val = m.group(1).strip()
+                if val.startswith("/") or val.startswith("http"):
+                    endpoints.add(val)
+        # 不应有 data: 或 javascript:
+        for ep in endpoints:
+            assert not ep.startswith("data:")
+            assert not ep.startswith("javascript:")
+
+    @pytest.mark.asyncio
+    async def test_extract_endpoints_against_http_server(self):
+        """真实 HTTP server: 主页 → 引用 JS → JS 含 fetch('/api/x') → 探测到."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from semantic_browser.browser.controller import BrowserController
+
+        # JS 文件: 含 fetch 和 axios 调用
+        js_body = b'''
+        fetch("/api/users");
+        axios.post("/api/login", {});
+        $.ajax({url: "/api/admin"});
+        '''
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                pass
+            def do_GET(self):
+                if self.path.endswith("/app.js"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript")
+                    self.send_header("Content-Length", str(len(js_body)))
+                    self.end_headers()
+                    self.wfile.write(js_body)
+                else:
+                    html = b'<!doctype html><html><head><script src="/app.js"></script></head><body>hi</body></html>'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(html)))
+                    self.end_headers()
+                    self.wfile.write(html)
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            ctrl = BrowserController()
+            await ctrl.open(f"http://127.0.0.1:{port}/")
+            result = await ctrl.extract_api_endpoints(max_scripts=5, timeout_ms=2000)
+            await ctrl.close()
+            assert result["scripts_scanned"] >= 1
+            assert result["endpoint_count"] >= 1
+            values = {e["value"] for e in result["endpoints"]}
+            assert "/api/users" in values
+            assert "/api/login" in values
+            assert "/api/admin" in values
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_mcp_tool_register_t40g(self):
+        """sb_extract_api_endpoints 注册."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_extract_api_endpoints" in names
+
+    def test_cli_command_register_t40g(self):
+        """tb extract-api-endpoints 注册."""
+        from semantic_browser.client.cli import tb
+        assert "extract-api-endpoints" in tb.commands
+

@@ -259,6 +259,11 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.probe_paths(
                 url, categories=categories,
             ))
+        # T40g: 从页面 JS 提取 API endpoints
+        if method == "GET" and path == "/extract-api-endpoints":
+            return self.owner.run(
+                self.owner.browser.controller.extract_api_endpoints()
+            )
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)

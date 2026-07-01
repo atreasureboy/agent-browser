@@ -617,6 +617,15 @@ def switch_frame(ctx, name_or_url):
                     base=ctx.obj["base"]))
 
 
+@tb.command("extract-api-endpoints")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def extract_api_endpoints(ctx, json_out):
+    """T40g: 从当前页面 JS 中提取 API endpoints (fetch/axios/XHR 模式)."""
+    _print(_request("GET", "/extract-api-endpoints", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

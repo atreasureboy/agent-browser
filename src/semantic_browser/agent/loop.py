@@ -31,6 +31,7 @@ from semantic_browser.browser.controller import BrowserController
 from semantic_browser.llm.service import LLMService, LLMUnavailableError, Tier
 from semantic_browser.llm.helpers import slice_refs_for_goal, build_smart_snapshot_excerpt
 from semantic_browser.llm.diagnostics import collect_diagnostics, format_diagnostics_for_llm
+from semantic_browser.memory.goal_memory import GoalMemory
 from semantic_browser.snapshot.engine import PageSnapshot, SnapshotEngine
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,9 @@ class GoalAgent:
         slice_tier: Tier = "cheap",  # 切片用便宜模型
         slice_max_refs: int = 15,  # 只给 LLM 最多 15 个 ref
         use_failure_diagnostics: bool = True,  # 失败自动 dump
+        # T27: 跨 session goal memory. 默认开启.
+        use_memory: bool = True,
+        goal_memory: GoalMemory | None = None,
     ) -> None:
         self.controller = controller
         if llm_service is None:
@@ -142,9 +146,13 @@ class GoalAgent:
         self.slice_tier = slice_tier
         self.slice_max_refs = slice_max_refs
         self.use_failure_diagnostics = use_failure_diagnostics
+        self.use_memory = use_memory
+        self.goal_memory = goal_memory or (GoalMemory() if use_memory else None)
         self.history: list[StepRecord] = []
         # T26: 失败诊断累积 (LLM 下一步看)
         self.last_failure_diag: Optional[str] = None
+        # T27: 本次 run 是否命中 cache (调试用)
+        self.last_memory_hit: Optional[dict[str, Any]] = None
 
     def _is_available(self) -> bool:
         return self.llm.is_available()
@@ -278,11 +286,41 @@ What's the next single action? Respond with JSON only."""
             )
         self.history = []
         self.last_failure_diag = None  # T26: 重置失败诊断
+        self.last_memory_hit = None  # T27: 重置 cache 标记
+
+        # T27: 跨 session memory — 先查 cache
+        if self.use_memory and self.goal_memory is not None:
+            cached = self.goal_memory.lookup(goal)
+            if cached and cached.get("success") and cached.get("answer"):
+                self.last_memory_hit = cached
+                return GoalResult(
+                    goal=goal, success=True,
+                    answer=cached["answer"],
+                    steps=[], total_steps=0,
+                    reason=f"from memory (hit_count={cached.get('hit_count', 0)})",
+                )
 
         # 可选: 自动 open start_url
         if start_url:
             await self.controller.open(start_url)
 
+        result = await self._run_loop(goal)
+        # T27: 记录到 memory (无论成败)
+        if self.use_memory and self.goal_memory is not None:
+            try:
+                self.goal_memory.record(
+                    goal=goal,
+                    success=result.success,
+                    answer=result.answer,
+                    steps=result.total_steps,
+                    reason=result.reason,
+                )
+            except Exception as e:
+                logger.warning("failed to record goal to memory: %s", e)
+        return result
+
+    async def _run_loop(self, goal: str) -> GoalResult:
+        """核心执行循环 — run() 包装了 memory lookup/record."""
         consecutive_failures = 0
         for step_num in range(1, self.max_steps + 1):
             snapshot_header, snapshot_excerpt = await self._capture_snapshot_excerpt(goal=goal)

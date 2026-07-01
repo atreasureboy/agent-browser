@@ -1074,6 +1074,55 @@ def llm_find_ref(ctx, description):
         click.echo("(no match)")
 
 
+@tb.group()
+def memory():
+    """T27: 跨 session goal memory (跨次跑的 goal 答案缓存)."""
+
+
+@memory.command("stats")
+@click.pass_context
+def memory_stats(ctx):
+    """显示 goal memory 统计."""
+    try:
+        data = _request("GET", "/memory/stats", base=ctx.obj["base"])
+    except click.ClickException:
+        from semantic_browser.memory.goal_memory import GoalMemory
+        data = GoalMemory().stats()
+    click.echo(f"path: {data['path']}")
+    click.echo(f"total: {data['total']} (success={data['success']}, failure={data['failure']})")
+    click.echo(f"total_hits: {data['total_hits']}")
+
+
+@memory.command("list")
+@click.option("--limit", default=10, show_default=True)
+@click.pass_context
+def memory_list(ctx, limit):
+    """列出最近 N 条 goal 记录."""
+    try:
+        data = _request("GET", f"/memory/list?limit={limit}", base=ctx.obj["base"])
+    except click.ClickException:
+        from semantic_browser.memory.goal_memory import GoalMemory
+        data = {"entries": GoalMemory().list_recent(limit)}
+    for e in data.get("entries", []):
+        mark = "✓" if e.get("success") else "✗"
+        hits = e.get("hit_count", 0)
+        ans = (e.get("answer") or e.get("reason") or "")[:60]
+        click.echo(f"  {mark} [hits={hits}] {e.get('goal','')[:50]} → {ans}")
+
+
+@memory.command("clear")
+@click.pass_context
+def memory_clear(ctx):
+    """清空 goal memory."""
+    try:
+        data = _request("POST", "/memory/clear", base=ctx.obj["base"])
+        click.echo("cleared" if data.get("cleared") else "failed")
+    except click.ClickException:
+        from semantic_browser.memory.goal_memory import GoalMemory
+        GoalMemory().clear()
+        click.echo("cleared (local)")
+
+
 def main():
     tb()
 

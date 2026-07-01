@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import pytest
 
 from semantic_browser.memory.store import MemoryStore
+from semantic_browser.memory.goal_memory import GoalMemory
 from semantic_browser.graph.builder import GraphBuilder, SiteGraph, GraphNode
 from semantic_browser.classifier.heuristic import PageClassifier, ClassificationResult
 from semantic_browser.classifier.llm_enhanced import LLMEnhancedClassifier, VALID_TYPES
@@ -2965,3 +2966,230 @@ class TestGoalAgentT26:
         svc = LLMService(api_key="k", base_url="http://fake")
         agent = GoalAgent(ctrl, llm_service=svc)
         assert agent.tier == "smart"
+
+
+class TestGoalMemory:
+    """T27: GoalMemory 单元测试 — 跨 session 缓存 goal→answer."""
+
+    def test_record_and_lookup_exact(self):
+        """存一条成功, 精确 lookup 命中."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("find contact email", success=True, answer="x@y.com", steps=3)
+            hit = mem.lookup("find contact email")
+            assert hit is not None
+            assert hit["answer"] == "x@y.com"
+            assert hit["steps"] == 3
+
+    def test_lookup_fuzzy_match(self):
+        """Jaccard 相似度阈值: 'find contact email' 接近 'find contact email for x.com'."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("find contact email for example.com", success=True, answer="a@b.com")
+            # token 重叠 ~0.6, 用 threshold=0.5 命中
+            hit = mem.lookup("find contact email", threshold=0.5)
+            assert hit is not None
+            assert hit["answer"] == "a@b.com"
+
+    def test_lookup_threshold_filters(self):
+        """完全不同 goal → lookup None."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("find contact email", success=True, answer="x@y.com")
+            hit = mem.lookup("book a flight to Tokyo")
+            assert hit is None
+
+    def test_lookup_only_returns_success(self):
+        """失败的 entry 不会作为答案返回."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("hard task", success=False, reason="couldn't")
+            hit = mem.lookup("hard task")
+            assert hit is None  # 失败不命中
+
+    def test_persistence_across_instances(self):
+        """两次 GoalMemory 实例, 数据持久化在 JSON."""
+        import tempfile, json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mem.json"
+            mem1 = GoalMemory(path)
+            mem1.record("get weather", success=True, answer="sunny")
+            mem2 = GoalMemory(path)
+            hit = mem2.lookup("get weather")
+            assert hit is not None
+            assert hit["answer"] == "sunny"
+
+    def test_hit_count_increments(self):
+        """命中后 hit_count +1."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("test goal", success=True, answer="ok")
+            mem.lookup("test goal")
+            mem.lookup("test goal")
+            mem.lookup("test goal")
+            entries = mem.list_recent()
+            assert entries[0]["hit_count"] == 3
+
+    def test_record_updates_existing(self):
+        """高度相似 (>=0.9) 视为同一 goal → 更新而非新增."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("find contact email", success=True, answer="first")
+            mem.record("find contact email", success=True, answer="second")
+            entries = mem.list_recent()
+            assert len(entries) == 1
+            assert entries[0]["answer"] == "second"
+
+    def test_stats_summary(self):
+        """stats() 返回 total/success/failure/total_hits."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("g1", success=True, answer="a")
+            mem.record("g2", success=False, reason="r")
+            mem.record("g3", success=True, answer="b")
+            mem.lookup("g1")
+            stats = mem.stats()
+            assert stats["total"] == 3
+            assert stats["success"] == 2
+            assert stats["failure"] == 1
+            assert stats["total_hits"] == 1
+
+    def test_clear_empties_memory(self):
+        """clear() 清空所有 entry."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("g1", success=True, answer="a")
+            mem.record("g2", success=True, answer="b")
+            mem.clear()
+            assert mem.stats()["total"] == 0
+            assert mem.lookup("g1") is None
+
+    def test_max_entries_lru_eviction(self):
+        """超过 MAX_ENTRIES (500) 时 LRU 淘汰."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            # 注入 MAX_ENTRIES+10 条
+            from semantic_browser.memory import goal_memory as gm_mod
+            orig_max = gm_mod.MAX_ENTRIES
+            gm_mod.MAX_ENTRIES = 5
+            try:
+                for i in range(7):
+                    mem.record(f"goal_{i}", success=True, answer=f"ans_{i}")
+                assert mem.stats()["total"] == 5
+                # 最早两条应被淘汰, 最近两条保留
+                assert mem.lookup("goal_6") is not None
+                assert mem.lookup("goal_5") is not None
+                assert mem.lookup("goal_0") is None
+            finally:
+                gm_mod.MAX_ENTRIES = orig_max
+
+
+class TestGoalAgentMemoryIntegration:
+    """T27: GoalAgent.run() 接入 goal memory."""
+
+    def test_cache_hit_short_circuits_run(self):
+        """已有 cache 时, run() 直接返回, 不调 LLM."""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.memory.goal_memory import GoalMemory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("get weather in Tokyo", success=True, answer="sunny 25C")
+
+            svc = LLMService(api_key="k", base_url="http://fake")
+            ctrl = BrowserController(BrowserConfig())
+            agent = GoalAgent(
+                ctrl, llm_service=svc, goal_memory=mem,
+                max_steps=5,
+            )
+            # 如果 cache 没命中, 会调 LLM (fake URL 必失败)
+            result = asyncio.run(agent.run("get weather in Tokyo"))
+            assert result.success is True
+            assert result.answer == "sunny 25C"
+            assert result.total_steps == 0
+            assert "memory" in result.reason
+            assert agent.last_memory_hit is not None
+
+    def test_no_memory_when_disabled(self):
+        """use_memory=False → 不查 cache."""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.memory.goal_memory import GoalMemory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            mem.record("get weather", success=True, answer="cached")
+
+            svc = LLMService(api_key="k", base_url="http://fake")
+            ctrl = BrowserController(BrowserConfig())
+            agent = GoalAgent(
+                ctrl, llm_service=svc, goal_memory=mem,
+                use_memory=False, max_steps=2,
+            )
+            # 应该走 LLM → 失败 (fake URL)
+            # 注入一个返回 done 的 LLM
+            async def fake_ask(goal, snap):
+                return {"thought": "x", "action": "done", "args": {"answer": "fresh"}}
+            async def fake_capture(goal=""):
+                return ("URL: x\n", "")
+            agent._ask_llm = fake_ask  # type: ignore[method-assign]
+            agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+            result = asyncio.run(agent.run("get weather"))
+            assert result.answer == "fresh"  # 不是 cache 的 "cached"
+
+    def test_records_result_after_run(self):
+        """run() 完成后写入 memory (无论成败)."""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent import GoalAgent
+        from semantic_browser.memory.goal_memory import GoalMemory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = GoalMemory(Path(tmp) / "mem.json")
+            svc = LLMService(api_key="k", base_url="http://fake")
+            ctrl = BrowserController(BrowserConfig())
+            agent = GoalAgent(ctrl, llm_service=svc, goal_memory=mem, max_steps=3)
+
+            async def fake_ask(goal, snap):
+                return {"thought": "x", "action": "done", "args": {"answer": "42"}}
+            async def fake_capture(goal=""):
+                return ("URL: x\n", "")
+            agent._ask_llm = fake_ask  # type: ignore[method-assign]
+            agent._capture_snapshot_excerpt = fake_capture  # type: ignore[method-assign]
+
+            asyncio.run(agent.run("compute pi"))
+            hit = mem.lookup("compute pi")
+            assert hit is not None
+            assert hit["answer"] == "42"

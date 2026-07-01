@@ -265,6 +265,18 @@ class TransparentBrowserDaemon:
             ))
         if method == "POST" and path == "/agent/run":
             return self.owner.run(self._run_agent(args))
+        # T27: 跨 session goal memory
+        if method == "GET" and path == "/memory/stats":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            return GoalMemory().stats()
+        if method == "GET" and path == "/memory/list":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            limit = int(args.get("limit", 20))
+            return {"entries": GoalMemory().list_recent(limit)}
+        if method == "POST" and path == "/memory/clear":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            GoalMemory().clear()
+            return {"cleared": True}
         # T23/T24: LLM 智能辅助端点
         if method == "GET" and path == "/llm/stats":
             from semantic_browser.llm import get_default_service

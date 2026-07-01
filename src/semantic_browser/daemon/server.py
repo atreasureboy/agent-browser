@@ -135,8 +135,12 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._read(format=args.get("format", "markdown")))
         if method == "POST" and path == "/click":
             return self.owner.run(self._click(args["ref"]))
+        if method == "POST" and path == "/click/healed":
+            return self.owner.run(self._click_healed(args["ref"]))
         if method == "POST" and path == "/type":
             return self.owner.run(self._type(args["ref"], args["text"]))
+        if method == "POST" and path == "/type/healed":
+            return self.owner.run(self._type_healed(args["ref"], args["text"]))
         if method == "POST" and path == "/hover":
             return self.owner.run(self._hover(args["ref"]))
         if method == "POST" and path == "/dblclick":
@@ -349,6 +353,12 @@ class TransparentBrowserDaemon:
     async def _type(self, ref: str, text: str) -> dict[str, Any]:
         ok = await self.owner.browser.controller.type_text(ref, text)
         return {"success": ok, "text_length": len(text)}
+
+    async def _click_healed(self, ref: str) -> dict[str, Any]:
+        return await self.owner.browser.controller.click_with_healing(ref)
+
+    async def _type_healed(self, ref: str, text: str) -> dict[str, Any]:
+        return await self.owner.browser.controller.type_with_healing(ref, text)
 
     async def _hover(self, ref: str) -> dict[str, Any]:
         ok = await self.owner.browser.controller.hover(ref)

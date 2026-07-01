@@ -209,7 +209,10 @@ What's the next single action? Respond with JSON only."""
         return json.loads(content)
 
     async def _execute_action(self, action: str, args: dict[str, Any]) -> tuple[bool, str]:
-        """执行 LLM 选的动作. Returns (success, error_or_output)."""
+        """执行 LLM 选的动作. Returns (success, error_or_output).
+
+        click/type 默认用 self-healing 版本 (T22) — 失败自动 force / JS.
+        """
         try:
             if action == "open":
                 url = args.get("url", "")
@@ -221,15 +224,17 @@ What's the next single action? Respond with JSON only."""
                 ref = args.get("ref", "")
                 if not ref:
                     return False, "missing ref"
-                ok = await self.controller.click(ref)
-                return ok, "" if ok else f"click {ref} returned False"
+                # T22: 用 self-healing, 大幅减少 brittle agent 行为
+                result = await self.controller.click_with_healing(ref)
+                return result["ok"], result.get("error") or ""
             if action == "type":
                 ref = args.get("ref", "")
                 text = args.get("text", "")
                 if not ref:
                     return False, "missing ref"
-                ok = await self.controller.type_text(ref, text)
-                return ok, "" if ok else f"type {ref} returned False"
+                # T22: 用 self-healing
+                result = await self.controller.type_with_healing(ref, text)
+                return result["ok"], result.get("error") or ""
             if action == "extract_text":
                 # 触发一次 snapshot, 让 LLM 看 ref 列表. 文本需要单独 extract
                 from semantic_browser.extractor.content import ContentExtractor

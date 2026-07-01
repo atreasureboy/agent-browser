@@ -181,6 +181,22 @@ def click_cmd(ctx, ref):
     _print(_request("POST", "/click", {"ref": ref}, base=ctx.obj["base"]))
 
 
+@tb.command("heal-click")
+@click.argument("ref")
+@click.pass_context
+def heal_click(ctx, ref):
+    """T22: Self-healing click — 失败自动 force / JS click."""
+    data = _request("POST", "/click/healed", {"ref": ref}, base=ctx.obj["base"])
+    if data.get("ok"):
+        if data.get("tried") and len(data["tried"]) > 1:
+            click.echo(f"✓ healed: tried {data['tried']}")
+        else:
+            click.echo("✓")
+    else:
+        click.echo(f"✗ {data.get('error')} (tried: {data.get('tried')})", err=True)
+        ctx.exit(1)
+
+
 @tb.command("type")
 @click.argument("ref")
 @click.argument("text")
@@ -188,6 +204,23 @@ def click_cmd(ctx, ref):
 def type_cmd(ctx, ref, text):
     """Fill text into a ref."""
     _print(_request("POST", "/type", {"ref": ref, "text": text}, base=ctx.obj["base"]))
+
+
+@tb.command("heal-type")
+@click.argument("ref")
+@click.argument("text")
+@click.pass_context
+def heal_type(ctx, ref, text):
+    """T22: Self-healing type — 失败自动 force / JS set."""
+    data = _request("POST", "/type/healed", {"ref": ref, "text": text}, base=ctx.obj["base"])
+    if data.get("ok"):
+        if data.get("tried") and len(data["tried"]) > 1:
+            click.echo(f"✓ healed: tried {data['tried']}")
+        else:
+            click.echo("✓")
+    else:
+        click.echo(f"✗ {data.get('error')} (tried: {data.get('tried')})", err=True)
+        ctx.exit(1)
 
 
 @tb.command("hover")

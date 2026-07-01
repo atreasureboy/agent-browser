@@ -2265,3 +2265,252 @@ class TestGoalAgent:
         assert len(d["steps"]) == 2
         assert d["steps"][0]["action"] == "open"
         assert d["steps"][0]["args"] == {"url": "https://x.com"}
+
+
+class TestSelfHealing:
+    """T22: self-healing click / type — 失败时自动 force / JS."""
+
+    def test_click_with_healing_returns_structured_result(self):
+        """click_with_healing 返回 {ok, ref, tried, error} 形状."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        assert inspect.iscoroutinefunction(ctrl.click_with_healing)
+        sig = inspect.signature(ctrl.click_with_healing)
+        assert "ref" in sig.parameters
+        assert "heal_attempts" in sig.parameters
+
+    def test_click_with_healing_succeeds_first_try(self):
+        """第一次正常 click 成功 → 只 tried=[normal]."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                captured["selector"] = selector
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def click(self, timeout=5000, force=False):
+                                captured["force"] = force
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.click_with_healing("e5"))
+        assert result["ok"] is True
+        assert result["tried"] == ["normal"]
+        assert result["error"] is None
+
+    def test_click_heals_with_force(self):
+        """第一次失败 → 第二次 force=True 成功."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"clicks": []}
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def click(self, timeout=5000, force=False):
+                                captured["clicks"].append(force)
+                                if not force:
+                                    raise RuntimeError("obscured")
+                                return None
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.click_with_healing("e7"))
+        assert result["ok"] is True
+        assert result["tried"] == ["normal", "force"]
+        assert captured["clicks"] == [False, True]  # 第一次 normal=False, 第二次 force=True
+
+    def test_click_heals_with_js(self):
+        """第一次 + 第二次都失败 → 第三次 JS click 成功."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {"clicks": [], "js": None}
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def click(self, timeout=5000, force=False):
+                                captured["clicks"].append(force)
+                                raise RuntimeError("always fail")
+                        return LL()
+                return FakeLocator()
+
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                return True
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.click_with_healing("e9"))
+        assert result["ok"] is True
+        assert result["tried"] == ["normal", "force", "js"]
+        assert "document.querySelector" in captured["js"]
+
+    def test_click_returns_error_when_all_fail(self):
+        """三种方式都失败 → ok=False + 完整 tried + error."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def click(self, timeout=5000, force=False):
+                                raise RuntimeError("nope")
+                        return LL()
+                return FakeLocator()
+
+            async def evaluate(self, js, arg=None):
+                return False
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.click_with_healing("e1"))
+        assert result["ok"] is False
+        assert result["tried"] == ["normal", "force", "js"]
+        assert result["error"]  # 任何错误消息 (不绑具体文案)
+
+    def test_type_with_healing_dispatches_input_event(self):
+        """type heal 的 JS 路径用 React-friendly value setter + dispatch input."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def fill(self, text, timeout=5000, force=False):
+                                if not force:
+                                    raise RuntimeError("normal fail")
+                                captured["force_fill"] = text
+                        return LL()
+                return FakeLocator()
+
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                captured["js_arg"] = arg
+                return True
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        # 第一次 normal 失败, 第二次 force 成功
+        result = asyncio.run(ctrl.type_with_healing("e3", "hello", heal_attempts=2))
+        assert result["ok"] is True
+        assert result["tried"] == ["normal", "force"]
+        assert captured["force_fill"] == "hello"
+
+        # 测 JS 路径: 第一次 + 第二次都失败
+        class FakeFrame2:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def fill(self, text, timeout=5000, force=False):
+                                raise RuntimeError("always fail")
+                        return LL()
+                return FakeLocator()
+
+            async def evaluate(self, js, arg=None):
+                captured["js2"] = js
+                captured["js2_arg"] = arg
+                return True
+
+        ctrl._frame = FakeFrame2()  # type: ignore[assignment]
+        result = asyncio.run(ctrl.type_with_healing("e3", "world", heal_attempts=2))
+        assert result["ok"] is True
+        assert result["tried"] == ["normal", "force", "js"]
+        # React-friendly 关键: HTMLInputElement 原型 setter + dispatch input event
+        assert "HTMLInputElement.prototype" in captured["js2"]
+        assert "dispatchEvent" in captured["js2"]
+        assert captured["js2_arg"] == ['[data-sb-ref="e3"]', "world"]
+
+    def test_type_healing_with_zero_attempts(self):
+        """heal_attempts=0 → 只试 normal."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        class FakeFrame:
+            def locator(self, selector):
+                class FakeLocator:
+                    @property
+                    def first(self):
+                        class LL:
+                            async def scroll_into_view_if_needed(self, timeout=5000):
+                                pass
+                            async def fill(self, text, timeout=5000, force=False):
+                                raise RuntimeError("fail")
+                        return LL()
+                return FakeLocator()
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.type_with_healing("e3", "x", heal_attempts=0))
+        assert result["ok"] is False
+        assert result["tried"] == ["normal"]

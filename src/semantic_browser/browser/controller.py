@@ -314,6 +314,57 @@ class BrowserController:
             logger.warning("Click failed ref=%s: %s", ref, e)
             return False
 
+    async def click_with_healing(self, ref: str, *, heal_attempts: int = 2) -> dict[str, Any]:
+        """T22: 带 self-healing 的 click — 失败时自动 retry with:
+        1. force=True (绕过遮挡检查)
+        2. JS click (绕过 Playwright actionability 检查)
+        Returns {"ok": bool, "ref": str, "tried": [str], "error": Optional[str]}.
+        """
+        target = await self._active_page_or_frame()
+        selector = self._ref_to_selector(ref)
+        tried: list[str] = []
+        last_err = None
+
+        # 第一次: 标准 click
+        tried.append("normal")
+        try:
+            locator = target.locator(selector).first
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            await locator.click(timeout=5000)
+            return {"ok": True, "ref": ref, "tried": tried, "error": None}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        if heal_attempts <= 0:
+            return {"ok": False, "ref": ref, "tried": tried, "error": last_err}
+
+        # 第二次: force=True (跳过遮挡检查)
+        tried.append("force")
+        try:
+            locator = target.locator(selector).first
+            await locator.click(force=True, timeout=5000)
+            logger.info("Healed click with force=True ref=%s", ref)
+            return {"ok": True, "ref": ref, "tried": tried, "error": None}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        # 第三次: JS click (绕过所有 actionability)
+        tried.append("js")
+        try:
+            ok = await target.evaluate(
+                "(sel) => { const el = document.querySelector(sel); "
+                "if (el) { el.click(); return true; } return false; }",
+                selector,
+            )
+            if ok:
+                logger.info("Healed click via JS ref=%s", ref)
+                return {"ok": True, "ref": ref, "tried": tried, "error": None}
+            last_err = "JS click: element not found"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        return {"ok": False, "ref": ref, "tried": tried, "error": last_err}
+
     async def type_text(self, ref: str, text: str) -> bool:
         """通过 @ref 输入文本。"""
         target = await self._active_page_or_frame()
@@ -327,6 +378,61 @@ class BrowserController:
         except Exception as e:
             logger.warning("Type failed ref=%s: %s", ref, e)
             return False
+
+    async def type_with_healing(self, ref: str, text: str, *, heal_attempts: int = 2) -> dict[str, Any]:
+        """T22: 带 self-healing 的 type_text — 失败时自动:
+        1. force=True fill
+        2. JS set value + dispatch input event (绕过 React 受控组件检查)
+        Returns {"ok", "ref", "tried", "error"}.
+        """
+        target = await self._active_page_or_frame()
+        selector = self._ref_to_selector(ref)
+        tried: list[str] = []
+        last_err = None
+
+        # 第一次: 标准 fill
+        tried.append("normal")
+        try:
+            locator = target.locator(selector).first
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            await locator.fill(text, timeout=5000)
+            return {"ok": True, "ref": ref, "tried": tried, "error": None}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        if heal_attempts <= 0:
+            return {"ok": False, "ref": ref, "tried": tried, "error": last_err}
+
+        # 第二次: force=True fill
+        tried.append("force")
+        try:
+            locator = target.locator(selector).first
+            await locator.fill(text, force=True, timeout=5000)
+            logger.info("Healed fill with force=True ref=%s", ref)
+            return {"ok": True, "ref": ref, "tried": tried, "error": None}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        # 第三次: JS dispatch input event (绕过 React 受控组件 / 框架拦截)
+        tried.append("js")
+        try:
+            await target.evaluate(
+                "([sel, v]) => { const el = document.querySelector(sel); "
+                "if (!el) return false; "
+                "const setter = Object.getOwnPropertyDescriptor("
+                "  window.HTMLInputElement.prototype, 'value').set; "
+                "setter.call(el, v); "
+                "el.dispatchEvent(new Event('input', { bubbles: true })); "
+                "el.dispatchEvent(new Event('change', { bubbles: true })); "
+                "return true; }",
+                [selector, text],
+            )
+            logger.info("Healed fill via JS ref=%s", ref)
+            return {"ok": True, "ref": ref, "tried": tried, "error": None}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
+
+        return {"ok": False, "ref": ref, "tried": tried, "error": last_err}
 
     async def fill_form(self, fields: dict[str, str]) -> dict[str, bool]:
         """T11: 一次性填多个字段 (人类填表的"批量"动作)。

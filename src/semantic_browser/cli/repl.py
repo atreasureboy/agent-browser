@@ -77,6 +77,8 @@ HELP_TEXT = """\
   scroll [up|down] [n]    滚动 (默认 down 500)
   tabs / new [url] / switch <N> / close [N]
                           多 tab 管理 (人类浏览器的核心能力)
+  wait text|ref|url X [ms]
+                          智能等待 (默认 10s); 比 sleep 稳
 
 [bold]查看[/bold]
   snapshot                语义快照表格
@@ -412,6 +414,28 @@ class REPLSession:
             return CommandResult(text="direction 必须是 up 或 down", error=True)
         await self.controller.scroll(direction, amount)
         return CommandResult(text=f"↕️  scroll {direction} {amount}px")
+
+    async def _cmd_wait(self, cmd: Command) -> CommandResult:
+        """`wait text|ref|url <target> [timeout_ms]` — 智能等待。"""
+        if len(cmd.args) < 2:
+            return CommandResult(text="用法: wait text|ref|url <target> [timeout_ms]", error=True)
+        kind = cmd.args[0].lower()
+        target = cmd.args[1]
+        timeout_ms = int(cmd.args[2]) if len(cmd.args) >= 3 else 10000
+        try:
+            if kind == "text":
+                ok = await self.controller.wait_for_text(target, timeout_ms=timeout_ms)
+            elif kind == "ref":
+                ok = await self.controller.wait_for_ref(target, timeout_ms=timeout_ms)
+            elif kind == "url":
+                ok = await self.controller.wait_for_url(target, timeout_ms=timeout_ms)
+            else:
+                return CommandResult(text=f"wait 类型必须是 text|ref|url, got {kind!r}", error=True)
+        except ValueError as e:
+            return CommandResult(text=f"✗ {e}", error=True)
+        if ok:
+            return CommandResult(text=f"✓ {kind} {target!r} 已出现 (≤ {timeout_ms}ms)")
+        return CommandResult(text=f"⏱  {kind} {target!r} {timeout_ms}ms 内未出现", error=True)
 
     async def _cmd_inspect(self, cmd: Command) -> CommandResult:
         ref = cmd.arg(0)

@@ -139,6 +139,19 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._type(args["ref"], args["text"]))
         if method == "POST" and path == "/scroll":
             return self.owner.run(self._scroll(args.get("direction", "down"), int(args.get("amount", 500))))
+        if method == "POST" and path == "/wait-for/text":
+            return self.owner.run(self._wait_for_text(
+                args["text"], int(args.get("timeout_ms", 10000)),
+                args.get("in_selector", "body"),
+            ))
+        if method == "POST" and path == "/wait-for/ref":
+            return self.owner.run(self._wait_for_ref(
+                args["ref"], int(args.get("timeout_ms", 10000)),
+            ))
+        if method == "POST" and path == "/wait-for/url":
+            return self.owner.run(self._wait_for_url(
+                args["pattern"], int(args.get("timeout_ms", 10000)),
+            ))
         if method == "POST" and path == "/press":
             return self.owner.run(self._press(args["key"]))
         if method == "POST" and path == "/back":
@@ -183,6 +196,8 @@ class TransparentBrowserDaemon:
             return {"saved": True, "url": url}
         if method == "GET" and path == "/stats":
             return self.owner.browser.store.stats()
+        if method == "POST" and path == "/run-workflow":
+            return self.owner.run(self._run_workflow(args["workflow_file"]))
         if method == "GET" and path == "/notes":
             url = args.get("url", "")
             limit = int(args.get("limit", 50))
@@ -230,6 +245,19 @@ class TransparentBrowserDaemon:
         await self.owner.browser.controller.scroll(direction, amount)
         return {"direction": direction, "amount": amount}
 
+    async def _wait_for_text(self, text: str, timeout_ms: int, in_selector: str) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.wait_for_text(text, timeout_ms=timeout_ms, in_selector=in_selector)
+        return {"found": ok, "text": text, "timeout_ms": timeout_ms}
+
+    async def _wait_for_ref(self, ref: str, timeout_ms: int) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.wait_for_ref(ref, timeout_ms=timeout_ms)
+        return {"found": ok, "ref": ref, "timeout_ms": timeout_ms}
+
+    async def _wait_for_url(self, pattern: str, timeout_ms: int) -> dict[str, Any]:
+        ok = await self.owner.browser.controller.wait_for_url(pattern, timeout_ms=timeout_ms)
+        return {"found": ok, "pattern": pattern, "url": await self.owner.browser.controller.get_url(),
+                "timeout_ms": timeout_ms}
+
     async def _press(self, key: str) -> dict[str, Any]:
         await self.owner.browser.controller.press_key(key)
         return {"key": key}
@@ -263,6 +291,13 @@ class TransparentBrowserDaemon:
         remaining = await self.owner.browser.controller.close_tab(index)
         active = self.owner.browser.controller.active_index
         return {"closed": index, "remaining": remaining, "active": active}
+
+    async def _run_workflow(self, workflow_file: str) -> dict[str, Any]:
+        from semantic_browser.workflow.runner import WorkflowRunner, load_workflow
+        workflow = load_workflow(workflow_file)
+        runner = WorkflowRunner(self.owner.browser.controller)
+        result = await runner.run(workflow)
+        return result.to_dict()
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -362,6 +362,91 @@ def tab_close(ctx, index):
     _print(_request("POST", "/tab/close", body, base=ctx.obj["base"]))
 
 
+@tb.group("wait-for")
+def wait_for_group():
+    """智能等待 — 比 sleep 更可靠。"""
+
+
+@wait_for_group.command("text")
+@click.argument("text")
+@click.option("--timeout-ms", default=10000, show_default=True)
+@click.option("--in", "in_selector", default="body", show_default=True,
+              help="CSS selector to scope search (default: whole page)")
+@click.option("--quiet", "-q", is_flag=True,
+              help="exit 0 if found, 1 if timeout (for scripts)")
+@click.pass_context
+def wait_text(ctx, text, timeout_ms, in_selector, quiet):
+    """Wait until TEXT appears on the page."""
+    try:
+        data = _request("POST", "/wait-for/text",
+                        {"text": text, "timeout_ms": timeout_ms, "in_selector": in_selector},
+                        base=ctx.obj["base"])
+    except click.ClickException as e:
+        if quiet:
+            click.echo(str(e), err=True)
+            ctx.exit(1)
+        raise
+    if quiet:
+        ctx.exit(0 if data["found"] else 1)
+    _print(data)
+
+
+@wait_for_group.command("ref")
+@click.argument("ref")
+@click.option("--timeout-ms", default=10000, show_default=True)
+@click.option("--quiet", "-q", is_flag=True)
+@click.pass_context
+def wait_ref(ctx, ref, timeout_ms, quiet):
+    """Wait until REF appears in DOM."""
+    try:
+        data = _request("POST", "/wait-for/ref",
+                        {"ref": ref, "timeout_ms": timeout_ms}, base=ctx.obj["base"])
+    except click.ClickException as e:
+        if quiet:
+            click.echo(str(e), err=True)
+            ctx.exit(1)
+        raise
+    if quiet:
+        ctx.exit(0 if data["found"] else 1)
+    _print(data)
+
+
+@wait_for_group.command("url")
+@click.argument("pattern")
+@click.option("--timeout-ms", default=10000, show_default=True)
+@click.option("--quiet", "-q", is_flag=True)
+@click.pass_context
+def wait_url(ctx, pattern, timeout_ms, quiet):
+    """Wait until current URL contains PATTERN (substring)."""
+    try:
+        data = _request("POST", "/wait-for/url",
+                        {"pattern": pattern, "timeout_ms": timeout_ms}, base=ctx.obj["base"])
+    except click.ClickException as e:
+        if quiet:
+            click.echo(str(e), err=True)
+            ctx.exit(1)
+        raise
+    if quiet:
+        ctx.exit(0 if data["found"] else 1)
+    _print(data)
+
+
+@tb.command("run-workflow")
+@click.argument("workflow_file", type=click.Path(exists=True))
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def run_workflow(ctx, workflow_file, json_out):
+    """Run a JSON workflow file (multi-step action sequence).
+
+    Workflow schema: {"name": "...", "on_error": "stop|continue", "steps": [{"action": ..., ...}]}
+    See src/semantic_browser/workflow/runner.py for full action list.
+    """
+    _print(_request("POST", "/run-workflow",
+                    {"workflow_file": str(workflow_file)},
+                    base=ctx.obj["base"]),
+           json_out=json_out)
+
+
 def main():
     tb()
 

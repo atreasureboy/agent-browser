@@ -222,6 +222,55 @@ class BrowserController:
     async def wait(self, seconds: float = 1.0) -> None:
         await asyncio.sleep(seconds)
 
+    # ── T8: 智能等待 — 等元素 / 文本 / URL 出现, 而不是固定 sleep ──
+
+    async def wait_for_text(
+        self, text: str, *, timeout_ms: int = 10000,
+        in_selector: str = "body",
+    ) -> bool:
+        """轮询页面直到 in_selector 内出现 text (默认 body 全局)。
+
+        Returns True 找到了, False 超时。
+        """
+        page = await self._ensure_page()
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                count = await page.locator(in_selector).filter(has_text=text).count()
+                if count > 0:
+                    return True
+            except Exception:
+                # locator 暂时无效 (页面切换中), 重试
+                pass
+            await asyncio.sleep(0.2)
+        return False
+
+    async def wait_for_ref(self, ref: str, *, timeout_ms: int = 10000) -> bool:
+        """轮询直到 ref 元素出现在 DOM 中 (可见也算, 但不强求 — 现代 SPA
+        ref 元素可能在 viewport 外但仍可交互)。"""
+        page = await self._ensure_page()
+        selector = self._ref_to_selector(ref)
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                count = await page.locator(selector).count()
+                if count > 0:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+        return False
+
+    async def wait_for_url(self, pattern: str, *, timeout_ms: int = 10000) -> bool:
+        """轮询直到 page.url 包含 pattern (substring 匹配, 不是 regex — 简单可靠)。"""
+        page = await self._ensure_page()
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+        while asyncio.get_event_loop().time() < deadline:
+            if pattern in page.url:
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
     async def screenshot(self, path: str | None = None) -> bytes:
         """截图。返回 PNG bytes，同时存到 path（如果给定）。"""
         page = await self._ensure_page()

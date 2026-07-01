@@ -586,3 +586,184 @@ class TestTabManagement:
         idx = ctrl.active_index
         # 过滤后只剩 1 个 tab, idx 应是 0
         assert idx == 0
+
+
+# ── T9: Workflow runner (用 fake controller) ──────────────────────
+
+class FakeControllerForWorkflow:
+    """替 WorkflowRunner 用的 fake controller — 模拟基本动作."""
+    def __init__(self):
+        self.actions = []
+        self.urls = ["https://start.com"]
+        self.active_idx = 0
+        self.click_should_fail = False
+
+    @property
+    def current_page(self):
+        if not self.urls:
+            return None
+        # 用 FakePage 充当 page — 只为了 .url / .title 之类
+        return FakePage(self.urls[self.active_idx])
+
+    async def open(self, url):
+        self.actions.append(("open", url))
+        self.urls[self.active_idx] = url
+    async def click(self, ref):
+        self.actions.append(("click", ref))
+        return not self.click_should_fail
+    async def type_text(self, ref, text):
+        self.actions.append(("type", ref, text))
+        return True
+    async def press_key(self, key):
+        self.actions.append(("press", key))
+    async def scroll(self, direction, amount):
+        self.actions.append(("scroll", direction, amount))
+    async def back(self):
+        self.actions.append(("back",))
+    async def forward(self):
+        self.actions.append(("forward",))
+    async def reload(self):
+        self.actions.append(("reload",))
+    async def screenshot(self, path=None):
+        self.actions.append(("screenshot", path))
+        return b"\x89PNG_FAKE"
+    async def wait_for_text(self, text, **kw):
+        self.actions.append(("wait_text", text))
+        return True
+    async def wait_for_ref(self, ref, **kw):
+        self.actions.append(("wait_ref", ref))
+        return True
+    async def wait_for_url(self, pat, **kw):
+        self.actions.append(("wait_url", pat))
+        return True
+    async def new_tab(self, url=""):
+        self.actions.append(("new_tab", url))
+        self.urls.append(url or "about:blank")
+        self.active_idx = len(self.urls) - 1
+    async def switch_tab(self, idx):
+        self.actions.append(("switch_tab", idx))
+        if 0 <= idx < len(self.urls):
+            self.active_idx = idx
+    async def close_tab(self, idx=None):
+        self.actions.append(("close_tab", idx))
+        if idx is None:
+            idx = self.active_idx
+        if 0 <= idx < len(self.urls):
+            self.urls.pop(idx)
+            self.active_idx = max(0, min(idx, len(self.urls) - 1))
+
+
+class TestWorkflowRunner:
+    def _runner(self):
+        from semantic_browser.workflow.runner import WorkflowRunner
+        return WorkflowRunner(FakeControllerForWorkflow())
+
+    async def test_simple_open(self):
+        r = await self._runner().run({"name": "t", "steps": [{"action": "open", "url": "https://x.com"}]})
+        assert r.status == "completed"
+        assert r.executed_steps == 1
+
+    async def test_multi_step(self):
+        wf = {
+            "name": "demo",
+            "steps": [
+                {"action": "open", "url": "https://x.com"},
+                {"action": "wait", "kind": "text", "target": "Welcome", "timeout_ms": 1000},
+                {"action": "click", "ref": "e3"},
+                {"action": "scroll", "direction": "down", "amount": 200},
+                {"action": "screenshot", "path": "/tmp/x.png"},
+            ],
+        }
+        r = await self._runner().run(wf)
+        assert r.status == "completed"
+        assert r.executed_steps == 5
+        assert all(s.ok for s in r.steps)
+
+    async def test_unknown_action_fails(self):
+        r = await self._runner().run({"name": "t", "steps": [{"action": "fly"}]})
+        assert r.status == "failed"
+        assert "unknown action" in r.steps[0].error
+
+    async def test_on_error_stop_default(self):
+        wf = {
+            "steps": [
+                {"action": "click", "ref": "e1"},  # click_should_fail=False, OK
+                {"action": "click", "ref": "e2"},  # next
+            ],
+        }
+        runner = self._runner()
+        runner.controller.click_should_fail = True
+        # 让 step 0 OK (改 ref), step 1 失败; on_error default = stop
+        wf = {
+            "steps": [
+                {"action": "click", "ref": "e1"},
+                {"action": "click", "ref": "e2"},  # 这个会失败
+                {"action": "scroll", "amount": 100},  # 不会执行
+            ],
+        }
+        # 强制第一个 click OK, 第二个 fail: 用 controller flag 在 click 时翻转
+        # 简化: 让 click_should_fail = True, 所有 click 都失败
+        r = await runner.run(wf)
+        assert r.status == "failed"
+        assert r.executed_steps == 0  # 第一个就 fail, 没成功的
+        # scroll 没执行
+        actions = [a[0] for a in runner.controller.actions]
+        assert "scroll" not in actions
+
+    async def test_on_error_continue(self):
+        wf = {
+            "on_error": "continue",
+            "steps": [
+                {"action": "click", "ref": "e1"},  # fail
+                {"action": "scroll", "amount": 100},  # 继续
+            ],
+        }
+        runner = self._runner()
+        runner.controller.click_should_fail = True
+        r = await runner.run(wf)
+        assert r.status == "partial"
+        assert r.executed_steps == 1  # 只有 scroll 算执行成功
+        assert not r.steps[0].ok
+        assert r.steps[1].ok
+
+    async def test_load_workflow_validates_schema(self, tmp_path):
+        from semantic_browser.workflow.runner import load_workflow
+        # 不是 object
+        p1 = tmp_path / "bad.json"
+        p1.write_text("[1, 2, 3]")
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            load_workflow(p1)
+        # 缺 steps
+        p2 = tmp_path / "bad2.json"
+        p2.write_text("{}")
+        with pytest.raises(ValueError, match="steps"):
+            load_workflow(p2)
+        # 文件不存在
+        with pytest.raises(FileNotFoundError):
+            load_workflow(tmp_path / "nope.json")
+
+    def test_workflow_result_to_dict_round_trip(self):
+        from semantic_browser.workflow.runner import WorkflowResult, WorkflowStepResult
+        r = WorkflowResult(name="t", total_steps=2, executed_steps=1, status="partial")
+        r.steps.append(WorkflowStepResult(0, "open", True, 100.0, data={"url": "x"}))
+        r.steps.append(WorkflowStepResult(1, "click", False, 50.0, error="nope"))
+        d = r.to_dict()
+        assert d["workflow"] == "t"
+        assert d["status"] == "partial"
+        assert d["steps"][0]["ok"] is True
+        assert d["steps"][0]["data"] == {"url": "x"}
+        assert d["steps"][1]["error"] == "nope"
+        assert "data" not in d["steps"][1]  # None 不写入
+
+    async def test_tab_actions_in_workflow(self):
+        wf = {
+            "steps": [
+                {"action": "new_tab", "url": "https://b.com"},
+                {"action": "switch_tab", "index": 0},
+                {"action": "close_tab"},
+            ],
+        }
+        runner = self._runner()
+        r = await runner.run(wf)
+        assert r.status == "completed"
+        assert r.executed_steps == 3

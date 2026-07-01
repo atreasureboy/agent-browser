@@ -212,6 +212,35 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/debug/clear":
             self.owner.browser.controller.clear_event_buffer()
             return {"cleared": True}
+        # T17: cookie / storage 管理
+        if method == "GET" and path == "/cookies":
+            url = args.get("url") or None
+            return self.owner.run(self.owner.browser.controller.get_cookies(url))
+        if method == "POST" and path == "/cookies/set":
+            return self.owner.run(self.owner.browser.controller.set_cookie(
+                name=args["name"], value=args["value"],
+                url=args.get("url") or None,
+                domain=args.get("domain") or None,
+                path=args.get("path", "/"),
+            ))
+        if method == "POST" and path == "/cookies/delete":
+            return self.owner.run(self.owner.browser.controller.delete_cookie(
+                name=args["name"], url=args.get("url") or None,
+            ))
+        if method == "POST" and path == "/cookies/clear":
+            n = self.owner.run(self.owner.browser.controller.clear_cookies())
+            return {"cleared": n}
+        if method == "GET" and path == "/storage":
+            kind = args.get("kind", "local")
+            return self.owner.run(self.owner.browser.controller.get_storage(kind=kind))
+        if method == "POST" and path == "/storage/set":
+            return self.owner.run(self.owner.browser.controller.set_storage(
+                key=args["key"], value=args["value"], kind=args.get("kind", "local"),
+            ))
+        if method == "POST" and path == "/storage/clear":
+            return self.owner.run(self.owner.browser.controller.clear_storage(
+                kind=args.get("kind", "local"),
+            ))
         if method == "POST" and path == "/state/save":
             return self.owner.run(self._save_state(args.get("path")))
         if method == "GET" and path == "/tab/list":

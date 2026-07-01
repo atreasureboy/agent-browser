@@ -452,6 +452,109 @@ def debug_clear(ctx):
     _print(_request("POST", "/debug/clear", base=ctx.obj["base"]))
 
 
+@tb.group()
+def cookies():
+    """T17: Cookie 管理 (调试登录态)."""
+
+
+@cookies.command("list")
+@click.option("--url", help="过滤特定 URL 的 cookies")
+@click.pass_context
+def cookies_list(ctx, url):
+    """列出所有 cookies (或某 URL 的)."""
+    q = {"url": url} if url else None
+    data = _request("GET", "/cookies", q, base=ctx.obj["base"])
+    if not data:
+        click.echo("(no cookies)")
+        return
+    for c in data:
+        flags = []
+        if c.get("httpOnly"):
+            flags.append("httpOnly")
+        if c.get("secure"):
+            flags.append("secure")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+        # 不打印 value (可能很长 / 含敏感)
+        click.echo(f"{c['name']:30s} = {c['value'][:40]}{'...' if len(c['value']) > 40 else ''}  ({c['domain']}){flag_str}")
+
+
+@cookies.command("set")
+@click.argument("name")
+@click.argument("value")
+@click.option("--url", help="限定 cookie 作用的 URL")
+@click.option("--domain", help="限定 cookie 作用的 domain (与 --url 二选一)")
+@click.pass_context
+def cookies_set(ctx, name, value, url, domain):
+    """设置一个 cookie."""
+    body = {"name": name, "value": value}
+    if url:
+        body["url"] = url
+    if domain:
+        body["domain"] = domain
+    _print(_request("POST", "/cookies/set", body, base=ctx.obj["base"]))
+
+
+@cookies.command("delete")
+@click.argument("name")
+@click.option("--url", help="限定删除的 URL")
+@click.pass_context
+def cookies_delete(ctx, name, url):
+    """删一个 cookie."""
+    body = {"name": name}
+    if url:
+        body["url"] = url
+    _print(_request("POST", "/cookies/delete", body, base=ctx.obj["base"]))
+
+
+@cookies.command("clear")
+@click.pass_context
+def cookies_clear(ctx):
+    """清空所有 cookies."""
+    _print(_request("POST", "/cookies/clear", base=ctx.obj["base"]))
+
+
+@tb.group()
+def storage():
+    """T17: localStorage / sessionStorage 管理."""
+
+
+@storage.command("list")
+@click.option("--kind", default="local", type=click.Choice(["local", "session"]),
+              show_default=True)
+@click.pass_context
+def storage_list(ctx, kind):
+    """列出 storage 条目."""
+    data = _request("GET", "/storage", {"kind": kind}, base=ctx.obj["base"])
+    if not data:
+        click.echo(f"(empty {kind}Storage)")
+        return
+    for k, v in data.items():
+        v_disp = v[:60] + "..." if len(v) > 60 else v
+        click.echo(f"{k:30s} = {v_disp}")
+
+
+@storage.command("set")
+@click.argument("key")
+@click.argument("value")
+@click.option("--kind", default="local", type=click.Choice(["local", "session"]),
+              show_default=True)
+@click.pass_context
+def storage_set(ctx, key, value, kind):
+    """写一个 storage 条目."""
+    _print(_request("POST", "/storage/set",
+                    {"key": key, "value": value, "kind": kind},
+                    base=ctx.obj["base"]))
+
+
+@storage.command("clear")
+@click.option("--kind", default="local", type=click.Choice(["local", "session", "all"]),
+              show_default=True)
+@click.pass_context
+def storage_clear(ctx, kind):
+    """清空 localStorage / sessionStorage."""
+    _print(_request("POST", "/storage/clear", {"kind": kind}, base=ctx.obj["base"]))
+
+
 @tb.group("state")
 def state_group():
     """Browser state commands."""

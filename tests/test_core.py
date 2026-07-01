@@ -1690,3 +1690,138 @@ class TestConsoleNetworkObservation:
         recent = ctrl.get_console_messages(limit=5)
         assert len(recent) == 5
         assert recent[-1]["text"] == "msg-19"
+
+
+class TestCookieStorageManagement:
+    """T17: cookies / localStorage / sessionStorage 管理 — agent 调试登录态."""
+
+    def test_get_cookies_signature(self):
+        """get_cookies(url=None) → list[dict]."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+        sig = inspect.signature(ctrl.get_cookies)
+        assert "url" in sig.parameters
+        assert inspect.iscoroutinefunction(ctrl.get_cookies)
+
+    def test_set_cookie_returns_structured_result(self):
+        """set_cookie 返回 {ok, name, error} 形状."""
+        # 形状契约验证 (实际 set 走真实 context.add_cookies)
+        expected_keys = {"ok", "name", "error"}
+        result = {"ok": True, "name": "session_id", "error": None}
+        assert set(result.keys()) == expected_keys
+        fail_result = {"ok": False, "name": "session_id", "error": "InvalidCookie"}
+        assert set(fail_result.keys()) == expected_keys
+
+    def test_storage_kind_validation(self):
+        """kind ∈ {local, session, all}."""
+        # API 形状: get_storage(kind), set_storage(key, value, kind), clear_storage(kind)
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        import inspect
+
+        sig_get = inspect.signature(ctrl.get_storage)
+        assert sig_get.parameters["kind"].default == "local"
+
+        sig_set = inspect.signature(ctrl.set_storage)
+        assert sig_set.parameters["kind"].default == "local"
+
+        sig_clear = inspect.signature(ctrl.clear_storage)
+        assert sig_clear.parameters["kind"].default == "local"
+
+    def test_get_storage_uses_active_target(self):
+        """get_storage 走 _active_page_or_frame() — frame 也支持."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                return {"k1": "v1", "k2": "v2"}
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should use frame, not page")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.get_storage(kind="local"))
+        assert result == {"k1": "v1", "k2": "v2"}
+        assert "localStorage" in captured["js"]
+        assert "sessionStorage" not in captured["js"]
+
+        # session kind
+        result = asyncio.run(ctrl.get_storage(kind="session"))
+        assert "sessionStorage" in captured["js"]
+
+    def test_set_storage_passes_key_value(self):
+        """set_storage 用 JS arrow function 传 [k, v] 数组."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                captured["arg"] = arg
+                return None
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            raise RuntimeError("should use frame")
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        result = asyncio.run(ctrl.set_storage("token", "abc123", kind="local"))
+        assert result["ok"] is True
+        assert captured["arg"] == ["token", "abc123"]
+        assert "localStorage.setItem" in captured["js"]
+
+    def test_clear_storage_local_uses_localstorage(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                return None
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        asyncio.run(ctrl.clear_storage(kind="local"))
+        assert "localStorage.clear()" in captured["js"]
+
+    def test_clear_storage_all_clears_both(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+
+        captured: dict = {}
+
+        class FakeFrame:
+            async def evaluate(self, js, arg=None):
+                captured["js"] = js
+                return None
+
+        ctrl._frame = FakeFrame()  # type: ignore[assignment]
+
+        async def fake_ensure():
+            return None
+        ctrl._ensure_page = fake_ensure  # type: ignore[method-assign]
+
+        import asyncio
+        asyncio.run(ctrl.clear_storage(kind="all"))
+        js = captured["js"]
+        assert "localStorage.clear()" in js
+        assert "sessionStorage.clear()" in js

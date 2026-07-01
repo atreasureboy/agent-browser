@@ -685,6 +685,115 @@ class BrowserController:
         self._network_requests.clear()
         self._page_errors.clear()
 
+    # ── T17: Cookie / Storage 管理 ───────────────────────────
+
+    async def get_cookies(self, url: str | None = None) -> list[dict[str, Any]]:
+        """列出 cookies. url=None = 所有 context cookies.
+
+        Returns [{"name", "value", "domain", "path", "expires", "httpOnly", "secure"}, ...]
+        """
+        page = await self._ensure_page()
+        # Playwright cookies API: 用 context 而不是 page
+        cookies = await self._context.cookies(url) if url else await self._context.cookies()
+        return [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ""),
+                "path": c.get("path", "/"),
+                "expires": c.get("expires", -1),
+                "httpOnly": c.get("httpOnly", False),
+                "secure": c.get("secure", False),
+                "sameSite": c.get("sameSite"),
+            }
+            for c in cookies
+        ]
+
+    async def set_cookie(
+        self,
+        name: str,
+        value: str,
+        url: str | None = None,
+        domain: str | None = None,
+        path: str = "/",
+    ) -> dict[str, Any]:
+        """设置一个 cookie.
+
+        url 优先; 若没给 url, 用 domain+path.
+        返回 {ok, name, error}.
+        """
+        try:
+            cookie: dict[str, Any] = {"name": name, "value": value, "path": path}
+            if url:
+                cookie["url"] = url
+            else:
+                cookie["domain"] = domain or ""
+                cookie["path"] = path
+            await self._context.add_cookies([cookie])
+            return {"ok": True, "name": name, "error": None}
+        except Exception as e:
+            return {"ok": False, "name": name, "error": str(e)[:200]}
+
+    async def delete_cookie(self, name: str, url: str | None = None) -> dict[str, Any]:
+        """删一个 cookie. url=None = 清空所有同名 cookie."""
+        try:
+            await self._context.clear_cookies(name=name, url=url)
+            return {"ok": True, "name": name}
+        except Exception as e:
+            return {"ok": False, "name": name, "error": str(e)[:200]}
+
+    async def clear_cookies(self) -> int:
+        """清空所有 cookies. 返回清理的 cookie 数."""
+        before = len(await self.get_cookies())
+        await self._context.clear_cookies()
+        return before
+
+    async def get_storage(self, kind: str = "local") -> dict[str, str]:
+        """读 localStorage / sessionStorage. kind: 'local' or 'session'.
+
+        Returns {key: value} (value 是 str; 复杂类型可能需要 agent 自己 parse).
+        """
+        target = await self._active_page_or_frame()
+        storage_kind = "localStorage" if kind == "local" else "sessionStorage"
+        # JS 在 frame 内跑 (iframe 也支持)
+        result = await target.evaluate(f"""
+            () => {{
+                const out = {{}};
+                const storage = {storage_kind};
+                for (let i = 0; i < storage.length; i++) {{
+                    const k = storage.key(i);
+                    out[k] = storage.getItem(k);
+                }}
+                return out;
+            }}
+        """)
+        return result or {}
+
+    async def set_storage(self, key: str, value: str, kind: str = "local") -> dict[str, Any]:
+        """写 localStorage / sessionStorage."""
+        target = await self._active_page_or_frame()
+        storage_kind = "localStorage" if kind == "local" else "sessionStorage"
+        try:
+            await target.evaluate(
+                f"([k, v]) => {storage_kind}.setItem(k, v)", [key, value],
+            )
+            return {"ok": True, "kind": kind, "key": key, "error": None}
+        except Exception as e:
+            return {"ok": False, "kind": kind, "key": key, "error": str(e)[:200]}
+
+    async def clear_storage(self, kind: str = "local") -> dict[str, Any]:
+        """清空 localStorage 或 sessionStorage. kind: 'local' / 'session' / 'all'."""
+        target = await self._active_page_or_frame()
+        storage_kind = "localStorage" if kind == "local" else "sessionStorage"
+        try:
+            if kind == "all":
+                await target.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+            else:
+                await target.evaluate(f"() => {storage_kind}.clear()")
+            return {"ok": True, "kind": kind, "error": None}
+        except Exception as e:
+            return {"ok": False, "kind": kind, "error": str(e)[:200]}
+
     # ── T15: Frame (iframe) 支持 ─────────────────────────────
 
     @property

@@ -72,6 +72,10 @@ class BrowserController:
         self._browser = await self._playwright.chromium.launch(
             headless=self.config.headless,
         )
+        await self._start_context()
+
+    async def _start_context(self) -> None:
+        """T33: 给当前 controller 创建独立 context. Pool 用 — 不重复启动 browser."""
         import os
         context_kwargs = {
             "viewport": self.config.viewport,
@@ -80,8 +84,20 @@ class BrowserController:
         }
         if self.config.storage_state_path and os.path.exists(self.config.storage_state_path):
             context_kwargs["storage_state"] = self.config.storage_state_path
+        assert self._browser is not None
         self._context = await self._browser.new_context(**context_kwargs)
         self._context.set_default_timeout(self.config.timeout)
+        # T18: 全局监听 console / network / pageerror (适用于 context 内所有页)
+        self._context.on("console", self._on_console)
+        self._context.on("request", self._on_request)
+        self._context.on("requestfailed", self._on_request_failed)
+        self._context.on("response", self._on_response)
+        self._context.on("weberror", self._on_web_error)
+
+    async def _ensure_context(self) -> None:
+        """T33: Pool 创建的 controller 用 — 第一次操作前确保 context 存在."""
+        if self._context is None and self._browser is not None:
+            await self._start_context()
         # T18: 全局监听 console / network / pageerror (适用于 context 内所有页)
         self._context.on("console", self._on_console)
         self._context.on("request", self._on_request)
@@ -197,7 +213,11 @@ class BrowserController:
         """确保有 current_page — 必要时建一个。"""
         if self._page is None or self._page.is_closed():
             if self._context is None:
-                await self.start()
+                # T33: Pool 创建的 controller 共享 browser 但 context 还没建
+                if self._browser is not None:
+                    await self._start_context()
+                else:
+                    await self.start()
             self._page = await self._context.new_page()
             self._active_idx = 0
         return self._page

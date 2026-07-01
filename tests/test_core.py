@@ -3848,3 +3848,143 @@ def _make_fake_controller(pages: list[tuple[str, list[str]]]):
     disc_mod.SnapshotEngine = FakeEngine  # type: ignore[assignment]
 
     return FakeCtrl()
+
+
+
+class TestControllerPool:
+    """T33: ControllerPool — 多 controller 共享 browser, 隔离 context."""
+
+    def test_pool_tracks_active_controllers(self):
+        """acquire/release 维护 _controllers dict."""
+        from semantic_browser.browser.pool import ControllerPool
+
+        pool = ControllerPool()
+        # 不真启动 browser — 只测 dict 操作
+        pool._controllers["a"] = "fake_ctrl_a"  # type: ignore[assignment]
+        pool._controllers["b"] = "fake_ctrl_b"  # type: ignore[assignment]
+        assert pool.list_active() == ["a", "b"]
+
+    def test_pool_max_contexts_enforced(self):
+        """超过 max_contexts 时 acquire 抛异常."""
+        import asyncio
+        from semantic_browser.browser.pool import ControllerPool
+
+        async def fake_acquire(name):
+            # 模拟 acquire 但跳过真启动 browser
+            async with pool._lock:
+                if name in pool._controllers:
+                    return pool._controllers[name]
+                if len(pool._controllers) >= pool.max_contexts:
+                    raise RuntimeError(f"ControllerPool exhausted")
+                # mock: 不真创建 controller, 只入 dict
+                pool._controllers[name] = f"fake_{name}"
+                return pool._controllers[name]
+
+        pool = ControllerPool(max_contexts=2)
+        pool._lock = asyncio.Lock()
+        # patch acquire 用 fake
+        pool.acquire = fake_acquire  # type: ignore[method-assign]
+        asyncio.run(pool.acquire("a"))
+        asyncio.run(pool.acquire("b"))
+        # 第 3 个应失败
+        try:
+            asyncio.run(pool.acquire("c"))
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "exhausted" in str(e)
+
+    def test_pool_reuses_named_controller(self):
+        """同名 acquire 直接复用, 不创建新 context."""
+        import asyncio
+        from semantic_browser.browser.pool import ControllerPool
+
+        async def fake_acquire(name):
+            async with pool._lock:
+                if name in pool._controllers:
+                    return pool._controllers[name]
+                pool._controllers[name] = f"fake_{name}"
+                return pool._controllers[name]
+
+        pool = ControllerPool()
+        pool._lock = asyncio.Lock()
+        pool.acquire = fake_acquire  # type: ignore[method-assign]
+
+        ctrl1 = asyncio.run(pool.acquire("agent-x"))
+        ctrl2 = asyncio.run(pool.acquire("agent-x"))
+        assert ctrl1 is ctrl2
+        assert pool.list_active() == ["agent-x"]
+
+    def test_pool_release_closes_context(self):
+        """release() 关闭 controller 自己的 context, 不影响共享 browser."""
+        import asyncio
+        from semantic_browser.browser.pool import ControllerPool
+
+        class FakeCtrl:
+            def __init__(self, name):
+                self._context = f"ctx_{name}"
+                self._pool_name = name
+
+        class FakePool(ControllerPool):
+            async def release(self, name):
+                async with self._lock:
+                    ctrl = self._controllers.pop(name, None)
+                if ctrl is None:
+                    return
+                # 模拟 close context
+                closed = []
+                if ctrl._context is not None:
+                    closed.append(ctrl._context)
+                return closed
+
+        pool = FakePool()
+        pool._lock = asyncio.Lock()
+        pool._controllers["a"] = FakeCtrl("a")  # type: ignore[assignment]
+        pool._controllers["b"] = FakeCtrl("b")  # type: ignore[assignment]
+        asyncio.run(pool.release("a"))
+        assert pool.list_active() == ["b"]
+
+    def test_pool_context_manager(self):
+        """async with pool as p: ... 走 start/close."""
+        from semantic_browser.browser.pool import ControllerPool
+
+        class FakePool(ControllerPool):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+            async def start(self):
+                self.events.append("start")
+            async def close(self):
+                self.events.append("close")
+
+        pool = FakePool()
+        import asyncio
+
+        async def use():
+            async with pool as p:
+                p.events.append("enter")
+            return p.events
+
+        events = asyncio.run(use())
+        assert events == ["start", "enter", "close"]
+
+    def test_make_controller_shares_browser(self):
+        """_make_controller 注入共享 browser, 不重新启动."""
+        from semantic_browser.browser.pool import ControllerPool
+
+        # 模拟共享 playwright + browser
+        class FakeBrowser:
+            pass
+        class FakePlaywright:
+            pass
+
+        pool = ControllerPool()
+        pool._browser = FakeBrowser()  # type: ignore[assignment]
+        pool._playwright = FakePlaywright()  # type: ignore[assignment]
+
+        ctrl = pool._make_controller("test-agent")
+        # 共享同一个 browser / playwright
+        assert ctrl._browser is pool._browser
+        assert ctrl._playwright is pool._playwright
+        assert ctrl._pool_name == "test-agent"
+        # context 还没建 (懒加载)
+        assert ctrl._context is None

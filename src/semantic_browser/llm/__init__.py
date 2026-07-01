@@ -1,4 +1,4 @@
-"""LLM 服务抽象层 — 支持 cheap/medium/smart 三档模型路由."""
+"""LLM 服务抽象层 — 支持 cheap/medium/smart 三档模型路由 + 多 provider."""
 
 from semantic_browser.llm.service import (
     LLMService,
@@ -7,6 +7,16 @@ from semantic_browser.llm.service import (
     Tier,
     get_default_service,
     reset_default_service,
+)
+from semantic_browser.llm.providers import (
+    LLMProvider,
+    OpenAICompatProvider,
+    AnthropicProvider,
+    GeminiProvider,
+    OllamaProvider,
+    build_provider,
+    detect_provider,
+    PROVIDER_NAMES,
 )
 from semantic_browser.llm.helpers import (
     slice_refs_for_goal,
@@ -27,6 +37,16 @@ __all__ = [
     "Tier",
     "get_default_service",
     "reset_default_service",
+    # T36: provider 多路
+    "LLMProvider",
+    "OpenAICompatProvider",
+    "AnthropicProvider",
+    "GeminiProvider",
+    "OllamaProvider",
+    "build_provider",
+    "detect_provider",
+    "PROVIDER_NAMES",
+    # helpers
     "slice_refs_for_goal",
     "summarize_text",
     "extract_fields",

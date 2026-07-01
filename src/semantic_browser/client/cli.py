@@ -1199,6 +1199,70 @@ def discover_cmd(ctx, start_url, max_pages, max_depth, delay_ms, json_out):
         click.echo(data["llm_summary"])
 
 
+@tb.command("bench")
+@click.argument("tasks_file", type=click.Path(exists=True))
+@click.option("--tier", default="smart",
+              type=click.Choice(["cheap", "medium", "smart"]),
+              show_default=True)
+@click.option("--max-steps", default=20, show_default=True)
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def bench_cmd(ctx, tasks_file, tier, max_steps, json_out):
+    """T35: 跑一组 golden task 评测 agent.
+
+    \b
+    tasks_file 是 JSON 列表, schema:
+      [{"name": "...", "goal": "...", "start_url": "...",
+        "expected": {"answer_contains": "...", "max_steps": N},
+        "tags": [...]}]
+    """
+    import asyncio
+    from semantic_browser.bench import load_tasks, run_benchmark
+    from semantic_browser.llm import LLMService
+    from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+    tasks = load_tasks(tasks_file)
+    click.echo(f"Loaded {len(tasks)} tasks from {tasks_file}")
+
+    async def run():
+        ctrl = BrowserController(BrowserConfig())
+        try:
+            await ctrl.start()
+            report = await run_benchmark(
+                tasks, llm_service=LLMService(),
+                controller=ctrl, tier=tier, max_steps=max_steps,
+                use_memory=False,
+            )
+        finally:
+            await ctrl.close()
+        return report
+
+    report = asyncio.run(run())
+    if json_out:
+        _print(report.to_dict(), json_out=True)
+        return
+    click.echo("")
+    click.echo(f"=== Results: {report.succeeded}/{report.total} "
+               f"({report.success_rate*100:.0f}%) ===")
+    click.echo(f"Avg steps: {report.avg_steps:.1f}")
+    click.echo(f"Avg duration: {report.avg_duration_sec:.2f}s")
+    if report.failure_reasons:
+        click.echo("Failure reasons:")
+        for reason, count in report.failure_reasons.items():
+            click.echo(f"  ×{count}  {reason[:80]}")
+    click.echo("")
+    for r in report.results:
+        mark = "✓" if r.success else "✗"
+        click.echo(f"  {mark} {r.task.name} (steps={r.actual_steps}, {r.duration_sec:.1f}s)")
+        if not r.success:
+            click.echo(f"      reason: {r.failure_reason[:80]}")
+    click.echo(data.get("tree_text", "(empty)"))
+    if data.get("llm_summary"):
+        click.echo("")
+        click.echo("--- LLM summary (for agent) ---")
+        click.echo(data["llm_summary"])
+
+
 def main():
     tb()
 

@@ -3988,3 +3988,147 @@ class TestControllerPool:
         assert ctrl._pool_name == "test-agent"
         # context 还没建 (懒加载)
         assert ctrl._context is None
+
+
+
+class TestBenchmark:
+    """T35: golden task 评测套件."""
+
+    def test_load_tasks_from_json(self):
+        """load_tasks() 解析 JSON 列表."""
+        import json
+        import tempfile
+        from pathlib import Path
+        from semantic_browser.bench import load_tasks
+
+        data = [
+            {"name": "t1", "goal": "extract h1", "start_url": "https://x.com",
+             "expected": {"answer_contains": "Hello", "max_steps": 5},
+             "tags": ["smoke"]},
+            {"name": "t2", "goal": "click button"},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            tasks = load_tasks(f.name)
+        assert len(tasks) == 2
+        assert tasks[0].name == "t1"
+        assert tasks[0].expected_answer_contains == "Hello"
+        assert tasks[0].expected_max_steps == 5
+        assert tasks[0].tags == ["smoke"]
+        assert tasks[1].expected_answer_contains == ""  # 没指定
+
+    def test_grade_passes_when_answer_contains(self):
+        """answer 含 expected → pass."""
+        from semantic_browser.bench import GoldenTask, _grade
+        from semantic_browser.agent.loop import GoalResult
+
+        task = GoldenTask(name="t", goal="x", expected_answer_contains="hello")
+        result = GoalResult(goal="x", success=True, answer="say hello world", total_steps=3)
+        ok, reason = _grade(task, result)
+        assert ok is True
+        assert reason == ""
+
+    def test_grade_fails_when_answer_missing(self):
+        """answer 不含 expected → fail."""
+        from semantic_browser.bench import GoldenTask, _grade
+        from semantic_browser.agent.loop import GoalResult
+
+        task = GoldenTask(name="t", goal="x", expected_answer_contains="hello")
+        result = GoalResult(goal="x", success=True, answer="goodbye", total_steps=3)
+        ok, reason = _grade(task, result)
+        assert ok is False
+        assert "hello" in reason
+
+    def test_grade_case_insensitive(self):
+        """answer 大小写不敏感 (lowercase 比较)."""
+        from semantic_browser.bench import GoldenTask, _grade
+        from semantic_browser.agent.loop import GoalResult
+
+        task = GoldenTask(name="t", goal="x", expected_answer_contains="HELLO")
+        result = GoalResult(goal="x", success=True, answer="hello world", total_steps=3)
+        ok, _ = _grade(task, result)
+        assert ok is True
+
+    def test_grade_fails_when_steps_exceed_max(self):
+        """步数 > expected_max_steps → fail."""
+        from semantic_browser.bench import GoldenTask, _grade
+        from semantic_browser.agent.loop import GoalResult
+
+        task = GoldenTask(name="t", goal="x",
+                          expected_answer_contains="hi",
+                          expected_max_steps=3)
+        result = GoalResult(goal="x", success=True, answer="hi", total_steps=10)
+        ok, reason = _grade(task, result)
+        assert ok is False
+        assert "steps" in reason
+
+    def test_run_benchmark_aggregates_results(self):
+        """run_benchmark() 累加 result + 算 success rate."""
+        import asyncio
+        from semantic_browser.bench import GoldenTask, run_benchmark
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        from semantic_browser.llm import LLMService
+        from semantic_browser.agent.loop import GoalAgent
+
+        # fake controller + service
+        ctrl = BrowserController(BrowserConfig())
+        svc = LLMService(api_key="k", base_url="http://fake")
+
+        # monkey-patch GoalAgent.run 来 fake 返回
+        original_run = GoalAgent.run
+        async def fake_run(self, goal, *, start_url=None):
+            from semantic_browser.agent.loop import GoalResult, StepRecord
+            if "pass" in goal:
+                return GoalResult(
+                    goal=goal, success=True, answer="hello world",
+                    steps=[], total_steps=2,
+                )
+            return GoalResult(
+                goal=goal, success=False, reason="simulated fail",
+                steps=[], total_steps=0,
+            )
+        GoalAgent.run = fake_run  # type: ignore[method-assign]
+
+        tasks = [
+            GoldenTask(name="pass1", goal="do thing pass",
+                       expected_answer_contains="hello"),
+            GoldenTask(name="fail1", goal="do thing fail"),
+        ]
+
+        try:
+            report = asyncio.run(run_benchmark(
+                tasks, llm_service=svc, controller=ctrl, use_memory=False,
+            ))
+            assert report.total == 2
+            assert report.succeeded == 1
+            assert report.failed == 1
+            assert report.success_rate == 0.5
+            # pass1 答 "hello world" 含 "hello" → pass
+            assert report.results[0].success is True
+            # fail1 没成功 → fail
+            assert report.results[1].success is False
+        finally:
+            GoalAgent.run = original_run  # type: ignore[method-assign]
+
+    def test_benchmark_report_to_dict_shape(self):
+        """BenchmarkReport.to_dict() 包含全部字段."""
+        from semantic_browser.bench import BenchmarkReport, TaskResult, GoldenTask
+        report = BenchmarkReport(total=2)
+        report.succeeded = 1
+        report.failed = 1
+        report.avg_steps = 3.0
+        report.avg_duration_sec = 1.5
+        report.results = [
+            TaskResult(task=GoldenTask(name="t1", goal="x"),
+                       success=True, actual_answer="ok",
+                       actual_steps=2, duration_sec=1.0),
+        ]
+        report.failure_reasons = {"agent failed": 1}
+        d = report.to_dict()
+        assert d["total"] == 2
+        assert d["succeeded"] == 1
+        assert d["success_rate"] == 0.5
+        assert d["avg_steps"] == 3.0
+        assert "agent failed" in d["failure_reasons"]
+        assert len(d["results"]) == 1

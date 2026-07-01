@@ -38,6 +38,112 @@ class BrowserConfig:
     storage_state_path: Optional[str] = None
 
 
+# ── T40f: 安全头 parser 帮手 ─────────────────────────────
+
+def _parse_csp(csp: str) -> dict[str, Any]:
+    """Parse CSP header — 拆 directives, 标常见不安全 source."""
+    directives: dict[str, list[str]] = {}
+    for part in csp.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(None, 1)
+        name = bits[0].lower()
+        sources = bits[1].split() if len(bits) > 1 else []
+        directives[name] = sources
+    all_srcs = [s for vs in directives.values() for s in vs]
+    return {
+        "raw": csp,
+        "directives": directives,
+        "directive_names": list(directives.keys()),
+        "has_unsafe_inline": "'unsafe-inline'" in all_srcs,
+        "has_unsafe_eval": "'unsafe-eval'" in all_srcs,
+        "allows_wildcard": "*" in all_srcs,
+        "allows_data": "data:" in all_srcs,
+        "allows_https": "https:" in all_srcs,
+        "has_script_src": "script-src" in directives,
+        "has_object_src": "object-src" in directives,
+        "has_default_src": "default-src" in directives,
+    }
+
+
+def _parse_hsts(hsts: str) -> dict[str, Any]:
+    """Strict-Transport-Security."""
+    out = {"raw": hsts, "max_age": 0, "include_subdomains": False, "preload": False}
+    for tok in hsts.split(";"):
+        tok = tok.strip()
+        if tok.lower().startswith("max-age="):
+            try:
+                out["max_age"] = int(tok.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif tok.lower() == "includesubdomains":
+            out["include_subdomains"] = True
+        elif tok.lower() == "preload":
+            out["preload"] = True
+    return out
+
+
+def _parse_permissions_policy(pp: str) -> dict[str, Any]:
+    """Permissions-Policy 解析成 {directive: allowed-origins 或 []}."""
+    directives: dict[str, list[str]] = {}
+    for part in pp.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split("=", 1)
+        name = bits[0].strip().lower()
+        sources: list[str] = []
+        if len(bits) > 1:
+            sources = bits[1].split()
+        directives[name] = sources
+    return {"raw": pp, "directives": directives}
+
+
+def _parse_set_cookie(sc_value: str) -> dict[str, Any]:
+    """解析单个 Set-Cookie 字符串."""
+    parts = sc_value.split(";")
+    first = parts[0].strip()
+    name = ""
+    value = ""
+    if "=" in first:
+        name, value = first.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+    out: dict[str, Any] = {
+        "name": name,
+        "value": value[:500],
+        "httpOnly": False,
+        "secure": False,
+        "sameSite": "",
+        "path": "",
+        "domain": "",
+        "max_age": None,
+        "expires": "",
+    }
+    for tok in parts[1:]:
+        tok = tok.strip()
+        low = tok.lower()
+        if low == "httponly":
+            out["httpOnly"] = True
+        elif low == "secure":
+            out["secure"] = True
+        elif low.startswith("samesite="):
+            out["sameSite"] = tok.split("=", 1)[1]
+        elif low.startswith("path="):
+            out["path"] = tok.split("=", 1)[1]
+        elif low.startswith("domain="):
+            out["domain"] = tok.split("=", 1)[1]
+        elif low.startswith("max-age="):
+            try:
+                out["max_age"] = int(tok.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif low.startswith("expires="):
+            out["expires"] = tok.split("=", 1)[1]
+    return out
+
+
 class BrowserController:
     """
     Playwright 异步封装。
@@ -754,6 +860,136 @@ class BrowserController:
                 return r.text[:50000]  # 50K 上限, 防止 OOM
         except Exception as e:
             return f"(fetch failed: {type(e).__name__}: {e})"
+
+    # ── T40a: 客户端存储 ─────────────────────────────────
+
+    async def get_storage(self) -> dict[str, Any]:
+        """T40a: 客户端存储探针 — localStorage/sessionStorage 全文 + cookies 字段.
+
+        Returns:
+            {
+              "localStorage":   {k: v (5000 字截断)},
+              "sessionStorage": {k: v},
+              "cookies": [{
+                  "name", "value"(500 字), "domain", "path", "expires"(unix ts or None),
+                  "httpOnly" (bool), "secure" (bool), "sameSite" (str), "url",
+              }],
+              "cookie_count": int,
+              "page_url": str,
+            }
+        """
+        page = await self._ensure_page()
+        stores = await page.evaluate("""() => {
+            const dump = (storage) => {
+                const out = {};
+                if (!storage) return out;
+                for (let i = 0; i < storage.length; i++) {
+                    const k = storage.key(i);
+                    if (k == null) continue;
+                    out[k] = (storage.getItem(k) || '').substring(0, 5000);
+                }
+                return out;
+            };
+            return {
+                localStorage: dump(window.localStorage),
+                sessionStorage: dump(window.sessionStorage),
+                page_url: location.href,
+            };
+        }""")
+        # cookies via Playwright context (gives typed fields)
+        cookies: list[dict[str, Any]] = []
+        try:
+            raw_cookies = await self._context.cookies()
+            for c in raw_cookies:
+                cookies.append({
+                    "name": c.get("name", ""),
+                    "value": (c.get("value") or "")[:500],
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", ""),
+                    "expires": c.get("expires"),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "secure": bool(c.get("secure", False)),
+                    "sameSite": c.get("sameSite", "") or "",
+                    "url": c.get("url", ""),
+                })
+        except Exception as e:
+            logger.warning("get cookies failed: %s", e)
+        return {
+            "localStorage": stores.get("localStorage", {}),
+            "sessionStorage": stores.get("sessionStorage", {}),
+            "cookies": cookies,
+            "cookie_count": len(cookies),
+            "page_url": stores.get("page_url", page.url),
+        }
+
+    # ── T40f: 安全头结构化 ───────────────────────────────
+
+    async def get_security_headers(self, url: str) -> dict[str, Any] | None:
+        """T40f: 给定 URL, 把响应头解析成结构化安全审计数据.
+
+        Returns: {
+          "url", "raw": {...全部 headers...},
+          "csp": {directives, has_unsafe_inline, has_unsafe_eval, ...} 或 None,
+          "hsts": {max_age, include_subdomains, preload} 或 None,
+          "x_frame_options": str 或 None,
+          "x_content_type_options": str 或 None,
+          "referrer_policy": str 或 None,
+          "coop": str 或 None,
+          "coep": str 或 None,
+          "permissions_policy": {directives: [...]} 或 None,
+          "set_cookie_parsed": [{name, value, httpOnly, secure, sameSite, ...}],
+          "score": "OK" | "weak" | "missing"   # 简易评分
+        } 或 None (没拿到头).
+        """
+        raw = await self.get_response_headers(url)
+        if raw is None:
+            return None
+        out: dict[str, Any] = {"url": url, "raw": raw}
+
+        # CSP
+        csp_val = raw.get("content-security-policy")
+        out["csp"] = _parse_csp(csp_val) if csp_val else None
+
+        # HSTS
+        hsts_val = raw.get("strict-transport-security")
+        out["hsts"] = _parse_hsts(hsts_val) if hsts_val else None
+
+        out["x_frame_options"] = raw.get("x-frame-options")
+        out["x_content_type_options"] = raw.get("x-content-type-options")
+        out["referrer_policy"] = raw.get("referrer-policy")
+        out["coop"] = raw.get("cross-origin-opener-policy")
+        out["coep"] = raw.get("cross-origin-embedder-policy")
+
+        pp_val = raw.get("permissions-policy")
+        out["permissions_policy"] = _parse_permissions_policy(pp_val) if pp_val else None
+
+        # Set-Cookie: header 不一定在 response_headers (httpx 通常会按 set-cookie 拆出)
+        sc = raw.get("set-cookie") or raw.get("Set-Cookie")
+        out["set_cookie_parsed"] = (
+            [_parse_set_cookie(s) for s in (sc if isinstance(sc, list) else [sc])]
+            if sc else []
+        )
+
+        # 简易评分 (安全头覆盖度)
+        score = 0
+        if out["csp"]:               score += 2
+        if out["hsts"]:              score += 1
+        if out["x_frame_options"]:   score += 1
+        if out["x_content_type_options"]: score += 1
+        if out["referrer_policy"]:   score += 1
+        if out["coop"] or out["coep"]: score += 1
+        if out["set_cookie_parsed"]:
+            for sc_entry in out["set_cookie_parsed"]:
+                if sc_entry.get("httpOnly"): score += 1
+                if sc_entry.get("secure"): score += 1
+                break  # 只看第一个 cookie 的 flags, 避免重复计
+        if score >= 6:
+            out["score"] = "OK"
+        elif score >= 3:
+            out["score"] = "weak"
+        else:
+            out["score"] = "missing"
+        return out
 
     async def get_content(self) -> str:
         """获取页面 (或当前 frame) 的 HTML。"""

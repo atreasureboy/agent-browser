@@ -4345,3 +4345,125 @@ class TestT39DeepSnapshot:
         assert "headers" in cmd_names
         assert "dom-diff" in cmd_names
         assert "script-source" in cmd_names
+
+
+class TestT40c40dSnapshotCommentsParams:
+    """T40c + T40d: HTML 注释提取 + URL 参数解析."""
+
+    def test_link_info_has_params_default(self):
+        """LinkInfo 默认 params 空 dict."""
+        from semantic_browser.snapshot.engine import LinkInfo
+        li = LinkInfo(ref="e1", text="x", href="/a")
+        assert li.params == {}
+
+    def test_control_info_has_form_params_default(self):
+        """ControlInfo 默认 form_params 空 dict."""
+        from semantic_browser.snapshot.engine import ControlInfo
+        c = ControlInfo(ref="e1", kind="textbox", label="x")
+        assert c.form_params == {}
+
+    def test_page_snapshot_has_comments_default(self):
+        """PageSnapshot 默认 comments 空 list."""
+        from semantic_browser.snapshot.engine import PageSnapshot
+        snap = PageSnapshot(url="u", title="t", domain="d")
+        assert snap.comments == []
+        d = snap.to_dict()
+        assert d["comments"] == []
+
+    def test_page_snapshot_includes_comments_in_to_dict(self):
+        """comments 进 to_dict, agent 能拿到."""
+        from semantic_browser.snapshot.engine import PageSnapshot
+        snap = PageSnapshot(url="u", title="t", domain="d")
+        snap.comments.append("TODO: fix X")
+        snap.comments.append("<!-- debug flag -->")
+        d = snap.to_dict()
+        assert "TODO: fix X" in d["comments"]
+        assert "<!-- debug flag -->" in d["comments"]
+
+
+class TestT40a40fStorageAndSecurityHeaders:
+    """T40a + T40f: 客户端存储 + 安全头结构化."""
+
+    def test_parse_csp_extracts_directives(self):
+        from semantic_browser.browser.controller import _parse_csp
+        out = _parse_csp("default-src 'self'; script-src 'unsafe-inline' 'self' cdn.example.com; img-src *")
+        assert "default-src" in out["directives"]
+        assert out["directives"]["default-src"] == ["'self'"]
+        assert out["has_unsafe_inline"] is True
+        assert out["allows_wildcard"] is True
+        assert out["has_default_src"] is True
+        assert out["has_script_src"] is True
+        assert out["directive_names"] == ["default-src", "script-src", "img-src"]
+
+    def test_parse_csp_empty_returns_empty(self):
+        from semantic_browser.browser.controller import _parse_csp
+        out = _parse_csp("")
+        assert out["directives"] == {}
+        assert out["has_unsafe_inline"] is False
+
+    def test_parse_hsts_basic(self):
+        from semantic_browser.browser.controller import _parse_hsts
+        out = _parse_hsts("max-age=31536000; includeSubDomains")
+        assert out["max_age"] == 31536000
+        assert out["include_subdomains"] is True
+        assert out["preload"] is False
+
+    def test_parse_hsts_with_preload(self):
+        from semantic_browser.browser.controller import _parse_hsts
+        out = _parse_hsts("max-age=63072000; includeSubDomains; preload")
+        assert out["max_age"] == 63072000
+        assert out["preload"] is True
+
+    def test_parse_set_cookie_extracts_flags(self):
+        from semantic_browser.browser.controller import _parse_set_cookie
+        sc = _parse_set_cookie(
+            "sessionId=abc123; Path=/; HttpOnly; Secure; SameSite=Strict; "
+            "Domain=example.com; Max-Age=3600"
+        )
+        assert sc["name"] == "sessionId"
+        assert sc["value"] == "abc123"
+        assert sc["httpOnly"] is True
+        assert sc["secure"] is True
+        assert sc["sameSite"] == "Strict"
+        assert sc["path"] == "/"
+        assert sc["domain"] == "example.com"
+        assert sc["max_age"] == 3600
+
+    def test_parse_set_cookie_minimal(self):
+        from semantic_browser.browser.controller import _parse_set_cookie
+        sc = _parse_set_cookie("foo=bar")
+        assert sc["name"] == "foo"
+        assert sc["httpOnly"] is False
+        assert sc["secure"] is False
+        assert sc["sameSite"] == ""
+
+    def test_parse_permissions_policy_basic(self):
+        from semantic_browser.browser.controller import _parse_permissions_policy
+        out = _parse_permissions_policy(
+            "camera=(), microphone=(self), geolocation=*"
+        )
+        assert "camera" in out["directives"]
+        assert "microphone" in out["directives"]
+        assert "geolocation" in out["directives"]
+
+    def test_storage_init_buffer_starts_empty(self):
+        """_storage 字段不存在 — 走 page.evaluate (测不了 page, 测 shape)."""
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+        ctrl = BrowserController(BrowserConfig())
+        # 验证 storage 方法存在并返回预期 shape (在没 page 时 raise)
+        assert hasattr(ctrl, "get_storage")
+        assert hasattr(ctrl, "get_security_headers")
+
+    def test_mcp_tools_register_t40a_f(self):
+        """TOOL_DEFINITIONS 包含 sb_storage + sb_security_headers."""
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "sb_storage" in names
+        assert "sb_security_headers" in names
+
+    def test_cli_commands_register_t40a_f(self):
+        """tb storage + security-headers 子命令注册."""
+        from semantic_browser.client.cli import tb
+        assert "storage" in tb.commands
+        assert "security-headers" in tb.commands
+

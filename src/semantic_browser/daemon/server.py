@@ -240,6 +240,15 @@ class TransparentBrowserDaemon:
             if not url:
                 raise ValueError("url required")
             return self.owner.run(self.owner.browser.controller.fetch_script_source(url))
+        # T40a: 客户端存储探针 (local/session + cookies)
+        if method == "GET" and path == "/storage":
+            return self.owner.run(self.owner.browser.controller.get_storage())
+        # T40f: 安全头结构化
+        if method == "GET" and path == "/security-headers":
+            url = args.get("url", "")
+            if not url:
+                raise ValueError("url required")
+            return self.owner.run(self.owner.browser.controller.get_security_headers(url))
         if method == "GET" and path == "/errors":
             limit = int(args.get("limit", 50))
             return self.owner.browser.controller.get_page_errors(limit=limit)

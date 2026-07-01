@@ -83,6 +83,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                              "provider": {"type": "string", "enum": ["anthropic", "gemini"]},
                              "model": {"type": "string"},
                              "full_page": {"type": "boolean"}})},
+    # T40a+f: 客户端存储探针 + 安全头结构化
+    {"name": "sb_storage", "description": "T40a: localStorage/sessionStorage 全文 + cookies 字段 (HttpOnly/Secure/SameSite).",
+     "inputSchema": _schema({})},
+    {"name": "sb_security_headers", "description": "T40f: 按 URL 解析 CSP/HSTS/XFO/Referrer-Policy/COOP/COEP/Set-Cookie 标志.",
+     "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
 ]
 
 
@@ -282,6 +287,12 @@ class MCPServer:
                 full_page=bool(args.get("full_page", True)),
             )
             return vsnap.to_dict()
+        if name == "sb_storage":
+            engine = await self._ensure_started()
+            return await engine.controller.get_storage()
+        if name == "sb_security_headers":
+            engine = await self._ensure_started()
+            return await engine.controller.get_security_headers(args["url"])
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

@@ -567,6 +567,24 @@ def debug_clear(ctx):
     _print(_request("POST", "/debug/clear", base=ctx.obj["base"]))
 
 
+@tb.command("storage")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def storage(ctx, json_out):
+    """T40a: 客户端存储探针 — localStorage/sessionStorage 全文 + cookies 字段."""
+    _print(_request("GET", "/storage", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("security-headers")
+@click.argument("url")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def security_headers(ctx, url, json_out):
+    """T40f: 按 URL 解析 CSP/HSTS/XFO/Referrer-Policy/COOP/COEP/Set-Cookie 等安全头."""
+    _print(_request("GET", "/security-headers", {"url": url},
+                    base=ctx.obj["base"]), json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

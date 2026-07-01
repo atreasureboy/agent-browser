@@ -26,6 +26,8 @@ class LinkInfo:
     text: str
     href: str
     internal: bool = True  # 是否站内链接
+    # T40d: href 拆出的 query 参数 — 审计/重组 URL 用
+    params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -43,6 +45,8 @@ class ControlInfo:
     input_name: str = ""      # <input name="..."> — 提交时字段名
     input_type: str = ""      # <input type="...">
     form_id: str = ""         # <form id="...">
+    # T40d: form_action URL 拆出的 query 参数 (e.g. ?redirect=/admin)
+    form_params: dict[str, str] = field(default_factory=dict)
     raw_attrs: dict[str, str] = field(default_factory=dict)  # deep 模式: 所有 HTML 属性
     outer_html: str = ""      # deep 模式: 元素 outerHTML (截断到 500 字符)
 
@@ -79,6 +83,8 @@ class PageSnapshot:
     scripts: list[ScriptInfo] = field(default_factory=list)
     # T39: detail_level 标记 ("normal" | "deep"), 让 caller 知道信息丰富度
     detail_level: str = "normal"
+    # T40c: HTML 注释 — 安全审计 (TODO/FIXME/凭据泄漏常见)
+    comments: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -140,6 +146,7 @@ class SnapshotEngine:
         links, controls = await self._extract_interactive(base_url or url, detail_level)
         raw_aria = await self._get_raw_aria()
         scripts = await self._extract_scripts(detail_level)
+        comments = await self._extract_comments()       # T40c
 
         snapshot = PageSnapshot(
             url=url,
@@ -149,12 +156,13 @@ class SnapshotEngine:
             links=links,
             controls=controls,
             scripts=scripts,
+            comments=comments,
             detail_level=detail_level,
             meta=meta,
             raw_aria=raw_aria,
         )
-        logger.info("Snapshot captured: %s (%d blocks, %d links, %d controls)",
-                     url, len(text_blocks), len(links), len(controls))
+        logger.info("Snapshot captured: %s (%d blocks, %d links, %d controls, %d comments)",
+                     url, len(text_blocks), len(links), len(controls), len(comments))
         return snapshot
 
     async def _extract_meta(self) -> dict[str, str]:
@@ -250,11 +258,19 @@ class SnapshotEngine:
                 seenLinks.add(href);
                 let internal = true;
                 try { internal = new URL(href).hostname === baseDomain.split(':')[0]; } catch { internal = false; }
+                // T40d: 拆 query 参数 — 审计/重组 URL 用
+                let params = {};
+                try {
+                    new URL(href, location.href).searchParams.forEach((v, k) => {
+                        params[k] = (v || '').substring(0, 200);
+                    });
+                } catch {}
                 links.push({
                     ref: assignRef(el),
                     href,
                     text: el.textContent.trim().substring(0, 200),
                     internal,
+                    params,
                 });
             }
 
@@ -296,11 +312,20 @@ class SnapshotEngine:
 
                 // T39: form metadata — 找最近的 <form> ancestor.
                 let form = el.closest('form');
-                let formAction = '', formMethod = '', formId = '';
+                let formAction = '', formMethod = '', formId = '', formParams = {};
                 if (form) {
                     formAction = (form.getAttribute('action') || '').substring(0, 200);
                     formMethod = (form.getAttribute('method') || 'get').toLowerCase();
                     formId = form.getAttribute('id') || '';
+                    // T40d: form action 的 query 参数 — e.g. ?redirect=/admin
+                    if (formAction) {
+                        try {
+                            const formUrl = new URL(formAction, location.href);
+                            formUrl.searchParams.forEach((v, k) => {
+                                formParams[k] = (v || '').substring(0, 200);
+                            });
+                        } catch {}
+                    }
                 }
 
                 // T39: deep 模式填 raw_attrs + outerHTML
@@ -320,6 +345,7 @@ class SnapshotEngine:
                     form_action: formAction,
                     form_method: formMethod,
                     form_id: formId,
+                    form_params: formParams,
                     input_name: el.getAttribute('name') || '',
                     input_type: el.getAttribute('type') || '',
                     raw_attrs: rawAttrs,
@@ -338,6 +364,7 @@ class SnapshotEngine:
                 text=link["text"][:200],
                 href=link["href"],
                 internal=link.get("internal", True),
+                params=link.get("params", {}),
             ))
         controls = [
             ControlInfo(
@@ -350,6 +377,7 @@ class SnapshotEngine:
                 form_action=c.get("form_action", ""),
                 form_method=c.get("form_method", ""),
                 form_id=c.get("form_id", ""),
+                form_params=c.get("form_params", {}),
                 input_name=c.get("input_name", ""),
                 input_type=c.get("input_type", ""),
                 raw_attrs=c.get("raw_attrs", {}),
@@ -400,4 +428,40 @@ class SnapshotEngine:
             ]
         except Exception as e:
             logger.warning("_extract_scripts failed: %s", e)
+            return []
+
+    async def _extract_comments(self) -> list[str]:
+        """T40c: 抓 HTML 注释 — 安全审计常发现 TODO/FIXME/凭据泄漏.
+
+        normal 模式也开 (廉价元数据).
+        """
+        try:
+            return await self.page.evaluate("""() => {
+                const out = [];
+                const seen = new Set();
+                const walk = (root) => {
+                    if (!root) return;
+                    const it = document.createTreeWalker(
+                        root, NodeFilter.SHOW_COMMENT, null, false
+                    );
+                    let n;
+                    while ((n = it.nextNode())) {
+                        const t = (n.nodeValue || '').trim();
+                        if (t && !seen.has(t)) {
+                            seen.add(t);
+                            out.push(t.substring(0, 500));
+                            if (out.length >= 200) return;
+                        }
+                    }
+                    // T40h: 也进 shadow root
+                    const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                    for (const el of all) {
+                        if (el.shadowRoot) walk(el.shadowRoot);
+                    }
+                };
+                walk(document);
+                return out;
+            }""")
+        except Exception as e:
+            logger.warning("_extract_comments failed: %s", e)
             return []

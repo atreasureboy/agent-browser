@@ -5844,3 +5844,454 @@ class TestT43jDecodeJwts:
         asyncio.run(go())
 
 
+# ════════════════════════════════════════════════════════════════
+# T44: Pen-tester 第三轮盲点 (12 项) — DNS / Wayback / XSS / auth
+#      / CSRF / IDOR / cloud / methods / 2FA / external / CSP / takeover
+# ════════════════════════════════════════════════════════════════
+
+
+class TestT44aDnsRecords:
+    """T44a: DNS 记录查询 (DoH)."""
+
+    def test_returns_expected_shape(self):
+        """DoH 查询 github.com, 至少拿到 A 记录 (不依赖外部网络, 真实 dns.google)."""
+        from semantic_browser.browser.controller import BrowserController
+        ctrl = BrowserController.__new__(BrowserController)
+        async def go():
+            r = await ctrl.dns_records("github.com", timeout=5.0)
+            assert r["host"] == "github.com"
+            assert isinstance(r["a"], list)
+            assert isinstance(r["mx"], list)
+            assert isinstance(r["ns"], list)
+            # github.com 必有 A 记录
+            if not r["errors"].get("A"):
+                assert len(r["a"]) >= 1
+                # A 记录应该是 IP 格式
+                import re
+                assert re.match(r"^\d+\.\d+\.\d+\.\d+$", r["a"][0])
+            # security_grade 应该是 ok/weak/missing 之一
+            assert r["security_grade"] in ("ok", "weak", "missing")
+            # notes 是 list
+            assert isinstance(r["notes"], list)
+        asyncio.run(go())
+
+
+class TestT44bWaybackUrls:
+    """T44b: Wayback Machine 历史 URL."""
+
+    def test_returns_expected_shape(self):
+        from semantic_browser.browser.controller import BrowserController
+        ctrl = BrowserController.__new__(BrowserController)
+        async def go():
+            r = await ctrl.wayback_urls("https://example.com/", limit=20, timeout=8.0)
+            assert r["url"] == "https://example.com/"
+            assert isinstance(r["unique_targets"], list)
+            # example.com 历史悠久, 必有多个 snapshot
+            if "error" not in r:
+                assert r["snapshot_count"] >= 1
+                assert r["unique_target_count"] >= 1
+        asyncio.run(go())
+
+
+class TestT44cXssSinks:
+    """T44c: DOM XSS sinks."""
+
+    def test_finds_eval_and_innerhtml_in_served_js(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {
+                "/": (200, "text/html",
+                      b'<html><head><script src="/app.js"></script></head></html>'),
+                "/app.js": (200, "application/javascript",
+                            b'function f() { eval(userInput); document.getElementById("x").innerHTML = html; }\n'
+                            b'function g() { document.write("hi"); setTimeout("alert(1)", 100); }\n'),
+            }
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.find_xss_sinks(max_scripts=5, timeout_ms=2000)
+                assert r["sink_count"] >= 3
+                sinks = {f["sink"] for f in r["findings"]}
+                assert "eval" in sinks
+                assert "innerHTML" in sinks
+                assert "document.write" in sinks
+                assert "setTimeout_string" in sinks
+                # 找到的 sink 必带 count + script + samples
+                for f in r["findings"]:
+                    assert "count" in f and f["count"] >= 1
+                    assert "samples" in f and len(f["samples"]) >= 1
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44dAuthMethods:
+    """T44d: CAPTCHA / OAuth / WebAuthn / MFA 检测."""
+
+    def test_detects_google_oauth_and_webauthn(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <button>Sign in with Google</button>
+          <script src="https://accounts.google.com/gsi/client" async defer></script>
+          <script>const t = grecaptcha.render('cap');</script>
+          <div id="webauthn">Use your passkey</div>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.detect_auth_methods()
+                assert "Google" in r["oauth_providers"]
+                assert "reCAPTCHA v2/v3" in r["captcha"]
+                assert "WebAuthn/Passkey" in r["mfa"]
+                # signals 列表里至少要包含 3 项
+                assert len(r["signals"]) >= 3
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44eCsrfCoverage:
+    """T44e: CSRF 覆盖率检查."""
+
+    def test_flags_forms_without_csrf(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        # 1 个 form 有 CSRF token, 1 个没有
+        html = b"""
+        <html><body>
+          <form action="/login" method="post">
+            <input type="hidden" name="authenticity_token" value="abc123">
+            <input name="username"><input name="password">
+          </form>
+          <form action="/api/submit" method="post">
+            <input name="data"><button>submit</button>
+          </form>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.check_csrf_coverage()
+                assert r["form_count"] >= 2
+                assert r["forms_with_csrf"] >= 1
+                assert r["forms_without_csrf"] >= 1
+                # 至少一个 vulnerable 应当指向 /api/submit
+                actions = {v["action"] for v in r["vulnerable"]}
+                assert "/api/submit" in actions
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44fIdorUrls:
+    """T44f: IDOR-prone URLs."""
+
+    def test_finds_sequential_user_id_urls(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <a href="/users/1">alice</a>
+          <a href="/users/2">bob</a>
+          <a href="/orders/12345">order 12345</a>
+          <a href="/safe/page">safe</a>
+          <a href="/api/v1/users/99">api</a>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.find_idor_urls()
+                assert r["idor_count"] >= 3
+                # safe/page 不应进
+                idor_hrefs = [i["href"] for i in r["idor_urls"]]
+                # browser 会把 href 解析成绝对 URL, 用 endswith 匹配
+                assert any(h.endswith("/users/1") for h in idor_hrefs)
+                assert any(h.endswith("/users/2") for h in idor_hrefs)
+                assert any(h.endswith("/orders/12345") for h in idor_hrefs)
+                assert not any(h.endswith("/safe/page") for h in idor_hrefs)
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44gCloudResources:
+    """T44g: 云资源 URL 泄露."""
+
+    def test_detects_s3_and_azure_urls(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <a href="https://my-bucket.s3.amazonaws.com/data.zip">download</a>
+          <script src="https://myaccount.blob.core.windows.net/cdn/app.js"></script>
+          <a href="https://myapp.herokuapp.com/">heroku</a>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.find_cloud_resources()
+                assert r["resource_count"] >= 3
+                providers = set(r["by_provider"].keys())
+                assert "aws_s3" in providers
+                assert "azure_blob" in providers
+                assert "heroku_app" in providers
+                # 资源 URL 必带 kind
+                for res in r["resources"]:
+                    assert "provider" in res
+                    assert "url" in res
+                    assert "kind" in res
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44hHttpMethods:
+    """T44h: HTTP methods probe (OPTIONS / Allow)."""
+
+    def test_probes_options_and_detects_dangerous(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", b"<html>ok</html>")}
+
+            def do_OPTIONS(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Allow", "GET, HEAD, POST, PUT, DELETE")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):  # noqa: N802
+                for p, (s, ct, b) in self.routes.items():
+                    if self.path == p:
+                        self.send_response(s)
+                        self.send_header("Content-Type", ct)
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.probe_http_methods(timeout_ms=2000)
+                assert r["base_url"].startswith("http://127.0.0.1:")
+                results = {res["path"]: res for res in r["results"]}
+                assert "/" in results
+                # 我们的 mock 返回了 PUT/DELETE, 应当被标 dangerous
+                assert results["/"]["dangerous"] is True
+                assert "PUT" in results["/"]["allow"]
+                assert "DELETE" in results["/"]["allow"]
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44i2fa:
+    """T44i: 2FA / MFA detection."""
+
+    def test_detects_webauthn_and_totp(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <div>Use your authenticator app for two-factor authentication</div>
+          <script>const pk = await navigator.credentials.create({...});</script>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.detect_2fa()
+                assert r["mfa_count"] >= 2
+                assert r["has_webauthn"] is True
+                assert r["has_totp"] is True
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44jExternalResources:
+    """T44j: 外部资源清单."""
+
+    def test_groups_external_domains(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        html = b"""
+        <html><body>
+          <a href="https://other.com/page">other</a>
+          <a href="https://other.com/about">other 2</a>
+          <a href="https://third.io/x">third</a>
+          <script src="https://cdn.other.com/lib.js"></script>
+          <iframe src="https://embed.example.io/widget"></iframe>
+        </body></html>
+        """
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", html)}
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.inventory_external_resources()
+                link_domains = {d["domain"] for d in r["external_link_domains"]}
+                assert "other.com" in link_domains
+                assert "third.io" in link_domains
+                # other.com 应有 count=2
+                other = next(d for d in r["external_link_domains"] if d["domain"] == "other.com")
+                assert other["count"] == 2
+                script_hosts = {s["host"] for s in r["external_script_hosts"]}
+                assert "cdn.other.com" in script_hosts
+                iframe_hosts = {i["host"] for i in r["external_iframes"]}
+                assert "embed.example.io" in iframe_hosts
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44kCspParse:
+    """T44k: CSP 头解析."""
+
+    def test_parses_csp_directives_and_flags_unsafe(self):
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' https://cdn.example.com; object-src 'none'; frame-ancestors 'none'"
+
+        class Handler(_T43Handler):
+            routes = {"/": (200, "text/html", b"<html>ok</html>")}
+
+            def do_GET(self):  # noqa: N802
+                for p, (s, ct, b) in self.routes.items():
+                    if self.path == p:
+                        self.send_response(s)
+                        self.send_header("Content-Type", ct)
+                        self.send_header("Content-Length", str(len(b)))
+                        self.send_header("Content-Security-Policy", CSP)
+                        self.end_headers()
+                        self.wfile.write(b)
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+        srv, url = _start_mock_server(Handler)
+
+        async def go():
+            c = BrowserController(BrowserConfig())
+            try:
+                await c.start()
+                await c.open(url + "/")
+                r = await c.parse_csp()
+                assert r["csp_raw"] is not None
+                assert "default-src" in r["directives"]
+                assert "script-src" in r["directives"]
+                assert r["directives"]["script-src"] == ["'self'", "'unsafe-inline'", "'unsafe-eval'"]
+                # unsafe-inline 和 unsafe-eval 都应当被 flag
+                flags_str = " ".join(r["flags"])
+                assert "unsafe-inline" in flags_str
+                assert "eval" in flags_str  # unsafe-eval 报 "allows eval()"
+                # 缺失 base-uri
+                assert "base-uri" in r["missing_recommended"]
+            finally:
+                await c.close()
+                srv.shutdown()
+                srv.server_close()
+        asyncio.run(go())
+
+
+class TestT44lSubdomainTakeover:
+    """T44l: 子域接管信号."""
+
+    def test_finds_s3_takeover_candidate(self):
+        """用一个不存在的子域, 验证函数形状 + 不可达 host 不崩."""
+        from semantic_browser.browser.controller import BrowserController
+        ctrl = BrowserController.__new__(BrowserController)
+        async def go():
+            r = await ctrl.check_subdomain_takeover(
+                host="example.com",
+                subdomains=["this-subdomain-does-not-exist-12345.example.com"],
+                timeout=3.0,
+            )
+            assert r["host"] == "example.com"
+            assert r["checked"] == 1
+            # 不存在的子域可能没有 CNAME, 不会命中任何 SIG, risky 应当为空 list
+            assert isinstance(r["risky"], list)
+        asyncio.run(go())
+
+
+

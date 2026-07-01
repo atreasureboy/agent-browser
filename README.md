@@ -277,6 +277,46 @@ tb decode-jwts
 
 覆盖的是 pen-tester recon 阶段最常用的能力: 子域扫描、敏感泄露、技术栈识别、secret 抓取。所有 10 项同时通过 MCP / CLI / daemon 三层暴露。
 
+## T44 — Pen-tester 第三轮盲点 (12 项)
+
+T43 之后用户再次以 agent 身份对 github.com/login + example.com 跑全套, 又发现 12 个缺失能力:
+
+```bash
+# T44a: DNS 记录 (A/AAAA/MX/NS/TXT-SPF/DMARC) — DoH (dns.google) 避开 dig 依赖
+#        自动解读: SPF ~all 软失败 / DMARC p=none 监控模式 / 缺 DMARC
+tb dns-records github.com
+# T44b: Wayback Machine 历史 URL — 旧端点/旧 secret 常没清理
+tb wayback-urls https://example.com
+# T44c: DOM XSS sinks (eval / innerHTML / document.write / Function / setTimeout 字符串)
+tb find-xss-sinks
+# T44d: CAPTCHA + OAuth provider + WebAuthn/2FA 联合检测
+#        reCAPTCHA / hCaptcha / Turnstile / FunCaptcha + Google/GitHub/FB/Apple/MS OAuth
+tb detect-auth-methods
+# T44e: CSRF 覆盖率 — 对当前页每个 form 检查 token 字段 (T42a 抓 token, 但没检查每个 form 都有)
+tb check-csrf-coverage
+# T44f: IDOR-prone URLs (/user/N, /order/N, /api/v1/users/N ...)
+tb find-idor-urls
+# T44g: 云资源泄露 (S3 / Azure Blob / GCP / Heroku / Firebase / CloudFront)
+#        实测在 github.com 抓到 github-cloud.s3.amazonaws.com
+tb find-cloud-resources
+# T44h: HTTP methods (OPTIONS + Allow header) — 找 PUT/DELETE/PATCH/TRACE 入口
+tb probe-http-methods
+# T44i: 2FA / MFA 专门检测 (WebAuthn / TOTP / SMS / backup code / Duo)
+tb detect-2fa
+# T44j: 外部资源清单 (外链域名 / 跨域脚本 / iframe / 跨域 form) — 供应链 / trust boundary 分析
+tb inventory-external-resources
+# T44k: CSP 头深度解析 — 拆 directive + 标危险配置 (unsafe-inline / unsafe-eval / * / data:)
+tb parse-csp
+# T44l: 子域接管信号 — 查 CNAME 跟易被接管服务签名比对 (S3/Heroku/Azure/CloudFront/GitHub Pages ...)
+tb check-subdomain-takeover example.com
+```
+
+**关键安全洞察 (实测):**
+- `tb dns-records github.com` → 报告 "SPF ends with ~all (softfail) — 伪造邮件更易通过"
+- `tb dns-records example.com` → "DMARC p=reject — 完全拒绝不合规邮件 (最好)"
+- `tb find-xss-sinks` 在 github.com 抓到 5 处 `document.cookie` 读取 + 3 处 `innerHTML` 赋值
+- `tb find-cloud-resources` 在 github.com 抓到 `github-cloud.s3.amazonaws.com`
+
 ## 后续路线
 
 - [ ] MCP Server 封装（作为 Hermes MCP 插件）

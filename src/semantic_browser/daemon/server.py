@@ -326,6 +326,58 @@ class TransparentBrowserDaemon:
         # T43j: JWT 解码
         if method == "GET" and path == "/decode-jwts":
             return self.owner.run(self.owner.browser.controller.decode_jwts())
+        # T44a: DNS 记录
+        if method == "GET" and path == "/dns-records":
+            return self.owner.run(self.owner.browser.controller.dns_records(host=args["host"]))
+        # T44l 也支持 host
+        if method == "GET" and path == "/check-subdomain-takeover" and "host" in args:
+            subs = args.get("subdomains")
+            return self.owner.run(self.owner.browser.controller.check_subdomain_takeover(
+                host=args["host"],
+                subdomains=subs if isinstance(subs, list) else None,
+            ))
+        # T44b: Wayback Machine
+        if method == "GET" and path == "/wayback-urls":
+            return self.owner.run(self.owner.browser.controller.wayback_urls(
+                url=args["url"], limit=int(args.get("limit", 200)),
+            ))
+        # T44c: DOM XSS sinks
+        if method == "GET" and path == "/find-xss-sinks":
+            return self.owner.run(self.owner.browser.controller.find_xss_sinks())
+        # T44d: auth methods
+        if method == "GET" and path == "/detect-auth-methods":
+            return self.owner.run(self.owner.browser.controller.detect_auth_methods())
+        # T44e: CSRF coverage
+        if method == "GET" and path == "/check-csrf-coverage":
+            return self.owner.run(self.owner.browser.controller.check_csrf_coverage())
+        # T44f: IDOR URLs
+        if method == "GET" and path == "/find-idor-urls":
+            return self.owner.run(self.owner.browser.controller.find_idor_urls())
+        # T44g: cloud resources
+        if method == "GET" and path == "/find-cloud-resources":
+            return self.owner.run(self.owner.browser.controller.find_cloud_resources())
+        # T44h: HTTP methods
+        if method == "GET" and path == "/probe-http-methods":
+            paths = args.get("paths")
+            return self.owner.run(self.owner.browser.controller.probe_http_methods(
+                base_url=args.get("base_url") or None,
+                paths=paths if isinstance(paths, list) else None,
+            ))
+        # T44i: 2FA
+        if method == "GET" and path == "/detect-2fa":
+            return self.owner.run(self.owner.browser.controller.detect_2fa())
+        # T44j: external resources
+        if method == "GET" and path == "/inventory-external-resources":
+            return self.owner.run(self.owner.browser.controller.inventory_external_resources())
+        # T44k: CSP parse
+        if method == "GET" and path == "/parse-csp":
+            return self.owner.run(self.owner.browser.controller.parse_csp())
+        # T44l: subdomain takeover
+        if method == "GET" and path == "/check-subdomain-takeover":
+            subs = args.get("subdomains")
+            return self.owner.run(self.owner.browser.controller.check_subdomain_takeover(
+                subdomains=subs if isinstance(subs, list) else None,
+            ))
         # T17: cookie / storage 管理
         if method == "GET" and path == "/cookies":
             url = args.get("url") or None

@@ -753,6 +753,137 @@ def decode_jwts(ctx, json_out):
     _print(_request("GET", "/decode-jwts", base=ctx.obj["base"]), json_out=json_out)
 
 
+@tb.command("dns-records")
+@click.argument("host")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def dns_records(ctx, host, json_out):
+    """T44a: DNS 记录查询 (A/AAAA/MX/NS/TXT-SPF/DMARC) — DoH 避开 dig 依赖."""
+    _print(_request("GET", "/dns-records", {"host": host}, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("wayback-urls")
+@click.argument("url")
+@click.option("--limit", default=200, type=int)
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def wayback_urls(ctx, url, limit, json_out):
+    """T44b: Wayback Machine 历史 URL (旧端点/旧 secret)."""
+    _print(_request("GET", "/wayback-urls",
+                    {"url": url, "limit": limit}, base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("find-xss-sinks")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def find_xss_sinks(ctx, json_out):
+    """T44c: 扫 <script> 找 DOM XSS sinks (eval/innerHTML/document.write)."""
+    _print(_request("GET", "/find-xss-sinks", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("detect-auth-methods")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def detect_auth_methods(ctx, json_out):
+    """T44d: CAPTCHA / OAuth provider / WebAuthn / MFA 检测."""
+    _print(_request("GET", "/detect-auth-methods", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("check-csrf-coverage")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def check_csrf_coverage(ctx, json_out):
+    """T44e: 对当前页每个 form 检查 CSRF token 是否存在."""
+    _print(_request("GET", "/check-csrf-coverage", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("find-idor-urls")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def find_idor_urls(ctx, json_out):
+    """T44f: 扫链接找 IDOR-prone URLs (/user/N, /order/N ...)."""
+    _print(_request("GET", "/find-idor-urls", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("find-cloud-resources")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def find_cloud_resources(ctx, json_out):
+    """T44g: 扫 page source 找 S3 / Azure Blob / GCP / Heroku / Firebase URL 泄露."""
+    _print(_request("GET", "/find-cloud-resources", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("probe-http-methods")
+@click.option("--base-url", help="以另一 URL 为基准 (默认当前页 origin)")
+@click.option("--paths", help="逗号分隔的 path 列表 (默认 /, /api, /api/v1, ...)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def probe_http_methods(ctx, base_url, paths, json_out):
+    """T44h: OPTIONS 探测每个 path 的 Allow header (PUT/DELETE/PATCH = 危险)."""
+    q: dict | None = None
+    if base_url or paths:
+        q = {}
+        if base_url:
+            q["base_url"] = base_url
+        if paths:
+            q["paths"] = [p.strip() for p in paths.split(",") if p.strip()]
+    _print(_request("GET", "/probe-http-methods", q, base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("detect-2fa")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def detect_2fa(ctx, json_out):
+    """T44i: 2FA / MFA 检测 (WebAuthn / TOTP / SMS / backup code / Duo)."""
+    _print(_request("GET", "/detect-2fa", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("inventory-external-resources")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def inventory_external_resources(ctx, json_out):
+    """T44j: 外部资源清单 (外链域名/跨域脚本/iframe/cross-origin form)."""
+    _print(_request("GET", "/inventory-external-resources", base=ctx.obj["base"]),
+           json_out=json_out)
+
+
+@tb.command("parse-csp")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def parse_csp(ctx, json_out):
+    """T44k: CSP 头解析 — 拆 directive + 标危险配置 (unsafe-inline / unsafe-eval / *)."""
+    _print(_request("GET", "/parse-csp", base=ctx.obj["base"]), json_out=json_out)
+
+
+@tb.command("check-subdomain-takeover")
+@click.argument("host", required=False)
+@click.option("--subdomains", help="逗号分隔的子域列表 (默认 14 个常见子域)")
+@click.option("--json-out", is_flag=True)
+@click.pass_context
+def check_subdomain_takeover(ctx, host, subdomains, json_out):
+    """T44l: 子域接管信号 — 查 CNAME 跟易被接管服务签名比对."""
+    if not host:
+        # 默认用当前页 origin
+        from urllib.parse import urlparse
+        try:
+            import httpx
+            r = httpx.get(f"{ctx.obj['base']}/url", timeout=3)
+            host = urlparse(r.json().get("url", "")).hostname or ""
+        except Exception:
+            host = ""
+    if not host:
+        click.echo("error: host required (or run after opening a page)")
+        return
+    q: dict | None = None
+    if subdomains:
+        q = {"subdomains": [s.strip() for s in subdomains.split(",") if s.strip()]}
+    _print(_request("GET", "/check-subdomain-takeover",
+                    {"host": host, "subdomains": q.get("subdomains")} if q else {"host": host},
+                    base=ctx.obj["base"]), json_out=json_out)
+
+
 @tb.group()
 def cookies():
     """T17: Cookie 管理 (调试登录态)."""

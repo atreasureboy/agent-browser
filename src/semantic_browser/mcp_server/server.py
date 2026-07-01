@@ -125,6 +125,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({})},
     {"name": "sb_decode_jwts", "description": "T43j: 在 storage/cookie/页面里找 JWT, 解码 header + payload (不验签).",
      "inputSchema": _schema({})},
+    # T44
+    {"name": "sb_dns_records", "description": "T44a: DNS 记录查询 (A/AAAA/MX/NS/TXT-SPF/DMARC) via DoH.",
+     "inputSchema": _schema({"host": {"type": "string"}}, ["host"])},
+    {"name": "sb_wayback_urls", "description": "T44b: Wayback Machine 历史 URL (旧端点/旧 secret).",
+     "inputSchema": _schema({"url": {"type": "string"}, "limit": {"type": "integer"}}, ["url"])},
+    {"name": "sb_find_xss_sinks", "description": "T44c: 扫 <script> 找 DOM XSS sinks (eval/innerHTML/document.write).",
+     "inputSchema": _schema({})},
+    {"name": "sb_detect_auth_methods", "description": "T44d: CAPTCHA / OAuth provider / WebAuthn / MFA 检测.",
+     "inputSchema": _schema({})},
+    {"name": "sb_check_csrf_coverage", "description": "T44e: 对当前页每个 form 检查 CSRF token 是否存在.",
+     "inputSchema": _schema({})},
+    {"name": "sb_find_idor_urls", "description": "T44f: 扫链接找 IDOR-prone URLs (/user/N, /order/N ...).",
+     "inputSchema": _schema({})},
+    {"name": "sb_find_cloud_resources", "description": "T44g: 扫 page source 找 S3 / Azure Blob / GCP / Heroku / Firebase URL 泄露.",
+     "inputSchema": _schema({})},
+    {"name": "sb_probe_http_methods", "description": "T44h: OPTIONS 探测每个 path 的 Allow header (PUT/DELETE/PATCH = 危险).",
+     "inputSchema": _schema({"base_url": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}})},
+    {"name": "sb_detect_2fa", "description": "T44i: 2FA / MFA 检测 (WebAuthn / TOTP / SMS / backup code / Duo).",
+     "inputSchema": _schema({})},
+    {"name": "sb_inventory_external_resources", "description": "T44j: 外部资源清单 (外链域名/跨域脚本/iframe/cross-origin form).",
+     "inputSchema": _schema({})},
+    {"name": "sb_parse_csp", "description": "T44k: CSP 头解析 — 拆 directive + 标危险配置 (unsafe-inline / unsafe-eval / *).",
+     "inputSchema": _schema({})},
+    {"name": "sb_check_subdomain_takeover", "description": "T44l: 子域接管信号 — 查 CNAME 跟易被接管服务签名比对.",
+     "inputSchema": _schema({"host": {"type": "string"}, "subdomains": {"type": "array", "items": {"type": "string"}}})},
 ]
 
 
@@ -393,6 +418,53 @@ class MCPServer:
         if name == "sb_decode_jwts":
             engine = await self._ensure_started()
             return await engine.controller.decode_jwts()
+        # T44
+        if name == "sb_dns_records":
+            engine = await self._ensure_started()
+            return await engine.controller.dns_records(host=args["host"])
+        if name == "sb_wayback_urls":
+            engine = await self._ensure_started()
+            return await engine.controller.wayback_urls(
+                url=args["url"], limit=int(args.get("limit", 200)),
+            )
+        if name == "sb_find_xss_sinks":
+            engine = await self._ensure_started()
+            return await engine.controller.find_xss_sinks()
+        if name == "sb_detect_auth_methods":
+            engine = await self._ensure_started()
+            return await engine.controller.detect_auth_methods()
+        if name == "sb_check_csrf_coverage":
+            engine = await self._ensure_started()
+            return await engine.controller.check_csrf_coverage()
+        if name == "sb_find_idor_urls":
+            engine = await self._ensure_started()
+            return await engine.controller.find_idor_urls()
+        if name == "sb_find_cloud_resources":
+            engine = await self._ensure_started()
+            return await engine.controller.find_cloud_resources()
+        if name == "sb_probe_http_methods":
+            engine = await self._ensure_started()
+            paths = args.get("paths")
+            return await engine.controller.probe_http_methods(
+                base_url=args.get("base_url") or None,
+                paths=paths,
+            )
+        if name == "sb_detect_2fa":
+            engine = await self._ensure_started()
+            return await engine.controller.detect_2fa()
+        if name == "sb_inventory_external_resources":
+            engine = await self._ensure_started()
+            return await engine.controller.inventory_external_resources()
+        if name == "sb_parse_csp":
+            engine = await self._ensure_started()
+            return await engine.controller.parse_csp()
+        if name == "sb_check_subdomain_takeover":
+            engine = await self._ensure_started()
+            subs = args.get("subdomains")
+            return await engine.controller.check_subdomain_takeover(
+                host=args.get("host") or None,
+                subdomains=subs,
+            )
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:

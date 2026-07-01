@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
+from semantic_browser.snapshot.engine import SnapshotEngine
 from playwright.async_api import (
+
     Browser,
     BrowserContext,
     Page,
@@ -3045,6 +3047,902 @@ class BrowserController:
             "page_url": page.url,
             "tokens": tokens,
             "token_count": len(tokens),
+        }
+
+    # ── T44a: DNS 记录 (A/AAAA/MX/NS/TXT-SPF/TXT-DMARC) ────────
+
+    async def dns_records(
+        self,
+        host: str,
+        *,
+        doh_endpoint: str = "https://dns.google/resolve",
+        timeout: float = 8.0,
+    ) -> dict[str, Any]:
+        """T44a: DNS 记录查询 — 用 DoH (DNS-over-HTTPS) 避开 dig 依赖.
+
+        查询类型: A / AAAA / MX / NS / TXT (SPF 提取) / _dmarc.<host>.TXT (DMARC 提取).
+        Returns {
+          "host",
+          "a":       [ip, ...],
+          "aaaa":    [ip, ...],
+          "mx":      [{priority, exchange}, ...],
+          "ns":      [ns_host, ...],
+          "spf":     [spf_record, ...] (从 TXT 提取 v=spf1),
+          "dmarc":   [dmarc_record, ...] (从 _dmarc.<host>.TXT),
+          "security_grade": "ok" | "weak" | "missing"   (spf + dmarc + mx 综合),
+          "notes":   [str, ...]  (pen-tester 视角的解读),
+          "errors":  {rtype: err, ...}  (部分失败不阻塞)
+        }
+        """
+        import re as _re
+        import httpx
+
+        async def _query(rtype: str, qname: str) -> list[dict[str, Any]]:
+            url = f"{doh_endpoint}?name={qname}&type={rtype}"
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(url, headers={"Accept": "application/dns-json"})
+            if r.status_code != 200:
+                raise RuntimeError(f"DoH status={r.status_code}")
+            doc = r.json()
+            return doc.get("Answer", []) or []
+
+        result: dict[str, Any] = {
+            "host": host,
+            "a": [],
+            "aaaa": [],
+            "mx": [],
+            "ns": [],
+            "spf": [],
+            "dmarc": [],
+            "security_grade": "ok",
+            "notes": [],
+            "errors": {},
+        }
+
+        async def _safe(rtype: str, qname: str) -> list[dict[str, Any]]:
+            try:
+                return await _query(rtype, qname)
+            except Exception as e:
+                result["errors"][rtype] = str(e)[:200]
+                return []
+
+        # A
+        for ans in await _safe("A", host):
+            if ans.get("type") == 1:
+                result["a"].append(ans.get("data", ""))
+        # AAAA
+        for ans in await _safe("AAAA", host):
+            if ans.get("type") == 28:
+                result["aaaa"].append(ans.get("data", ""))
+        # MX
+        for ans in await _safe("MX", host):
+            if ans.get("type") == 15:
+                data = ans.get("data", "")
+                # format: "10 mail.example.com."
+                parts = data.split(None, 1)
+                if len(parts) == 2:
+                    result["mx"].append({"priority": int(parts[0]), "exchange": parts[1].rstrip(".")})
+        # NS
+        for ans in await _safe("NS", host):
+            if ans.get("type") == 2:
+                result["ns"].append(ans.get("data", "").rstrip("."))
+        # TXT — 提取 SPF
+        for ans in await _safe("TXT", host):
+            if ans.get("type") == 16:
+                data = ans.get("data", "").strip('"')
+                if data.lower().startswith("v=spf1"):
+                    result["spf"].append(data)
+        # DMARC
+        for ans in await _safe("TXT", f"_dmarc.{host}"):
+            if ans.get("type") == 16:
+                data = ans.get("data", "").strip('"')
+                if data.lower().startswith("v=dmarc1"):
+                    result["dmarc"].append(data)
+
+        # 解读
+        if not result["mx"]:
+            result["notes"].append("no MX — 域名不收邮件 (或不接受 SMTP)")
+        if not result["spf"]:
+            result["notes"].append("no SPF — 邮件伪造无任何 SPF 防线")
+        else:
+            # 检查 SPF 是否 -all (硬失败)
+            spf0 = result["spf"][0]
+            if "~all" in spf0:
+                result["notes"].append("SPF ends with ~all (softfail) — 伪造邮件更易通过")
+            elif " -all" not in spf0 and "-all" not in spf0:
+                result["notes"].append("SPF 不含 -all — 末尾策略弱, 易被绕过")
+        if not result["dmarc"]:
+            result["notes"].append("no DMARC — 无报告/无拒绝策略")
+        else:
+            d0 = result["dmarc"][0].lower()
+            if "p=none" in d0 or "p=monitor" in d0:
+                result["notes"].append("DMARC p=none — 不拒绝不合规邮件 (监控模式)")
+            elif "p=quarantine" in d0:
+                result["notes"].append("DMARC p=quarantine — 隔离不合规邮件")
+            elif "p=reject" in d0:
+                result["notes"].append("DMARC p=reject — 完全拒绝不合规邮件 (最好)")
+
+        # 安全分
+        score = 0
+        if result["spf"]:
+            score += 1
+        if result["dmarc"]:
+            score += 1
+            d0 = result["dmarc"][0].lower()
+            if "p=reject" in d0:
+                score += 1
+        if result["mx"]:
+            score += 1
+        if score <= 1:
+            result["security_grade"] = "missing"
+        elif score == 2:
+            result["security_grade"] = "weak"
+        else:
+            result["security_grade"] = "ok"
+        return result
+
+    # ── T44b: Wayback Machine 历史 URL ─────────────────
+
+    async def wayback_urls(
+        self,
+        url: str,
+        *,
+        limit: int = 200,
+        timeout: float = 12.0,
+    ) -> dict[str, Any]:
+        """T44b: Wayback Machine 历史 URL 探测.
+
+        查 web.archive.org/web/timemap/link/<url> — 返回该 URL 在历史上的所有快照的指向 URL.
+        pen-tester 视角: 旧端点 / 旧 secret / 旧 API 常在历史快照里没清理.
+
+        Returns {
+          "url",
+          "snapshot_count": int,
+          "unique_targets": [url, ...],  # 去重
+          "first_snapshot": str | None,  # 最早一条
+          "last_snapshot": str | None,
+          "samples": [url, ...] (前 10),
+        }
+        """
+        from urllib.parse import quote as _q
+        import httpx
+        target = f"https://web.archive.org/web/timemap/link/{_q(url, safe='/:?=&')}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                r = await client.get(target, headers={"User-Agent": "semantic-browser-recon/1.0"})
+            if r.status_code != 200:
+                return {"url": url, "snapshot_count": 0, "unique_targets": [],
+                        "first_snapshot": None, "last_snapshot": None, "samples": [],
+                        "error": f"status={r.status_code}"}
+            lines = r.text.splitlines()
+            # timemap 格式: <timestamp> <original_url> <mimetype> "<target_url>"
+            # 跳过 header (前 2 行)
+            targets: list[str] = []
+            for line in lines[2:]:
+                parts = line.split(None, 3)
+                if len(parts) >= 4:
+                    target_url = parts[3].strip('"').strip()
+                    if target_url:
+                        targets.append(target_url[:500])
+            uniq = list(dict.fromkeys(targets))  # 保序去重
+            uniq_limited = uniq[:limit]
+            return {
+                "url": url,
+                "snapshot_count": len(targets),
+                "unique_targets": uniq_limited,
+                "unique_target_count": len(uniq),
+                "first_snapshot": targets[0] if targets else None,
+                "last_snapshot": targets[-1] if targets else None,
+                "samples": uniq_limited[:10],
+            }
+        except Exception as e:
+            return {"url": url, "snapshot_count": 0, "unique_targets": [],
+                    "first_snapshot": None, "last_snapshot": None, "samples": [],
+                    "error": str(e)[:200]}
+
+    # ── T44c: DOM XSS sinks in JS source ──────────────
+
+    async def find_xss_sinks(
+        self,
+        *,
+        max_scripts: int = 15,
+        max_body: int = 100_000,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        r"""T44c: 扫页面所有 <script src> 源码, 找 DOM XSS sinks.
+
+        检测 sinks:
+          - eval(                          (eval arbitrary string)
+          - new Function(                  (function constructor)
+          - innerHTML\s*=                  (HTML injection)
+          - outerHTML\s*=
+          - document.write(                (DOM write)
+          - document.writeln(
+          - setTimeout("...", )            (string form, not function)
+          - setInterval("...", )           (string form)
+          - .insertAdjacentHTML(
+          - location\s*=                   (location override)
+          - window.location\s*=
+          - location.href\s*=
+          - document.cookie                (sensitive read)
+          - .src\s*=\s*location            (URL injection)
+
+        Returns {
+          "page_url", "scripts_scanned", "scripts_failed",
+          "findings": [{sink, count, script, samples: [snippet, ...]}],
+          "by_sink": {sink: total_count},
+          "sink_count": int,
+        }
+        """
+        import re as _re
+        from urllib.parse import urljoin
+        import httpx
+
+        page = await self._ensure_page()
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            return out;
+        }""")
+        scripts = scripts[:max_scripts]
+        page_url = page.url
+        abs_urls = [urljoin(page_url, s) for s in scripts if s]
+
+        SINK_PATTERNS = [
+            ("eval",                   r"\beval\s*\("),
+            ("function_constructor",   r"\bnew\s+Function\s*\("),
+            ("innerHTML",              r"\.innerHTML\s*="),
+            ("outerHTML",              r"\.outerHTML\s*="),
+            ("document.write",         r"\bdocument\.write(?:ln)?\s*\("),
+            ("setTimeout_string",      r"\bsetTimeout\s*\(\s*['\"]"),
+            ("setInterval_string",     r"\bsetInterval\s*\(\s*['\"]"),
+            ("insertAdjacentHTML",     r"\.insertAdjacentHTML\s*\("),
+            ("location_assignment",    r"\b(?:window\.)?location(?:\.href)?\s*="),
+            ("document.cookie_read",   r"\bdocument\.cookie\b"),
+            ("src_from_location",      r"\.src\s*=\s*(?:window\.)?location"),
+        ]
+
+        findings: list[dict[str, Any]] = []
+        scripts_scanned = 0
+        scripts_failed = 0
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-probe/1.0"},
+            follow_redirects=True,
+        ) as client:
+            for url in abs_urls:
+                try:
+                    r = await client.get(url)
+                    body = r.text[:max_body]
+                    scripts_scanned += 1
+                except Exception:
+                    scripts_failed += 1
+                    continue
+                for name, pat in SINK_PATTERNS:
+                    matches = list(_re.finditer(pat, body))
+                    if not matches:
+                        continue
+                    samples = []
+                    for m in matches[:3]:
+                        start = max(0, m.start() - 30)
+                        end = min(len(body), m.end() + 30)
+                        samples.append(body[start:end].replace("\n", " ")[:120])
+                    findings.append({
+                        "sink": name,
+                        "count": len(matches),
+                        "script": url,
+                        "samples": samples,
+                    })
+
+        by_sink: dict[str, int] = {}
+        for f in findings:
+            by_sink[f["sink"]] = by_sink.get(f["sink"], 0) + f["count"]
+        return {
+            "page_url": page_url,
+            "scripts_scanned": scripts_scanned,
+            "scripts_failed": scripts_failed,
+            "findings": findings,
+            "by_sink": by_sink,
+            "sink_count": len(findings),
+        }
+
+    # ── T44d: CAPTCHA + OAuth provider detection ─────────
+
+    async def detect_auth_methods(self) -> dict[str, Any]:
+        """T44d: 检测页面里出现的 auth/CAPTCHA/OAuth 组件.
+
+        检测:
+          - reCAPTCHA v2/v3 (grecaptcha.render / google.com/recaptcha)
+          - hCaptcha
+          - Cloudflare Turnstile
+          - FunCaptcha / Arkose Labs
+          - Google OAuth
+          - GitHub OAuth
+          - Facebook OAuth
+          - Apple OAuth
+          - Microsoft OAuth
+          - Twitter/X OAuth
+          - WebAuthn / Passkey
+          - Magic link / passwordless (含 "magic link" 文字)
+          - SAML (saml/acs/SingleSignOn)
+
+        Returns {
+          "page_url",
+          "captcha": [name, ...],
+          "oauth_providers": [name, ...],
+          "mfa": [name, ...],   # 2FA / MFA 信号 (WebAuthn, TOTP, SMS, backup)
+          "sso": [name, ...],   # SAML / OIDC generic
+          "signals": [{kind, name, hint}],
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        try:
+            content = await page.content()
+        except Exception:
+            content = ""
+        # 也看脚本 src (CDN 引用可能没在 inline HTML 里)
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            return out;
+        }""")
+        script_blob = " ".join(scripts)
+        combined = (content + " " + script_blob)[:50000]
+
+        captcha_sigs = [
+            (r"grecaptcha\.render|google\.com/recaptcha|Recaptcha\.create", "reCAPTCHA v2/v3"),
+            (r"hcaptcha\.com|hcaptcha\.render|h-captcha", "hCaptcha"),
+            (r"challenges\.cloudflare\.com/turnstile|cf-turnstile", "Cloudflare Turnstile"),
+            (r"funcaptcha|arkoselabs|arkose\.com", "FunCaptcha/Arkose"),
+        ]
+        oauth_sigs = [
+            (r"Sign in with Google|accounts\.google\.com/o/oauth|gsi/client", "Google"),
+            (r"Sign in with GitHub|github\.com/login/oauth", "GitHub"),
+            (r"Sign in with Facebook|facebook\.com/v\d+\.\d+/dialog/oauth|fbcdn\.net", "Facebook"),
+            (r"Sign in with Apple|appleid\.apple\.com|appleid\.sdk", "Apple"),
+            (r"Sign in with Microsoft|login\.microsoftonline\.com|msal", "Microsoft"),
+            (r"Sign in with Twitter|Sign in with X|twitter\.com/oauth|x\.com/oauth", "Twitter/X"),
+            (r"Sign in with Discord|discord\.com/oauth2", "Discord"),
+            (r"Sign in with LinkedIn|linkedin\.com/oauth", "LinkedIn"),
+        ]
+        mfa_sigs = [
+            (r"webauthn|public[-_]key[-_]credential|navigator\.credentials", "WebAuthn/Passkey"),
+            (r"totp|google[-_]authenticator|authy|1password|2fa|two[-_]factor|authenticator", "TOTP-based 2FA"),
+            (r"sms[-_]code|verification[-_]code|2fa[-_]sms", "SMS 2FA"),
+            (r"backup[-_]code|recovery[-_]code", "Backup codes"),
+            (r"duo[-_]factor|duo\.com", "Duo 2FA"),
+        ]
+        sso_sigs = [
+            (r"/saml/acs|/|saml2|SAMLResponse|SPEntityID|IdPEntityID", "SAML SSO"),
+            (r"/oidc|/oauth2/authorize|openid-connect", "OIDC/OAuth2 generic"),
+        ]
+
+        captcha = [name for pat, name in captcha_sigs if _re.search(pat, combined, _re.IGNORECASE)]
+        oauth = [name for pat, name in oauth_sigs if _re.search(pat, combined, _re.IGNORECASE)]
+        mfa = [name for pat, name in mfa_sigs if _re.search(pat, combined, _re.IGNORECASE)]
+        sso = [name for pat, name in sso_sigs if _re.search(pat, combined, _re.IGNORECASE)]
+
+        signals: list[dict[str, str]] = []
+        for n in captcha:
+            signals.append({"kind": "captcha", "name": n, "hint": "Bot protection"})
+        for n in oauth:
+            signals.append({"kind": "oauth", "name": n, "hint": "OAuth provider"})
+        for n in mfa:
+            signals.append({"kind": "mfa", "name": n, "hint": "Multi-factor auth"})
+        for n in sso:
+            signals.append({"kind": "sso", "name": n, "hint": "SSO protocol"})
+        return {
+            "page_url": page.url,
+            "captcha": captcha,
+            "oauth_providers": oauth,
+            "mfa": mfa,
+            "sso": sso,
+            "signals": signals,
+        }
+
+    # ── T44e: CSRF 覆盖率检查 ─────────────────────
+
+    async def check_csrf_coverage(self) -> dict[str, Any]:
+        """T44e: 对当前页每个 form 检查 CSRF token 是否存在.
+
+        CSRF token 字段名: csrf_token, authenticity_token, _csrf, csrfmiddlewaretoken,
+                           antiforgerytoken, __requestverificationtoken, _token, csrfToken
+        只对会改变状态的 form (login/signup/checkout/contact/upload) 报警.
+
+        Returns {
+          "page_url",
+          "form_count": int,
+          "forms_with_csrf": int,
+          "forms_without_csrf": int,
+          "vulnerable": [{action, method, kind, field_names}],
+        }
+        """
+        page = await self._ensure_page()
+        snap = await SnapshotEngine(page).capture(base_url=page.url, detail_level="full")
+        CSRF_NAMES = {
+            "csrf_token", "authenticity_token", "_csrf", "csrfmiddlewaretoken",
+            "antiforgerytoken", "__requestverificationtoken", "_token", "csrftoken",
+            "csrfToken", "anti_csrf_token", "x-csrf-token", "csrf", "_csrf_token",
+        }
+        STATE_CHANGING = {"login", "signup", "checkout", "contact", "upload", "search", "unknown"}
+        vulnerable: list[dict[str, Any]] = []
+        for f in snap.forms:
+            has_csrf = any(
+                h.get("name", "").lower() in CSRF_NAMES
+                for h in f.hidden_fields
+            )
+            if not has_csrf and f.classification in STATE_CHANGING:
+                vulnerable.append({
+                    "action": f.action[:200],
+                    "method": f.method or "get",
+                    "kind": f.classification,
+                    "field_names": f.input_names[:10],
+                })
+        return {
+            "page_url": page.url,
+            "form_count": len(snap.forms),
+            "forms_with_csrf": sum(
+                1 for f in snap.forms
+                if any(h.get("name", "").lower() in CSRF_NAMES for h in f.hidden_fields)
+            ),
+            "forms_without_csrf": len(vulnerable),
+            "vulnerable": vulnerable,
+        }
+
+    # ── T44f: IDOR-prone URLs ──────────────────────
+
+    async def find_idor_urls(self) -> dict[str, Any]:
+        """T44f: 扫链接 + form action 找 IDOR-prone URLs.
+
+        模式: /user/{N}, /users/{N}, /order/{N}, /orders/{N}, /invoice/{N},
+              /account/{N}, /profile/{N}, /api/v1/users/{N}, /api/v1/orders/{N}, ...
+        数字 ID (1-12 位) 视为可疑.
+        Returns {
+          "page_url",
+          "idor_urls": [{href, kind, id}],
+          "idor_count": int,
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        snap = await SnapshotEngine(page).capture(base_url=page.url, detail_level="full")
+        IDOR_RE = _re.compile(
+            r"/(users?|orders?|invoices?|accounts?|profiles?|customers?|tickets?)"
+            r"/(\d{1,12})(?:\b|/)",
+            _re.IGNORECASE,
+        )
+        # 也加上常见的 API 路径
+        API_RE = _re.compile(
+            r"/api/v\d+/(users|orders|invoices|accounts)/(\d{1,12})(?:\b|/)",
+            _re.IGNORECASE,
+        )
+        idor: list[dict[str, Any]] = []
+        seen = set()
+        for link in snap.links:
+            for m in IDOR_RE.finditer(link.href or ""):
+                key = (m.group(1).lower(), m.group(2), link.href[:200])
+                if key in seen:
+                    continue
+                seen.add(key)
+                idor.append({"href": link.href[:300], "kind": m.group(1).lower(), "id": m.group(2)})
+        for f in snap.forms:
+            for m in IDOR_RE.finditer(f.action or ""):
+                key = (m.group(1).lower(), m.group(2), f.action[:200])
+                if key in seen:
+                    continue
+                seen.add(key)
+                idor.append({"href": f.action[:300], "kind": m.group(1).lower(), "id": m.group(2), "in_form": True})
+        return {
+            "page_url": page.url,
+            "idor_urls": idor[:100],
+            "idor_count": len(idor),
+        }
+
+    # ── T44g: 云资源泄露 (S3 / Azure / GCP / Heroku / Firebase) ─
+
+    async def find_cloud_resources(self) -> dict[str, Any]:
+        """T44g: 扫 page source + script srcs, 找云资源 URL 泄露.
+
+        检测:
+          - AWS S3:            <bucket>.s3.amazonaws.com / s3-<region>.amazonaws.com/<bucket>
+          - Azure Blob:        <account>.blob.core.windows.net
+          - Azure Files:       <account>.file.core.windows.net
+          - GCP Storage:       storage.googleapis.com/<bucket>
+          - Heroku:            <app>.herokuapp.com
+          - Firebase DB:       <app>.firebaseio.com
+          - Firebase Hosting:  <app>.web.app / <app>.firebaseapp.com
+          - CloudFront:        <id>.cloudfront.net
+          - DigitalOcean:      <bucket>.nyc3.digitaloceanspaces.com
+
+        Returns {
+          "page_url",
+          "resources": [{provider, url, kind}],
+          "by_provider": {aws_s3: N, azure_blob: M, ...},
+        }
+        """
+        import re as _re
+        page = await self._ensure_page()
+        try:
+            content = await page.content()
+        except Exception:
+            content = ""
+        scripts = await page.evaluate("""() => {
+            const out = [];
+            for (const s of document.querySelectorAll('script[src]')) {
+                const src = s.getAttribute('src');
+                if (src) out.push(src);
+            }
+            for (const l of document.querySelectorAll('link[href]')) {
+                const h = l.getAttribute('href');
+                if (h) out.push(h);
+            }
+            return out;
+        }""")
+        blob = content + "\n" + "\n".join(scripts)
+        PATTERNS = [
+            ("aws_s3",         r"https?://[a-z0-9.\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com[^\s\"'<>]*", "S3 bucket"),
+            ("aws_s3_path",    r"https?://s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com/[a-z0-9.\-]+[^\s\"'<>]*", "S3 path-style"),
+            ("azure_blob",     r"https?://[a-z0-9]+\.blob\.core\.windows\.net[^\s\"'<>]*", "Azure Blob"),
+            ("azure_file",     r"https?://[a-z0-9]+\.file\.core\.windows\.net[^\s\"'<>]*", "Azure Files"),
+            ("gcp_storage",    r"https?://storage\.googleapis\.com/[a-z0-9.\-]+[^\s\"'<>]*", "GCP Storage"),
+            ("heroku_app",     r"https?://[a-z0-9\-]+\.herokuapp\.com[^\s\"'<>]*", "Heroku app"),
+            ("firebase_db",    r"https?://[a-z0-9\-]+\.firebaseio\.com[^\s\"'<>]*", "Firebase DB"),
+            ("firebase_host",  r"https?://[a-z0-9\-]+\.(?:web\.app|firebaseapp\.com)[^\s\"'<>]*", "Firebase Hosting"),
+            ("cloudfront",     r"https?://[a-z0-9]+\.cloudfront\.net[^\s\"'<>]*", "CloudFront"),
+            ("do_spaces",      r"https?://[a-z0-9\-]+\.[a-z0-9]+\.digitaloceanspaces\.com[^\s\"'<>]*", "DigitalOcean Spaces"),
+        ]
+        resources: list[dict[str, str]] = []
+        seen = set()
+        for prov, pat, kind in PATTERNS:
+            for m in _re.finditer(pat, blob, _re.IGNORECASE):
+                url = m.group(0).rstrip(".,);\"'")
+                if url in seen:
+                    continue
+                seen.add(url)
+                resources.append({"provider": prov, "url": url[:300], "kind": kind})
+        by_provider: dict[str, int] = {}
+        for r in resources:
+            by_provider[r["provider"]] = by_provider.get(r["provider"], 0) + 1
+        return {
+            "page_url": page.url,
+            "resources": resources[:200],
+            "by_provider": by_provider,
+            "resource_count": len(resources),
+        }
+
+    # ── T44h: HTTP methods probe (OPTIONS / Allow) ───────────
+
+    async def probe_http_methods(
+        self,
+        base_url: str | None = None,
+        *,
+        paths: list[str] | None = None,
+        timeout_ms: int = 4000,
+    ) -> dict[str, Any]:
+        """T44h: OPTIONS 请求探测每个 path 的 Allow header, 看是否支持危险方法.
+
+        Returns {
+          "base_url",
+          "results": [
+            {"path", "allow" (parsed), "dangerous" (bool, 含 PUT/DELETE/PATCH/CONNECT/TRACE)},
+            ...
+          ],
+        }
+        """
+        import httpx
+        page = await self._ensure_page()
+        if not base_url:
+            base_url = page.url
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port and not (
+            (parsed.scheme == "http" and parsed.port == 80)
+            or (parsed.scheme == "https" and parsed.port == 443)
+        ):
+            origin += f":{parsed.port}"
+        if not paths:
+            paths = ["/", "/api", "/api/v1", "/users", "/admin", "/login"]
+        DANGEROUS = {"PUT", "DELETE", "PATCH", "CONNECT", "TRACE"}
+        results: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            timeout=timeout_ms / 1000,
+            headers={"User-Agent": "semantic-browser-probe/1.0"},
+            follow_redirects=False,
+        ) as client:
+            for path in paths:
+                url = origin + path
+                try:
+                    r = await client.request("OPTIONS", url)
+                except Exception as e:
+                    results.append({"path": path, "allow": [], "dangerous": False, "error": str(e)[:200]})
+                    continue
+                allow = r.headers.get("allow") or r.headers.get("Allow") or ""
+                methods = [m.strip().upper() for m in allow.split(",") if m.strip()]
+                dangerous = any(m in DANGEROUS for m in methods)
+                results.append({
+                    "path": path,
+                    "status": r.status_code,
+                    "allow": methods,
+                    "dangerous": dangerous,
+                })
+        return {
+            "base_url": base_url,
+            "results": results,
+        }
+
+    # ── T44i: 2FA / MFA detection (alias of T44d mfa section) ───
+
+    async def detect_2fa(self) -> dict[str, Any]:
+        """T44i: 专门检测 2FA / MFA 信号 (WebAuthn / TOTP / SMS / backup code / Duo)."""
+        r = await self.detect_auth_methods()
+        return {
+            "page_url": r["page_url"],
+            "mfa": r["mfa"],
+            "mfa_count": len(r["mfa"]),
+            "has_webauthn": "WebAuthn/Passkey" in r["mfa"],
+            "has_totp": any("TOTP" in m for m in r["mfa"]),
+            "has_sms": any("SMS" in m for m in r["mfa"]),
+            "has_backup_code": any("Backup" in m for m in r["mfa"]),
+        }
+
+    # ── T44j: External resource inventory ───────────────
+
+    async def inventory_external_resources(self) -> dict[str, Any]:
+        """T44j: 当前页所有外部资源分组 (供 trust boundary 分析).
+
+        分组维度:
+          - 外部 link domain: <a href> 指向外站的 host
+          - 外部 script host: <script src> 外站 host
+          - 外部 iframe: <iframe src> 外站 host
+          - 跨域 form action: <form action> 外站 host
+          - 跨域 redirect: 链接中含其他 host 的 redirect target
+
+        Returns {
+          "page_url",
+          "external_link_domains": [{domain, count}],
+          "external_script_hosts": [{host, urls}],
+          "external_iframes": [{host, src}],
+          "cross_origin_forms": [{host, action}],
+        }
+        """
+        from urllib.parse import urlparse, urljoin
+        from collections import Counter
+        page = await self._ensure_page()
+        page_url = page.url
+        page_host = urlparse(page_url).hostname
+        snap = await SnapshotEngine(page).capture(base_url=page_url, detail_level="full")
+        # 1) 外部 link 域名
+        link_domains: Counter[str] = Counter()
+        for link in snap.links:
+            href = link.href or ""
+            if not href.startswith("http"):
+                continue
+            h = urlparse(href).hostname
+            if h and h != page_host:
+                link_domains[h] += 1
+        # 2) 外部 script hosts
+        script_hosts: dict[str, list[str]] = {}
+        for s in snap.scripts:
+            if not (s.has_src and s.src):
+                continue
+            try:
+                u = urlparse(s.src)
+                if u.hostname and u.hostname != page_host:
+                    script_hosts.setdefault(u.hostname, []).append(s.src[:300])
+            except Exception:
+                pass
+        # 3) iframe: snapshot 里没有直接拿, 走 page.evaluate
+        iframes = await page.evaluate("""() => {
+            const out = [];
+            for (const f of document.querySelectorAll('iframe[src]')) {
+                out.push(f.getAttribute('src'));
+            }
+            return out;
+        }""")
+        external_iframes: list[dict[str, str]] = []
+        for src in iframes:
+            try:
+                full = urljoin(page_url, src)
+                h = urlparse(full).hostname
+                if h and h != page_host:
+                    external_iframes.append({"host": h, "src": full[:300]})
+            except Exception:
+                pass
+        # 4) 跨域 form action
+        cross_origin_forms: list[dict[str, str]] = []
+        for f in snap.forms:
+            try:
+                full = urljoin(page_url, f.action or "")
+                h = urlparse(full).hostname
+                if h and h != page_host:
+                    cross_origin_forms.append({"host": h, "action": full[:300]})
+            except Exception:
+                pass
+        return {
+            "page_url": page_url,
+            "external_link_domains": [
+                {"domain": d, "count": c} for d, c in link_domains.most_common(50)
+            ],
+            "external_script_hosts": [
+                {"host": h, "urls": urls[:5]} for h, urls in list(script_hosts.items())[:30]
+            ],
+            "external_iframes": external_iframes[:30],
+            "cross_origin_forms": cross_origin_forms[:30],
+        }
+
+    # ── T44k: CSP 指令解析 (deep) ────────────────────
+
+    async def parse_csp(self) -> dict[str, Any]:
+        """T44k: 把 CSP 头拆成 directive × source 列表, 标出危险配置.
+
+        Returns {
+          "page_url",
+          "csp_raw": str | None,
+          "directives": {directive_name: [source, ...], ...},
+          "flags": [str, ...],   # 危险配置: unsafe-inline, unsafe-eval, * wildcard, data:, ...
+          "missing_recommended": [str, ...],  # 缺失建议的 directive (script-src, frame-ancestors, base-uri)
+        }
+        """
+        page = await self._ensure_page()
+        hdrs = await self.get_security_headers(page.url)
+        csp = hdrs.get("csp")
+        if not csp:
+            return {"page_url": page.url, "csp_raw": None, "directives": {},
+                    "flags": ["no_csp"], "missing_recommended": ["script-src", "frame-ancestors", "base-uri"]}
+        raw = csp.get("raw", "") if isinstance(csp, dict) else str(csp)
+        directives: dict[str, list[str]] = {}
+        flags: list[str] = []
+        for d in raw.split(";"):
+            d = d.strip()
+            if not d:
+                continue
+            parts = d.split(None, 1)
+            name = parts[0].lower()
+            sources = parts[1].split() if len(parts) > 1 else []
+            directives[name] = sources
+            for s in sources:
+                sl = s.lower()
+                if "'unsafe-inline'" in sl or s == "*":
+                    flags.append(f"{name} contains {s}")
+                if "'unsafe-eval'" in sl:
+                    flags.append(f"{name} allows eval()")
+                if s == "data:":
+                    flags.append(f"{name} allows data: URI")
+        recommended = ["script-src", "default-src", "frame-ancestors", "base-uri", "form-action"]
+        missing = [r for r in recommended if r not in directives]
+        return {
+            "page_url": page.url,
+            "csp_raw": raw,
+            "directives": directives,
+            "flags": flags,
+            "missing_recommended": missing,
+        }
+
+    # ── T44l: Subdomain takeover signal ────────────────
+
+    async def check_subdomain_takeover(
+        self,
+        host: str | None = None,
+        subdomains: list[str] | None = None,
+        *,
+        doh_endpoint: str = "https://dns.google/resolve",
+        timeout: float = 8.0,
+    ) -> dict[str, Any]:
+        """T44l: 对每个子域查 CNAME, 跟已知"易被接管"服务签名比对.
+
+        签名表 (fingerprint → risk):
+          - s3.amazonaws.com / s3-website → "S3 bucket (check ownership)"
+          - .herokuapp.com               → "Heroku app (check deletion)"
+          - .azurewebsites.net           → "Azure Web App (check deletion)"
+          - .cloudfront.net              → "CloudFront (check distribution)"
+          - .elasticbeanstalk.com        → "Elastic Beanstalk"
+          - .github.io                   → "GitHub Pages (check repo)"
+          - .pantheonsite.io             → "Pantheon"
+          - .tumblr.com                  → "Tumblr (custom domain)"
+          - .wordpress.com               → "WordPress.com"
+          - .shopify.com                 → "Shopify (check claim)"
+
+        Returns {
+          "host",
+          "checked": int,
+          "risky": [{subdomain, cname, provider, risk, http_status (if any)}],
+        }
+        """
+        import re as _re
+        import socket
+        import httpx
+        if not host:
+            try:
+                page = await self._ensure_page()
+                from urllib.parse import urlparse
+                host = urlparse(page.url).hostname
+            except Exception:
+                pass
+        if not subdomains:
+            # 默认查常见子域
+            subdomains = [f"{prefix}.{host}" for prefix in (
+                "www", "api", "staging", "dev", "test", "beta", "admin",
+                "blog", "shop", "mail", "cdn", "static", "app",
+            )]
+        SIGS = [
+            (r"\.s3(?:\-[a-z0-9\-]+)?\.amazonaws\.com",    "AWS S3",      "check if bucket exists / is yours"),
+            (r"\.s3-website(?:\-[a-z0-9\-]+)?\.amazonaws\.com", "AWS S3 website", "check bucket ownership"),
+            (r"\.herokuapp\.com",                          "Heroku",      "check if app is deleted"),
+            (r"\.azurewebsites\.net",                      "Azure Web App", "check if app is deleted"),
+            (r"\.cloudfront\.net",                         "CloudFront",  "check distribution ownership"),
+            (r"\.elasticbeanstalk\.com",                   "Elastic Beanstalk", "check environment"),
+            (r"\.github\.io",                               "GitHub Pages", "check repo exists"),
+            (r"\.pantheonsite\.io",                        "Pantheon",    "check site status"),
+            (r"\.tumblr\.com$",                            "Tumblr",      "check blog claim"),
+            (r"\.wordpress\.com$",                         "WordPress.com", "check site claim"),
+            (r"\.shopify\.com$",                           "Shopify",     "check store claim"),
+        ]
+        risky: list[dict[str, Any]] = []
+        checked = 0
+
+        async def _get_cname(sub: str) -> str | None:
+            """Try CNAME via DoH, fallback to socket.gethostbyname (A record)."""
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.get(f"{doh_endpoint}?name={sub}&type=CNAME",
+                                         headers={"Accept": "application/dns-json"})
+                if r.status_code == 200:
+                    for ans in r.json().get("Answer", []):
+                        if ans.get("type") == 5:
+                            return ans.get("data", "").rstrip(".")
+            except Exception:
+                pass
+            return None
+
+        async def _http_status(sub: str) -> int | None:
+            try:
+                async with httpx.AsyncClient(timeout=3.0, follow_redirects=False) as client:
+                    for scheme in ("https", "http"):
+                        try:
+                            r = await client.get(f"{scheme}://{sub}/", headers={"User-Agent": "semantic-browser-recon/1.0"})
+                            return r.status_code
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            return None
+
+        for sub in subdomains:
+            checked += 1
+            cname = await _get_cname(sub)
+            target = cname or sub
+            matched_provider: str | None = None
+            matched_risk: str | None = None
+            for pat, provider, risk in SIGS:
+                if _re.search(pat, target, _re.IGNORECASE):
+                    matched_provider = provider
+                    matched_risk = risk
+                    break
+            if matched_provider:
+                # 拿 HTTP 状态辅助判断
+                status = await _http_status(sub)
+                # 404 / 503 / NXDOMAIN-like 强烈提示可接管
+                suspicious_status = status in (404, 503) or status is None
+                risky.append({
+                    "subdomain": sub,
+                    "cname": cname,
+                    "provider": matched_provider,
+                    "risk": matched_risk,
+                    "http_status": status,
+                    "suspicious_status": suspicious_status,
+                })
+        return {
+            "host": host,
+            "checked": checked,
+            "risky": risky,
         }
 
     # ── T12: 通用 retry ─────────────────────────────────────────────

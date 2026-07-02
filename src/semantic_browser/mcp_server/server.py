@@ -2,6 +2,9 @@
 MCP Server — SemanticBrowser 的 Model Context Protocol 适配层。
 
 stdio JSON-RPC 2.0 server with lazy SemanticBrowser startup.
+
+T57: 可选 daemon 代理 — 设了 daemon_url 时, sessions/capacity/admin/queue/health
+等 daemon 级工具走 HTTP; 未设时返回 INTERNAL 错误 (这些功能需要 daemon).
 """
 
 from __future__ import annotations
@@ -10,11 +13,14 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import sys
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 
 from semantic_browser.engine import SemanticBrowser
-from semantic_browser.result import classify_exception
+from semantic_browser.result import classify_exception, err
 from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,20 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+# T57: daemon 代理 — MCP 客户端可以连远端 daemon (共享 chromium + 多 session)
+DAEMON_URL_ENV = "SEMANTIC_BROWSER_DAEMON_URL"
+
+
+class _DaemonProxyError(Exception):
+    """T57: daemon 返回 ok:false 时, 把 error.code 透传给 MCP 客户端 (不丢 INTERNAL 通用化)."""
+
+    def __init__(self, code: str, message: str, retryable: bool = False, level: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.level = level
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -158,12 +178,46 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
          "standards": {"type": "array", "items": {"type": "string"},
                        "description": "WCAG tag 列表, 默认 wcag2a/wcag2aa/wcag21a/wcag21aa"},
      })},
+    # T18: 调试工具 — JS console / network / page errors (安全审计相关)
+    {"name": "sb_get_console", "description": "T18: 返回浏览器收集的 JS console 消息 (log/warn/error) — 帮 agent 诊断 XSS/脚本错误.",
+     "inputSchema": _schema({"type": {"type": "string", "description": "filter: log/warn/error/debug/info, 空=全部"},
+                             "limit": {"type": "integer", "default": 100}})},
+    {"name": "sb_get_network", "description": "T18: 返回浏览器网络请求缓冲 (按 method/URL/status 过滤) — 安全审计敏感 endpoint.",
+     "inputSchema": _schema({"only_failed": {"type": "boolean", "default": False},
+                             "method": {"type": "string", "description": "GET/POST/..."},
+                             "limit": {"type": "integer", "default": 100}})},
+    {"name": "sb_get_page_errors", "description": "T18: 列出当前页 JS 异常 (uncaughtException) — 排查 SPA 错误.",
+     "inputSchema": _schema({"limit": {"type": "integer", "default": 50}})},
+    # T54: 多 session 隔离 — MCP 客户端可创建/列/删独立 BrowserContext
+    {"name": "sb_sessions_list", "description": "T54: 列出所有活跃 session (含 default).",
+     "inputSchema": _schema({})},
+    {"name": "sb_sessions_create", "description": "T54: 创建新 session (不传 name 自动 agent-N). 错误时返回 CAPACITY_DEGRADED.",
+     "inputSchema": _schema({"name": {"type": "string"}})},
+    {"name": "sb_sessions_delete", "description": "T54: 关闭并移除指定 session. default session 不能删.",
+     "inputSchema": _schema({"name": {"type": "string"}}, ["name"])},
+    # T56: 容量 + 降级 — agent 看 L0-L4 退路状态
+    {"name": "sb_capacity", "description": "T56: 返回 sessions_active/max/ratio + degradation_level/label — agent 据此决定要不要新开 session.",
+     "inputSchema": _schema({})},
+    {"name": "sb_admin_degrade", "description": "T56: 显式 bump degradation level (1..4). 测试用, 让 agent 模拟 daemon 降级.",
+     "inputSchema": _schema({"level": {"type": "integer", "minimum": 1, "maximum": 4}}, ["level"])},
+    {"name": "sb_admin_restore", "description": "T56: 显式 restore degradation 到 L0. 与 sb_admin_degrade 配对.",
+     "inputSchema": _schema({})},
+    # T51: op 锁状态 — agent 决定要不要等
+    {"name": "sb_queue", "description": "T51: 当前 op_lock 状态 (current_op / running_for_s / waiters) — agent 据此 backoff.",
+     "inputSchema": _schema({})},
+    # T49: 增强 /health
+    {"name": "sb_health", "description": "T49: 健康检查 + pid/host/port/uptime/page_url — agent 排查省一次 roundtrip.",
+     "inputSchema": _schema({})},
 ]
 
 
 class MCPServer:
-    def __init__(self, engine: Optional[SemanticBrowser] = None) -> None:
+    def __init__(self, engine: Optional[SemanticBrowser] = None, daemon_url: str | None = None) -> None:
         self._engine = engine
+        # T57: daemon_url 不传时读 env — 让 Claude Desktop config 设环境变量就能切 daemon
+        self._daemon_url = daemon_url or os.environ.get(DAEMON_URL_ENV)
+        if self._daemon_url:
+            logger.info("MCPServer routing daemon-level tools to %s", self._daemon_url)
 
     async def _ensure_started(self) -> SemanticBrowser:
         if self._engine is None:
@@ -175,6 +229,75 @@ class MCPServer:
         if self._engine is None:
             self._engine = SemanticBrowser()
         return self._engine
+
+    def _daemon_get(self, path: str, params: dict | None = None) -> Any:
+        """T57: 同步 GET → daemon. MCP tool 直接 await 这个 (因为工具 handler 是 async)."""
+        if not self._daemon_url:
+            raise RuntimeError(
+                "daemon-level tool requires daemon_url; "
+                f"set {DAEMON_URL_ENV} env or pass daemon_url= to MCPServer"
+            )
+        url = self._daemon_url.rstrip("/") + path
+        if params:
+            from urllib.parse import urlencode
+            url += "?" + urlencode(params)
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode("utf-8"))
+        return self._extract_daemon_result(body)
+
+    def _daemon_post(self, path: str, args: dict | None = None) -> Any:
+        """T57: 同步 POST → daemon."""
+        if not self._daemon_url:
+            raise RuntimeError(
+                "daemon-level tool requires daemon_url; "
+                f"set {DAEMON_URL_ENV} env or pass daemon_url= to MCPServer"
+            )
+        url = self._daemon_url.rstrip("/") + path
+        data = json.dumps(args or {}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode("utf-8"))
+        return self._extract_daemon_result(body)
+
+    def _daemon_delete(self, path: str) -> Any:
+        """T57: 同步 DELETE → daemon."""
+        if not self._daemon_url:
+            raise RuntimeError(
+                "daemon-level tool requires daemon_url; "
+                f"set {DAEMON_URL_ENV} env or pass daemon_url= to MCPServer"
+            )
+        url = self._daemon_url.rstrip("/") + path
+        req = urllib.request.Request(url, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode("utf-8"))
+        return self._extract_daemon_result(body)
+
+    @staticmethod
+    def _extract_daemon_result(body: dict[str, Any]) -> Any:
+        """T57: 解 daemon envelope — ok:false 时抛 _DaemonProxyError 保留 code/level."""
+        if not body.get("ok"):
+            e = body.get("error") or {}
+            raise _DaemonProxyError(
+                code=e.get("code", "DAEMON_ERROR"),
+                message=e.get("message", "unknown"),
+                retryable=bool(e.get("retryable", False)),
+                level=e.get("level"),
+            )
+        return body.get("data")
 
     async def handle(self, request: Any) -> Optional[dict[str, Any]]:
         if not isinstance(request, dict):
@@ -213,6 +336,17 @@ class MCPServer:
             return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(
                 {"ok": True, "data": result, "error": None}, ensure_ascii=False, indent=2)}],
                 "isError": False})
+        except _DaemonProxyError as e:
+            # T57: daemon 业务错 (CAPACITY_DEGRADED / SESSION_NOT_FOUND 等) — 保留原 code/level
+            error_dict: dict[str, Any] = {
+                "code": e.code, "message": e.message, "retryable": e.retryable,
+            }
+            if e.level is not None:
+                error_dict["level"] = e.level
+            logger.warning("Tool %s failed (daemon proxy): %s", name, e.code)
+            return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(
+                {"ok": False, "data": None, "error": error_dict}, ensure_ascii=False, indent=2)}],
+                "isError": True})
         except Exception as e:
             # T48: 错误也走 Result envelope, 然后再包 MCP content. agent 在 text 里 parse ok/data/error
             classified = classify_exception(e)
@@ -483,6 +617,42 @@ class MCPServer:
                 max_nodes_per_violation=int(args.get("max_nodes_per_violation", 5)),
                 standards=standards if isinstance(standards, list) else None,
             )
+        # T18: 调试工具 (in-engine, 不需要 daemon)
+        if name == "sb_get_console":
+            engine = await self._ensure_started()
+            return engine.controller.get_console_messages(
+                type_filter=args.get("type") or None,
+                limit=int(args.get("limit", 100)),
+            )
+        if name == "sb_get_network":
+            engine = await self._ensure_started()
+            only_failed = bool(args.get("only_failed", False))
+            return engine.controller.get_network_requests(
+                only_failed=only_failed,
+                method_filter=args.get("method") or None,
+                limit=int(args.get("limit", 100)),
+            )
+        if name == "sb_get_page_errors":
+            engine = await self._ensure_started()
+            return engine.controller.get_page_errors(limit=int(args.get("limit", 50)))
+        # T57: daemon 级工具 — 走 HTTP 代理 (没配 daemon_url 时上面 _daemon_* 会 raise)
+        if name == "sb_sessions_list":
+            return self._daemon_get("/sessions")
+        if name == "sb_sessions_create":
+            return self._daemon_post("/sessions", {"name": args.get("name")} if "name" in args else None)
+        if name == "sb_sessions_delete":
+            name_param = args.get("name") or ""
+            return self._daemon_delete(f"/sessions/{name_param}")
+        if name == "sb_capacity":
+            return self._daemon_get("/capacity")
+        if name == "sb_admin_degrade":
+            return self._daemon_post("/admin/degrade", {"level": args["level"]})
+        if name == "sb_admin_restore":
+            return self._daemon_post("/admin/restore", {})
+        if name == "sb_queue":
+            return self._daemon_get("/queue")
+        if name == "sb_health":
+            return self._daemon_get("/health")
         raise ValueError(f"Unknown tool: {name}")
 
     async def run(self, stdin=None, stdout=None) -> None:
@@ -520,6 +690,7 @@ class MCPServer:
 
 async def amain() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # T57: 默认读 env 配 daemon_url — Claude Desktop config 里设 SEMANTIC_BROWSER_DAEMON_URL 即可
     await MCPServer().run()
 
 

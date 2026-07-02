@@ -428,6 +428,32 @@ else:
 
 **测试**: 4 新 (queue 空闲 / 并发 open 串行化 / SSE 期间 queue 显示 running / 锁正确释放). 全套 **571 passed, 7 skipped**.
 
+## T57 — T40/T42/T43/T44 安全工具 MCP 暴露 + daemon 代理模式
+
+MCP server 现在 66 个工具, 覆盖 T40+T42+T43+T44 全部 22 项 site intelligence 工具, 加 T18 调试 (console/network/errors) + T54 sessions + T56 capacity/admin 暴露. 关键设计: **可选 daemon 代理** —
+
+```python
+# 默认: in-process (每 MCP 客户端一个独立 SemanticBrowser, 适合轻量 Claude Desktop 用)
+# 通过 SEMANTIC_BROWSER_DAEMON_URL env 或 MCPServer(daemon_url=...) 切到 daemon 代理:
+import os
+os.environ["SEMANTIC_BROWSER_DAEMON_URL"] = "http://127.0.0.1:8765"
+# 现在 sessions/capacity/admin/queue/health 走 daemon HTTP — 多 agent 共享 chromium
+```
+
+**T57 新增 MCP 工具** (11):
+- `sb_get_console` — JS console 消息 (log/warn/error 过滤) — XSS 审计
+- `sb_get_network` — 网络请求缓冲 (按 method/失败过滤) — 敏感 endpoint 审计
+- `sb_get_page_errors` — 页面 JS 异常 — SPA 排查
+- `sb_sessions_list/create/delete` — 多 agent session CRUD (T54, 需 daemon)
+- `sb_capacity` — sessions_active/max/ratio + degradation_level/label (T56, 需 daemon)
+- `sb_admin_degrade/restore` — 显式 bump/restore 降级 (T56, 需 daemon, 测试/运维)
+- `sb_queue` — op_lock 状态 (T51, 需 daemon) — agent 决定 backoff
+- `sb_health` — 增强 health (T49, 需 daemon)
+
+**业务错误透传**: daemon 返回的 `CAPACITY_DEGRADED` / `SESSION_NOT_FOUND` / `DEGRADED_READONLY` 等稳定错误码, MCP 层不丢, 通过 `_DaemonProxyError` 保留 code/level 字段. agent 一次调用拿全错误语义, 不用猜测.
+
+**测试**: 13 新 (3 T18 in-engine / 3 缺 daemon_url 错误 / 5 daemon 代理走通 / 1 错误透传 / 1 env 注入). 全套 **612 passed, 7 skipped**.
+
 ## T56 — DegradationController L0-L4 + /capacity + 错误码扩展
 
 daemon 在容量/资源压力下按 L0-L4 自动降级, agent 通过 `/capacity` 查当前退路, 不用猜; 阻挡的请求返回 503 + `Retry-After` 头让客户端做 backoff:

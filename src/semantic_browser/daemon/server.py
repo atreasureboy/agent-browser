@@ -365,7 +365,7 @@ class TransparentBrowserDaemon:
                     "method": method, "path": path, "code": final_code,
                 })
             # duration 只记非 SSE (SSE 长流会扭曲直方图)
-            if path != "/discover/stream":
+            if path not in ("/discover/stream", "/agent/run/stream"):
                 self.metrics.observe("request_duration", {
                     "method": method, "path": path,
                 }, elapsed)
@@ -750,6 +750,12 @@ class TransparentBrowserDaemon:
             ))
         if method == "POST" and path == "/agent/run":
             return self.owner.run(self._run_agent(args))
+        # T53: SSE 流式 agent run — 复用 on_step 钩子推 step-by-step
+        if method == "POST" and path == "/agent/run/stream":
+            if req is None:
+                raise ValueError("/agent/run/stream requires req context")
+            self._stream_agent_run(req, args)
+            return "_SSE_HANDLED"
         # T29: dry-run plan preview
         if method == "POST" and path == "/agent/plan":
             return self.owner.run(self._plan_agent(args))
@@ -1235,6 +1241,118 @@ class TransparentBrowserDaemon:
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("SSE client disconnected")
+
+    def _stream_agent_run(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
+        """T53: SSE 流式 agent_run — 每 step 一个 event (复用 on_step 钩子).
+
+        Event 格式 (JSON 一行):
+          data: {"type": "start", "goal": "...", "max_steps": N}
+          data: {"type": "step", "step": N, "action": "...", "args": {...},
+                 "success": bool, "error": "...", "thought": "..."}
+          data: {"type": "done_result", "result": {完整 GoalResult.to_dict()}}
+          data: {"type": "done_result", "error": "..."}  # 异常时
+        """
+        import json as _json
+        from semantic_browser.agent import GoalAgent
+
+        goal = args["goal"]
+        max_steps = int(args.get("max_steps", 20))
+        tier = args.get("tier", "smart")
+        allow_destructive = bool(args.get("allow_destructive", False))
+        start_url = args.get("start_url") or None
+
+        req.send_response(200)
+        req.send_header("content-type", "text/event-stream; charset=utf-8")
+        req.send_header("cache-control", "no-cache")
+        req.send_header("x-accel-buffering", "no")
+        req.send_header("connection", "keep-alive")
+        req.end_headers()
+
+        event_queue: queue.Queue = queue.Queue(maxsize=128)
+        loop_ref = self.owner.loop
+
+        async def on_step(record):
+            entry = {
+                "type": "step",
+                "step": record.step,
+                "action": record.action,
+                "args": record.args,
+                "success": record.success,
+                "error": record.error,
+                "thought": record.thought,
+            }
+            # on_step 跑在 daemon 的 event loop 上, queue 是线程安全的
+            try:
+                event_queue.put_nowait(entry)
+            except queue.Full:
+                logger.warning("agent_run SSE queue full; dropping step %s", record.step)
+
+        async def run_agent() -> None:
+            try:
+                agent = GoalAgent(
+                    self.owner.browser.controller,
+                    tier=tier,
+                    max_steps=max_steps,
+                    on_step=on_step,
+                    allow_destructive=allow_destructive,
+                )
+                result = await agent.run(goal=goal, start_url=start_url)
+                event_queue.put_nowait({"type": "_final", "result": result.to_dict()})
+            except Exception as e:
+                logger.exception("agent/run/stream failed")
+                event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
+
+        # start event
+        try:
+            start_frame = b"data: " + _json.dumps(
+                {"type": "start", "goal": goal, "max_steps": max_steps},
+                ensure_ascii=False,
+            ).encode("utf-8") + b"\n\n"
+            req.wfile.write(start_frame)
+            req.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        loop_ref.call_soon_threadsafe(asyncio.ensure_future, run_agent())
+
+        try:
+            final_result: dict[str, Any] | None = None
+            idle_ticks = 0
+            while True:
+                try:
+                    event = event_queue.get(timeout=15)
+                    idle_ticks = 0
+                except queue.Empty:
+                    idle_ticks += 1
+                    if idle_ticks > 4:
+                        logger.warning("agent_run SSE stream idle too long; closing")
+                        break
+                    try:
+                        req.wfile.write(b": keepalive\n\n")
+                        req.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    continue
+                if event.get("type") == "_final":
+                    final_result = event["result"]
+                    break
+                frame = b"data: " + _json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    logger.warning("agent_run SSE client disconnected mid-stream")
+                    return
+
+            done = {"type": "done_result"}
+            if final_result and "_error" in final_result:
+                done["error"] = final_result["_error"]
+            elif final_result:
+                done["result"] = final_result
+            req.wfile.write(b"data: " + _json.dumps(done, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            req.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.warning("agent_run SSE client disconnected")
 
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service

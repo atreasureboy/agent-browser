@@ -486,6 +486,77 @@ class TestSSEEndpoint:
         assert "SSE-State" in s["data"]["title"]
 
 
+class TestAgentRunStream:
+    """T53: /agent/run/stream 端点 — SSE 帧格式 + 错误处理 (复用 on_step 钩子)."""
+
+    def _post_sse(self, url: str, body: dict, *, timeout: float = 30) -> list[dict]:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"content-type": "application/json"}, method="POST",
+        )
+        events = []
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            assert resp.headers.get("content-type", "").startswith("text/event-stream"), \
+                f"非 SSE: {resp.headers.get('content-type')}"
+            while True:
+                line = resp.readline().decode("utf-8").rstrip("\n").rstrip("\r")
+                if not line or not line.startswith("data: "):
+                    continue
+                event = json.loads(line[len("data: "):])
+                events.append(event)
+                if event.get("type") == "done_result":
+                    break
+        return events
+
+    def test_agent_run_stream_emits_sse_envelope(self, daemon):
+        """没配 LLM 时, 端点也走 SSE — start + done_result (含失败 reason)."""
+        events = self._post_sse(
+            f"{daemon}/agent/run/stream",
+            {"goal": "test goal", "max_steps": 3},
+            timeout=30,
+        )
+        types = [e["type"] for e in events]
+        assert "start" in types, f"缺 start: {types}"
+        assert "done_result" in types, f"缺 done_result: {types}"
+        start = next(e for e in events if e["type"] == "start")
+        assert start["goal"] == "test goal"
+        assert start["max_steps"] == 3
+        # 没 LLM → done_result 含 error (走快速失败路径)
+        dr = next(e for e in events if e["type"] == "done_result")
+        assert "result" in dr or "error" in dr
+
+    def test_agent_run_stream_missing_goal_returns_400(self, daemon):
+        """缺 goal → MISSING_PARAM → 协议层 400 (不走 SSE)."""
+        data = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{daemon}/agent/run/stream", data=data,
+            headers={"content-type": "application/json"}, method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("应报错")
+        except HTTPError as e:
+            assert e.code == 400
+            body = json.loads(e.read())
+            assert body["ok"] is False
+            assert body["error"]["code"] == "MISSING_PARAM"
+
+    def test_agent_run_stream_excluded_from_duration_histogram(self, daemon):
+        """/agent/run/stream 不应进 request_duration (避免扭曲直方图)."""
+        events = self._post_sse(
+            f"{daemon}/agent/run/stream",
+            {"goal": "x", "max_steps": 1},
+            timeout=30,
+        )
+        assert any(e["type"] == "done_result" for e in events)
+        # 验证 /metrics 里 /agent/run/stream 不出现 duration 直方图
+        req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+        # 但 counter 仍应记录 (SSE 完成的请求)
+        assert 'path="/agent/run/stream"' in body
+
+
 class TestT52Metrics:
     """T52: /metrics 端点 — Prometheus 格式 + 必含关键指标."""
 

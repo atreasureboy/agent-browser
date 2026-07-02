@@ -23,6 +23,8 @@ from urllib.parse import parse_qs, urlparse
 
 from semantic_browser.engine import SemanticBrowser
 from semantic_browser.snapshot.engine import SnapshotEngine
+from semantic_browser.browser.controller import BrowserConfig, BrowserController
+from semantic_browser.browser.pool import ControllerPool
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +63,37 @@ def _read_pid_file(path: Path) -> tuple[int, str] | None:
 
 
 class _AsyncOwner:
-    """Runs one asyncio loop in a background thread for browser operations."""
+    """Runs one asyncio loop in a background thread for browser operations.
+
+    T54: 持有 ControllerPool (共享 chromium + 多 BrowserContext). 每个 session
+    是一个独立的 BrowserController, 通过 name 区分.
+    """
+
+    DEFAULT_SESSION = "default"
+
+    class _BrowserShim:
+        """Backward-compat: 让 owner.browser.controller.X() 还能工作."""
+
+        def __init__(self, controller: BrowserController) -> None:
+            self.controller = controller
 
     def __init__(self, headless: bool = True, storage_state_path: str | None = None) -> None:
         import threading as _threading
         self.loop = asyncio.new_event_loop()
-        self.browser = SemanticBrowser(headless=headless, storage_state_path=storage_state_path)
+        self.config = BrowserConfig(
+            headless=headless,
+            storage_state_path=os.path.expanduser(storage_state_path) if storage_state_path else None,
+        )
+        # T54: 共享 chromium 进程 + 多 BrowserContext
+        self.pool = ControllerPool(self.config, max_contexts=20)
         self.thread = threading.Thread(target=self._run_loop, name="tb-daemon-loop", daemon=True)
         self.thread.start()
         # T51: 浏览器操作串行化锁 (放在 owner 上, _acquire_op_lock_or_503 直接拿)
         self.op_lock = _threading.Lock()
-        self.run(self.browser.start())
+        self.run(self.pool.start())
+        # 预创建 default session — 保留 .browser 兼容旧代码
+        default_ctrl = self.run(self.pool.acquire(self.DEFAULT_SESSION))
+        self.browser = self._BrowserShim(default_ctrl)
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -83,10 +105,42 @@ class _AsyncOwner:
 
     def close(self) -> None:
         try:
-            self.run(self.browser.close())
+            self.run(self.pool.close())
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=5)
+
+    def get_controller(self, name: str | None = None) -> BrowserController:
+        """T54: 拿指定 session 的 controller, 懒创建 (同步 — 给 HTTP handler thread 用).
+
+        注意: 已经在 event loop 上的 coroutine 不能调这个, 会 deadlock.
+        那种情况直接 await self.pool.acquire(name).
+        """
+        name = name or self.DEFAULT_SESSION
+        return self.run(self.pool.acquire(name))
+
+    async def aget_controller(self, name: str | None = None) -> BrowserController:
+        """T54: async 版本 — 给已经在 event loop 上的 coroutine 用 (不会 deadlock)."""
+        name = name or self.DEFAULT_SESSION
+        return await self.pool.acquire(name)
+
+    def list_sessions(self) -> list[str]:
+        """T54: 列出所有活跃 session 名."""
+        return self.pool.list_active()
+
+    def release_session(self, name: str) -> bool:
+        """T54: 关闭并移除指定 session. 返回是否真释放了一个."""
+        if name == self.DEFAULT_SESSION:
+            return False  # default 不能释放
+
+        async def _release() -> bool:
+            async with self.pool._lock:
+                return self.pool._controllers.pop(name, None) is not None
+
+        try:
+            return self.run(_release())
+        except Exception:
+            return False
 
 
 # T51: 串行化所有 controller 操作, 避免多 HTTP 线程并发改 page state.
@@ -137,8 +191,20 @@ _STATUS_BY_CODE: dict[str, int] = {
     "NETWORK_FAIL": 502,
     "PAGE_NOT_OPENED": 409,
     "DAEMON_BUSY": 503,
+    # T54: session CRUD 错误码
+    "SESSION_NOT_FOUND": 404,
+    "CANNOT_DELETE_DEFAULT": 400,
+    "SESSION_CREATE_FAILED": 503,
     "INTERNAL": 500,
 }
+
+
+class _SessionError(Exception):
+    """T54: session 操作失败的业务异常 — 带 code 用于 HTTP 状态映射."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # T52: 轻量 metrics registry — 不引 prometheus_client, 手写一个足够
@@ -241,6 +307,9 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
         def do_POST(self) -> None:
             daemon._handle(self, "POST")
+
+        def do_DELETE(self) -> None:
+            daemon._handle(self, "DELETE")
 
     return Handler
 
@@ -346,6 +415,12 @@ class TransparentBrowserDaemon:
                     "error": {"code": "DAEMON_BUSY", "message": str(e), "retryable": True},
                 })
                 return
+            # T54: session 错误码走自定义异常, 不经 classify_exception
+            if isinstance(e, _SessionError):
+                final_status = _STATUS_BY_CODE.get(e.code, 500)
+                final_code = e.code
+                self._send(req, final_status, err(e.code, str(e), retryable=False))
+                return
             # T48: 统一走 classify_exception, 错误带 code / message / retryable
             classified = classify_exception(e)
             code = classified["error"]["code"]
@@ -430,7 +505,7 @@ class TransparentBrowserDaemon:
                 "lock_timeout_s": _OP_LOCK_TIMEOUT_S,
             }
         if method == "GET" and path == "/state":
-            return self.owner.run(self._state())
+            return self.owner.run(self._state(session=args.get("session")))
         # T52: Prometheus metrics 端点 — 返回 text/plain, Prometheus 直接抓
         if method == "GET" and path == "/metrics":
             import time as _time
@@ -440,11 +515,33 @@ class TransparentBrowserDaemon:
             body += f"tb_daemon_uptime_seconds {uptime:.2f}\n"
             self._send_raw(req, 200, body, "text/plain; version=0.0.4; charset=utf-8")
             return "_RAW_HANDLED"
+        # T54: session CRUD — list / create / delete
+        if method == "GET" and path == "/sessions":
+            sessions = self.owner.list_sessions()
+            return {"sessions": sessions, "active_count": len(sessions)}
+        if method == "POST" and path == "/sessions":
+            name = args.get("name") or f"agent-{len(self.owner.list_sessions()) + 1}"
+            try:
+                _ = self.owner.get_controller(name)
+            except Exception as e:
+                raise _SessionError("SESSION_CREATE_FAILED", f"{type(e).__name__}: {e}") from None
+            return {"name": name, "created": True, "active": self.owner.list_sessions()}
+        if method == "DELETE" and path.startswith("/sessions/"):
+            name = path[len("/sessions/"):]
+            if not name:
+                raise _SessionError("MISSING_PARAM", "session name required after /sessions/")
+            if name == self.owner.DEFAULT_SESSION:
+                raise _SessionError("CANNOT_DELETE_DEFAULT", "cannot delete default session")
+            released = self.owner.release_session(name)
+            if not released:
+                raise _SessionError("SESSION_NOT_FOUND", f"session {name!r} not found")
+            return {"name": name, "released": True, "active": self.owner.list_sessions()}
         if method == "POST" and path == "/open":
-            return self.owner.run(self._open(args["url"]))
+            return self.owner.run(self._open(args["url"], args.get("session")))
         if method == "GET" and path == "/snapshot":
             return self.owner.run(self._snapshot(
                 detail_level=args.get("detail_level", "normal"),
+                session=args.get("session"),
             ))
         if method == "GET" and path == "/snapshot-vision":
             return self.owner.run(self._snapshot_vision(
@@ -452,15 +549,16 @@ class TransparentBrowserDaemon:
                 provider=args.get("provider"),
                 model=args.get("model"),
                 full_page=bool(args.get("full_page", True)),
+                session=args.get("session"),
             ))
         if method == "GET" and path == "/read":
-            return self.owner.run(self._read(format=args.get("format", "markdown")))
+            return self.owner.run(self._read(format=args.get("format", "markdown"), session=args.get("session")))
         if method == "POST" and path == "/click":
-            return self.owner.run(self._click(args["ref"]))
+            return self.owner.run(self._click(args["ref"], session=args.get("session")))
         if method == "POST" and path == "/click/healed":
             return self.owner.run(self._click_healed(args["ref"]))
         if method == "POST" and path == "/type":
-            return self.owner.run(self._type(args["ref"], args["text"]))
+            return self.owner.run(self._type(args["ref"], args["text"], session=args.get("session")))
         if method == "POST" and path == "/type/healed":
             return self.owner.run(self._type_healed(args["ref"], args["text"]))
         if method == "POST" and path == "/hover":
@@ -852,15 +950,21 @@ class TransparentBrowserDaemon:
             return {"count": len(notes_list), "notes": notes_list}
         raise ValueError(f"unknown endpoint: {method} {path}")
 
-    async def _state(self) -> dict[str, Any]:
-        return {"url": await self.owner.browser.controller.get_url(), "title": await self.owner.browser.controller.get_title()}
+    async def _state(self, session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        return {"url": await ctrl.get_url(), "title": await ctrl.get_title()}
 
-    async def _open(self, url: str) -> dict[str, Any]:
-        result = await self.owner.browser.browse(url)
-        return {"url": result.snapshot.url, "title": result.snapshot.title, "type": result.classification.page_type}
+    async def _open(self, url: str, session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        page = await ctrl.open(url)
+        snap = await SnapshotEngine(page).capture(base_url=url)
+        from semantic_browser.classifier.heuristic import PageClassifier
+        cls = PageClassifier().classify(snap)
+        return {"url": snap.url, "title": snap.title, "type": cls.page_type}
 
-    async def _snapshot(self, detail_level: str = "normal") -> dict[str, Any]:
-        page = self.owner.browser.controller.current_page
+    async def _snapshot(self, detail_level: str = "normal", session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        page = ctrl.current_page
         if page is None:
             raise ValueError("no active page; call /open first")
         return (await SnapshotEngine(page).capture(
@@ -874,35 +978,36 @@ class TransparentBrowserDaemon:
         provider: str | None = None,
         model: str | None = None,
         full_page: bool = True,
+        session: str | None = None,
     ) -> dict[str, Any]:
         """T38: 截图 → vision LLM → 结构化描述."""
         from semantic_browser.snapshot.vision import capture_vision_snapshot
-        page = self.owner.browser.controller.current_page
+        ctrl = await self.owner.aget_controller(session)
+        page = ctrl.current_page
         if page is None:
             raise ValueError("no active page; call /open first")
         vsnap = await capture_vision_snapshot(
-            self.owner.browser.controller,
-            goal=goal,
-            provider=provider,
-            model=model,
-            full_page=full_page,
+            ctrl, goal=goal, provider=provider, model=model, full_page=full_page,
         )
         return vsnap.to_dict()
 
-    async def _read(self, format: str = "markdown") -> dict[str, Any]:
-        page = self.owner.browser.controller.current_page
+    async def _read(self, format: str = "markdown", session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        page = ctrl.current_page
         if page is None:
             raise ValueError("no active page; call /open first")
         from semantic_browser.extractor.content import ContentExtractor
         article = await ContentExtractor(page).extract_article()
         return {"format": format, "content": article.to_markdown() if format == "markdown" else article.to_dict()}
 
-    async def _click(self, ref: str) -> dict[str, Any]:
-        ok = await self.owner.browser.controller.click(ref)
-        return {"success": ok, "url": await self.owner.browser.controller.get_url()}
+    async def _click(self, ref: str, session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        ok = await ctrl.click(ref)
+        return {"success": ok, "url": await ctrl.get_url()}
 
-    async def _type(self, ref: str, text: str) -> dict[str, Any]:
-        ok = await self.owner.browser.controller.type_text(ref, text)
+    async def _type(self, ref: str, text: str, session: str | None = None) -> dict[str, Any]:
+        ctrl = await self.owner.aget_controller(session)
+        ok = await ctrl.type_text(ref, text)
         return {"success": ok, "text_length": len(text)}
 
     async def _click_healed(self, ref: str) -> dict[str, Any]:

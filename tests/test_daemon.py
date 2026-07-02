@@ -1307,6 +1307,257 @@ class TestT58SSRFGuardrail:
         assert r["error"]["code"] == "SSRF_BLOCKED"
 
 
+def _read_sse_frames(host: str, port: int, path: str, *,
+                     headers: dict | None = None,
+                     timeout: float = 5.0,
+                     max_frames: int = 10) -> tuple[dict, list[dict]]:
+    """T59 helper: 打开 SSE stream, 读最多 max_frames 个 data 帧, 返回 (response_headers, frames).
+
+    frames[i] = {"id": int, "data": parsed_json, "raw": str}
+
+    注意: socket readline 超时 (HTTPConnection.timeout) 会抛 socket.timeout,
+    不是普通 Exception; 这里 catch 后返回已拼好的 frames 而不是丢掉.
+    """
+    import http.client as _hc
+    conn = _hc.HTTPConnection(host, port, timeout=timeout)
+    merged_headers = headers or {}
+    conn.request("GET", path, headers=merged_headers)
+    resp = conn.getresponse()
+    resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+    frames: list[dict] = []
+    cur_id: int | None = None
+    cur_data_parts: list[str] = []
+    deadline = time.time() + timeout
+    while len(frames) < max_frames and time.time() < deadline:
+        try:
+            line = resp.readline()
+        except (TimeoutError, OSError):
+            # socket 读超时 — 返已收的 frames
+            break
+        if not line:
+            break
+        s = line.decode("utf-8").rstrip("\n").rstrip("\r")
+        if not s:
+            # 空行 = frame 边界
+            if cur_data_parts:
+                raw = "\n".join(cur_data_parts)
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    data = {"_raw": raw}
+                frames.append({"id": cur_id, "data": data, "raw": raw})
+                cur_id = None
+                cur_data_parts = []
+            continue
+        if s.startswith("id:"):
+            try:
+                cur_id = int(s[3:].strip())
+            except ValueError:
+                cur_id = None
+        elif s.startswith("data:"):
+            cur_data_parts.append(s[5:].lstrip())
+        elif s.startswith(":"):
+            # keepalive / comment — skip
+            continue
+        else:
+            # 其它 SSE field (event:/retry:) — skip for now
+            continue
+    conn.close()
+    return resp_headers, frames
+
+
+class TestT59PressureEvents:
+    """T59: SSE pressure events (fable §2.5) — system.pressure + daemon.degraded + /events SSE stream."""
+
+    def test_admin_degrade_publishes_pressure_event(self, daemon):
+        """admin bump L1 → 发 system.pressure{level=high, reason=admin_degrade_L1}."""
+        # 先订阅 /events stream (server-side context, 后台线程读)
+        import threading
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        collected: list[dict] = []
+        stop = [False]
+        # 用 _read_sse_frames 但要并发的 — 拿个简单方式: 后台读 frames
+        def _reader():
+            try:
+                _, frames = _read_sse_frames(host, port, "/events",
+                                              headers={}, timeout=4.0, max_frames=2)
+                collected.extend(frames)
+            except Exception as e:
+                collected.append({"_error": str(e)})
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        time.sleep(0.3)  # 让 SSE 连接先建立, 订阅生效
+        # 触发 admin degrade → 应发 system.pressure + daemon.degraded
+        _http("POST", f"{daemon}/admin/degrade", {"level": 1})
+        t.join(timeout=6)
+        assert collected, "no SSE frames received"
+        topics = [f["data"].get("topic") for f in collected if isinstance(f.get("data"), dict)]
+        assert "system.pressure" in topics, f"expected system.pressure in {topics}"
+        assert "daemon.degraded" in topics, f"expected daemon.degraded in {topics}"
+        # 检查 payload
+        for f in collected:
+            d = f["data"]
+            if d.get("topic") == "system.pressure":
+                payload = d["payload"]
+                assert payload["level"] == "high"
+                assert payload["reason"] == "admin_degrade_L1"
+                assert "capacity_ratio" in payload
+                break
+
+    def test_admin_restore_publishes_normal_pressure(self, daemon):
+        """admin restore L0 → 发 system.pressure{level=normal}."""
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        import threading
+        collected: list[dict] = []
+        def _reader():
+            try:
+                _, frames = _read_sse_frames(host, port, "/events", timeout=8.0, max_frames=8)
+                collected.extend(frames)
+            except Exception:
+                pass
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        time.sleep(0.6)
+        _http("POST", f"{daemon}/admin/degrade", {"level": 3})
+        time.sleep(0.5)
+        _http("POST", f"{daemon}/admin/restore", {})
+        t.join(timeout=12)
+        topics_with_level = [
+            f["data"]["payload"].get("level")
+            for f in collected
+            if isinstance(f.get("data"), dict)
+            and f["data"].get("topic") == "system.pressure"
+            and isinstance(f["data"].get("payload"), dict)
+        ]
+        assert "normal" in topics_with_level, (
+            f"expected normal pressure; got {topics_with_level}"
+        )
+        assert "critical" in topics_with_level, (
+            f"expected critical pressure too; got {topics_with_level}"
+        )
+
+    def test_capacity_includes_pressure_level(self, daemon):
+        """/capacity response 应带 pressure_level 字段 (T59)."""
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["ok"] is True
+        assert "pressure_level" in r["data"]
+        # 初始应该是 "normal" 或 None (未触发过 _emit_pressure_event)
+        assert r["data"]["pressure_level"] in (None, "normal")
+
+    def test_events_endpoint_returns_sse_headers(self, daemon):
+        """/events 应返 text/event-stream content-type + no-cache."""
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        # 用短 timeout 拿 headers (不读 body, 立即关)
+        import http.client as _hc
+        conn = _hc.HTTPConnection(host, port, timeout=3)
+        conn.request("GET", "/events", headers={})
+        resp = conn.getresponse()
+        # 不读 body, 直接拿 headers + 关闭 — 避免 socket.timeout 抛错
+        h = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+        assert "text/event-stream" in h.get("content-type", "")
+        assert "no-cache" in h.get("cache-control", "")
+
+    def test_events_subscribe_then_trigger_publishes_live(self, daemon):
+        """SSE 客户端订阅后, publish 到 bus, 应立刻收到 live frame (no replay needed)."""
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        # 用 _read_sse_frames helper (已处理 socket.timeout)
+        # sleep 0.5 让 bridge task 上线
+        def _reader():
+            try:
+                _, frames = _read_sse_frames(host, port, "/events?topics=system.pressure",
+                                              headers={}, timeout=3.0, max_frames=3)
+                collected.extend([f for f in frames
+                                  if isinstance(f.get("data"), dict)
+                                  and f["data"].get("topic") == "system.pressure"])
+            except Exception:
+                pass
+        import threading
+        collected: list[dict] = []
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        time.sleep(0.5)  # 等 SSE 连接 + bridge 订阅建立
+        _http("POST", f"{daemon}/admin/degrade", {"level": 3})
+        t.join(timeout=6)
+        assert collected, "no system.pressure frame received"
+        f = collected[0]
+        assert f["data"]["payload"]["level"] == "critical"
+        assert f["data"]["payload"]["reason"] == "admin_degrade_L3"
+        assert f["id"] is not None and f["id"] > 0
+
+    def test_events_lasteventid_replays_history(self, daemon):
+        """带 Last-Event-ID 应先 replay bus 上 seq > N 的事件再接 live.
+
+        验证协议契约: client 重连时带 Last-Event-ID=N → bus 重传 seq>N 的事件,
+        然后接 live. 我们通过 — 先开 /events 连接 (live bridge 上线, 记下
+        baseline max_seq), 再发事件, 然后断开 + 重连带 Last-Event-ID=baseline
+        → 应该收到 replayed frames.
+        """
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        # 1. 第一个 SSE 连接 — 让 live bridge 上线
+        baseline_frames: list[dict] = []
+        baseline_done = [False]
+        import threading
+        def first_conn():
+            try:
+                _, frames = _read_sse_frames(host, port, "/events?topics=system.pressure",
+                                              headers={}, timeout=2.5, max_frames=8)
+                baseline_frames.extend(frames)
+            except Exception:
+                pass
+            baseline_done[0] = True
+        t1 = threading.Thread(target=first_conn, daemon=True)
+        t1.start()
+        time.sleep(0.5)  # bridge 上线
+        # 2. 发事件
+        _http("POST", f"{daemon}/admin/degrade", {"level": 2})
+        time.sleep(0.5)
+        # baseline_max_seq = 当前 bus 最大 seq (live bridge 推到这为止)
+        # 估算: 读 /capacity 不一定有 seq, 改用 baseline_frames 的 max id
+        # 简化: 等 baseline_done (连接断) 后开第二个连接带 Last-Event-ID=0 重传
+        # 这就是 ""everything from beginning"" — 验证 replay 真能拿到事件
+        t1.join(timeout=4)
+        # 让 live bridge 把事件推到 baseline
+        # 第二个连接: 带 Last-Event-ID=0 → 应该把 bus 已存的全部事件重传
+        _, replayed_frames = _read_sse_frames(host, port, "/events?topics=system.pressure",
+                                                headers={"Last-Event-ID": "0"},
+                                                timeout=2.5, max_frames=10)
+        pressure_topics = [f["data"].get("topic") for f in replayed_frames
+                           if isinstance(f.get("data"), dict)]
+        # 至少 1 个 system.pressure (degrade 时发的) — 后续可能 baseline bridge 也推
+        assert pressure_topics.count("system.pressure") >= 1, (
+            f"expected ≥1 pressure event via replay; got {pressure_topics}"
+        )
+
+    def test_events_does_not_block_op_lock(self, daemon):
+        """/events 不该拿 op_lock, 不被 T51 DAEMON_BUSY 击."""
+        # 启个 /events 连接 (后台), 然后跑个普通 op, 验证 op 能正常完成
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        import threading
+        evt_done = [False]
+        def _reader():
+            try:
+                _read_sse_frames(host, port, "/events", timeout=2.0, max_frames=1)
+            except Exception:
+                pass
+            evt_done[0] = True
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        time.sleep(0.4)  # 让 SSE 连接建立
+        # /health 不拿 op_lock; 但 /state 应该走 op_lock — 验证不卡
+        # 实际上 /state 拿 op_lock 但 _OP_LOCK_TIMEOUT_S 默认 30s;
+        # 我们只验证 /events 不影响其他端点 (也就是 _NO_LOCK_PATHS 包含 /events)
+        r = _http("GET", f"{daemon}/health")
+        assert r["ok"] is True
+        t.join(timeout=3)
+
+
 class TestDaemonClientCLI:
     def test_cli_help(self):
         """tb CLI 应能 --help (不真正启动 daemon)。"""

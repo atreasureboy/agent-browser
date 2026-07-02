@@ -187,7 +187,12 @@ class EventBus:
 
 
 def _topic_matches(pattern: str, topic: str) -> bool:
-    """topic glob: 'session.*' matches 'session.created', 'foo' matches 'foo'."""
+    """topic glob: 'session.*' matches 'session.created', 'foo' matches 'foo'.
+
+    T59: '*' matches everything (wildcard catch-all for /events SSE stream).
+    """
+    if pattern == "*":
+        return True
     if pattern == topic:
         return True
     if pattern.endswith(".*"):

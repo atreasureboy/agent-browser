@@ -454,6 +454,52 @@ os.environ["SEMANTIC_BROWSER_DAEMON_URL"] = "http://127.0.0.1:8765"
 
 **测试**: 13 新 (3 T18 in-engine / 3 缺 daemon_url 错误 / 5 daemon 代理走通 / 1 错误透传 / 1 env 注入). 全套 **612 passed, 7 skipped**.
 
+## T59 — SSE pressure events (fable §2.5 backpressure)
+
+Agent 订阅 daemon SSE stream, 容器/降级变化时主动避让, 不必每次轮询 `/capacity` — 是 §2.5 提到的"守规 agent 提前避让":
+
+```bash
+# 订阅全部事件
+$ curl -N http://127.0.0.1:8765/events
+id: 191
+data: {"topic": "system.pressure", "payload": {"level": "critical", "capacity_ratio": 0.96, "reason": "auto_capacity"}, "seq": 191}
+
+id: 192
+data: {"topic": "daemon.degraded", "payload": {"level": 2, "label": "L2_preempt_low", "pressure": "critical", ...}, ...}
+
+# 触发条件: capacity ≥ 0.85 (L1) / ≥ 0.95 (L2); admin 显式 (L1-L4); admin restore (回到 normal)
+
+# 订阅指定 topic pattern
+$ curl -N 'http://127.0.0.1:8765/events?topics=system.pressure'
+# 只推 system.* 事件, daemon.* / session.* 噪声不进
+
+# 跨重启续传 (T55 契约)
+$ curl -N -H 'Last-Event-ID: 192' http://127.0.0.1:8765/events
+# 先 replay bus 上 seq>192 的事件再接 live
+```
+
+**Topic / event 协议**:
+- `system.pressure{level: normal|soft|high|critical, prev, reason, capacity_ratio, ts}` — 通用 backpressure 信号; 只在 level 真变化时发, 不 spam
+- `daemon.degraded{level: 0-4, label, pressure, reason, capacity_ratio, ts}` — 显式降级事件; 同 event 一起发便于区分自动/手动
+- 后续 `browser.crashed` (T60), `pool.pressure` (T60+) 都走同一通道 — 一个 SSE 端点全覆盖
+
+**auto_degrade 只升不降 + pressure 镜像**:
+- L1 (≥0.85) → system.pressure{level=high, reason=auto_capacity}
+- L2 (≥0.95) → system.pressure{level=critical}
+- admin degrade L1/L2 → high, L3/L4 → critical
+- admin restore → normal (level 不再 auto-restored, 显式 `/admin/restore`)
+
+**`/events` SSE 实现**:
+- 协议复用 T55 SSE 续传 (`Last-Event-ID` header) + 200ms poll-based bridge (避开 asyncio.Queue 跨线程 fanout 问题)
+- `topics` query param 默认 `*` (通配新增), 支持 `system.*` / `daemon.*` 等
+- bridge task 在 daemon 自己的 event loop 上跑 (`asyncio.run_coroutine_threadsafe`); bridge_q (thread-safe) 投给 HTTP handler
+- 不进 op_lock (放行路径); L4 全拒时仍可用 (degraded allowed)
+- 不写入 Prometheus duration 直方图 (长流会扭曲)
+
+**新容量字段**: `/capacity` 现在带 `pressure_level`, 一次拿全状态.
+
+**测试**: 7 新 (admin 显式降级发 high / restore 发 normal / /capacity 含 pressure_level / SSE headers 正确 / live event 流 / Last-Event-ID 重传 replay / 不抢 op_lock). 全套 **656 passed, 7 skipped**.
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

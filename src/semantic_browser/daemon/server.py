@@ -14,6 +14,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -362,6 +363,8 @@ class TransparentBrowserDaemon:
         self._ssrf_allowlist: frozenset[str] = ssrf_allowlist or frozenset()
         # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
         self._allow_data_scheme: bool = allow_data_scheme
+        # T59: SSE pressure events — 上次发布的压力等级 (None=未发布, 'normal'/'soft'/'high'/'critical')
+        self._pressure_level: str | None = None
 
     def serve_forever(self) -> None:
         daemon = self
@@ -397,7 +400,7 @@ class TransparentBrowserDaemon:
 
     # T51: 端点白名单 — 不需要 op_lock 的纯只读 / 元数据查询.
     # 其它端点 (open / click / snapshot / discover / etc.) 都串行化, 避免 controller 状态被覆盖.
-    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats", "/capacity", "/metrics"})
+    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats", "/capacity", "/metrics", "/events"})
 
     # T56: 降级检查触发点 — 写 op 在 L3+ 被拒, 全 op 在 L4 被拒
     _WRITE_OPS = frozenset({
@@ -408,8 +411,9 @@ class TransparentBrowserDaemon:
     })
 
     # T56: 降级时仍允许的只读/控制端点 (L4 全拒时除外)
+    # T59: /events 也放行 (agent 仍要订阅降级状态)
     _DEGRADED_ALLOWED = frozenset({
-        "/health", "/queue", "/stats", "/capacity", "/metrics",
+        "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
         "/admin/degrade", "/admin/restore",
     })
 
@@ -417,6 +421,9 @@ class TransparentBrowserDaemon:
         """T56: 基于容量自动升降级 — 不经 Prometheus 回路 (fable §5.7).
         每请求调一次, 0ms 开销, 阈值用 capacity_ratio.
         只升不降 — 降级必须显式 /admin/restore, 防 admin bump 完被自动回落吃掉.
+
+        T59: 同时发 SSE pressure 事件 (system.pressure + daemon.degraded) —
+        agent 订阅 /events 主动避让, 不必每次轮询 /capacity.
         """
         n = len(self.owner.list_sessions())
         max_ = self._capacity_max_contexts
@@ -425,10 +432,49 @@ class TransparentBrowserDaemon:
         if ratio >= 0.85 and self._degradation_level < 1:
             self._degradation_level = 1
             logger.warning("DegradationController: auto-bumped to L1 (capacity_ratio=%.2f)", ratio)
+            self._emit_pressure_event("high", reason="auto_capacity", capacity_ratio=ratio)
         elif ratio >= 0.95 and self._degradation_level < 2:
             self._degradation_level = 2
             logger.warning("DegradationController: auto-bumped to L2 (capacity_ratio=%.2f)", ratio)
+            self._emit_pressure_event("critical", reason="auto_capacity", capacity_ratio=ratio)
         # 不再自动降 — admin/restore 显式降到 L0
+
+    def _emit_pressure_event(self, level: str, *, reason: str,
+                            capacity_ratio: float | None = None) -> None:
+        """T59: 发 SSE pressure 事件 — system.pressure + daemon.degraded.
+
+        只在 level 真变化时发 (避免满屏 spam). ratio 可选 (auto_capacity 时填,
+        admin 显式时 None).
+
+        三层 notification:
+        - system.pressure{level: soft|high|critical}  — 通用 backpressure 信号
+        - daemon.degraded{level, ratio}                — 显式降级事件
+        """
+        if level == self._pressure_level:
+            return  # 没变化 — 不发
+        prev = self._pressure_level
+        self._pressure_level = level
+        # capacity_ratio 计算 (若有)
+        ratio = capacity_ratio
+        if ratio is None:
+            n = len(self.owner.list_sessions())
+            ratio = round(n / max(self._capacity_max_contexts, 1), 3)
+        try:
+            self.event_bus.publish(
+                "system.pressure",
+                {"level": level, "prev": prev, "reason": reason,
+                 "capacity_ratio": ratio, "ts": time.time()},
+            )
+            self.event_bus.publish(
+                "daemon.degraded",
+                {"level": self._degradation_level,
+                 "label": ["L0_healthy", "L1_reject_new", "L2_preempt_low",
+                           "L3_readonly", "L4_full"][self._degradation_level],
+                 "pressure": level, "reason": reason,
+                 "capacity_ratio": ratio, "ts": time.time()},
+            )
+        except Exception:
+            logger.exception("failed to publish pressure event")
 
     def _enforce_degradation(self, method: str, path: str) -> None:
         """T56: 按当前 degradation level 拒绝不该走的请求.
@@ -554,7 +600,7 @@ class TransparentBrowserDaemon:
                     "method": method, "path": path, "code": final_code,
                 })
             # duration 只记非 SSE (SSE 长流会扭曲直方图)
-            if path not in ("/discover/stream", "/agent/run/stream"):
+            if path not in ("/discover/stream", "/agent/run/stream", "/events"):
                 self.metrics.observe("request_duration", {
                     "method": method, "path": path,
                 }, elapsed)
@@ -643,7 +689,14 @@ class TransparentBrowserDaemon:
                 "capacity_ratio": round(len(sessions) / max(self._capacity_max_contexts, 1), 3),
                 "degradation_level": self._degradation_level,
                 "degradation_label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][self._degradation_level],
+                "pressure_level": self._pressure_level or "normal",
             }
+        # T59: /events — SSE stream of all EventBus events (持久 + live)
+        if method == "GET" and path == "/events":
+            if req is None:
+                raise ValueError("/events requires req context")
+            self._stream_events(req, args)
+            return "_SSE_HANDLED"
         # T52: Prometheus metrics 端点 — 返回 text/plain, Prometheus 直接抓
         if method == "GET" and path == "/metrics":
             import time as _time
@@ -660,10 +713,15 @@ class TransparentBrowserDaemon:
                 raise ValueError(f"degradation level must be 1..4, got {level}")
             self._degradation_level = level
             logger.warning("DegradationController: admin set to L%d", level)
+            # T59: admin 显式降级 → 发 pressure (按等级映射)
+            pressure = {1: "high", 2: "high", 3: "critical", 4: "critical"}.get(level, "high")
+            self._emit_pressure_event(pressure, reason=f"admin_degrade_L{level}")
             return {"level": level, "label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][level]}
         if method == "POST" and path == "/admin/restore":
             self._degradation_level = 0
             logger.info("DegradationController: admin restored to L0")
+            # T59: 恢复 → 发 normal pressure (让 agent 解锁)
+            self._emit_pressure_event("normal", reason="admin_restore")
             return {"level": 0, "label": "L0_healthy"}
         # T54: session CRUD — list / create / delete
         if method == "GET" and path == "/sessions":
@@ -1660,6 +1718,171 @@ class TransparentBrowserDaemon:
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("agent_run SSE client disconnected")
+
+    def _stream_events(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
+        """T59: SSE stream of EventBus events — system.pressure + 全部 daemon.* topic.
+
+        Args (query string):
+          topics: 逗号分隔的 topic pattern 列表 (默认 "*" 全部). example: "system.*"
+          since_seq: 可选, 起始游标 (int); 默认用 Last-Event-ID header (W3C SSE)
+
+        Event 格式 (每 frame 一行 JSON data, 带 id):
+          id: <seq>
+          data: {"topic": "system.pressure", "payload": {...}, "ts": ..., "seq": ...}
+
+        协议复用 T55 SSE 续传契约:
+          1. client 不带 Last-Event-ID → 从 max_seq 重启 (默认收到启动后的事件)
+          2. client 带 Last-Event-ID=N → 从 bus 重传 seq>N 的, 再接 live
+          3. 中途断连 → 重连时带 Last-Event-ID (接续)
+
+        实现:
+          - bus.subscribe() 返回 asyncio.Queue; HTTP 线程不能 await 它
+          - 套路: 在 daemon 自己的 event loop 上 schedule 一个 bridge task,
+            从 asyncio.Queue.get() 拿到 record, 用 loop.call_soon_threadsafe
+            通过 thread-safe Queue 投递给 HTTP handler
+        """
+        import json as _json
+
+        topics_param = args.get("topics", "*") or "*"
+        topic_patterns = [t.strip() for t in topics_param.split(",") if t.strip()] or ["*"]
+        # Last-Event-ID header 是 W3C SSE 标准: 客户端最后收到的 event id.
+        # 0 (=header 不存在或 "0") → client 想从开头收
+        # N>0 → client 想从 seq>N 开始 (跳过已收的)
+        last_event_id_hdr = req.headers.get("Last-Event-ID")
+        if last_event_id_hdr is not None:
+            # header 存在 — 显式 cursor (W3C spec)
+            try:
+                last_event_id = int(last_event_id_hdr.strip() or "0")
+            except ValueError:
+                last_event_id = 0
+        else:
+            # header 缺失 — 从 since_seq query param 或默认 0
+            last_event_id = int(args.get("since_seq", 0) or 0)
+
+        # SSE headers
+        req.send_response(200)
+        req.send_header("content-type", "text/event-stream; charset=utf-8")
+        req.send_header("cache-control", "no-cache")
+        req.send_header("x-accel-buffering", "no")
+        req.send_header("connection", "keep-alive")
+        req.end_headers()
+
+        # 1) Replay historical events from bus (跨 / 重连 续传)
+        replayed = 0
+        # 仅在 Last-Event-ID header 存在 OR since_seq>0 时 replay;
+        # 否则 (= 默认 0) 只接 live, 避免每次重连都从头刷一遍老事件
+        since_param = int(args.get("since_seq", 0) or 0)
+        if last_event_id_hdr is not None or since_param > 0:
+            # 全部 topic 走 replay (top-level selector "*") — bus.replay 暂不支持 glob
+            # 拿到所有 seq > last_event_id 的事件, payload 带 topic 可以过滤
+            # 这里简化: 不过滤 (Replay 阶段给 caller 全部; live 再按 topic 过滤)
+            for ev in self.event_bus.replay(since_seq=last_event_id, limit=500):
+                # topic 过滤 (若有 patterns 非 "*")
+                if "*" not in topic_patterns:
+                    ev_topic = ev["topic"]
+                    if not any(_topic_matches_pattern(p, ev_topic) for p in topic_patterns):
+                        continue
+                frame = (b"id: " + str(ev["seq"]).encode("utf-8") + b"\n"
+                         + b"data: " + _json.dumps(
+                             {"topic": ev["topic"], "payload": ev["payload"],
+                              "ts": ev["ts"], "seq": ev["seq"]},
+                             ensure_ascii=False).encode("utf-8") + b"\n\n")
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                    replayed += 1
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+        logger.info("T59 /events: replayed=%d patterns=%s", replayed, topic_patterns)
+
+        # 2) Live events — poll-based bridge (避免 asyncio.Queue 跨线程问题).
+        # 每 0.2s 从 bus.replay(since_seq) 拉新事件, 经 bridge_q 投给 HTTP handler.
+        # 上次最大 seq 持在 last_seq_box (用 list 包 mutable container);
+        # bridge() 内 nonlocal 关键字不能用 (async def 不能直接 nonlocal from outer);
+        # 改用 list 间接更新.
+        bridge_q: queue.Queue = queue.Queue(maxsize=256)
+        stop_bridge = [False]
+        last_seq_box = [self.event_bus.max_seq]
+
+        async def bridge() -> None:
+            try:
+                while not stop_bridge[0]:
+                    events = self.event_bus.replay(since_seq=last_seq_box[0], limit=200)
+                    for ev in events:
+                        # topic 过滤 (bus.replay 全部返回, 这里按 pattern 过滤)
+                        if "*" not in topic_patterns:
+                            ev_topic = ev["topic"]
+                            if not any(_topic_matches_pattern(p, ev_topic) for p in topic_patterns):
+                                last_seq_box[0] = max(last_seq_box[0], ev["seq"])
+                                continue
+                        try:
+                            bridge_q.put_nowait(ev)
+                        except queue.Full:
+                            # 满: 丢最旧 (跟 bus 同样丢策略)
+                            try:
+                                bridge_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                bridge_q.put_nowait(ev)
+                            except queue.Full:
+                                pass
+                        last_seq_box[0] = max(last_seq_box[0], ev["seq"])
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("events bridge crashed")
+
+        # 在 daemon loop 上 schedule bridge task
+        loop_ref = self.owner.loop
+        future = asyncio.run_coroutine_threadsafe(bridge(), loop_ref)
+        try:
+            idle_ticks = 0
+            while True:
+                try:
+                    record = bridge_q.get(timeout=15)
+                    idle_ticks = 0
+                except queue.Empty:
+                    idle_ticks += 1
+                    if idle_ticks > 4:  # 60s 没事件 — 关闭 (防 zombie 连接)
+                        logger.info("T59 /events idle timeout; closing")
+                        break
+                    try:
+                        req.wfile.write(b": keepalive\n\n")
+                        req.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    continue
+                # 写 SSE frame
+                frame = (b"id: " + str(record["seq"]).encode("utf-8") + b"\n"
+                         + b"data: " + _json.dumps(
+                             {"topic": record["topic"], "payload": record["payload"],
+                              "ts": record["ts"], "seq": record["seq"]},
+                             ensure_ascii=False).encode("utf-8") + b"\n\n")
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+        finally:
+            # 停 bridge task
+            stop_bridge[0] = True
+            try:
+                future.cancel()
+            except Exception:
+                pass
+
+
+def _topic_matches_pattern(pattern: str, topic: str) -> bool:
+    """T59 helper: pattern can be 'system.*' or exact 'system.pressure' or '*'."""
+    if pattern == "*":
+        return True
+    if pattern == topic:
+        return True
+    if pattern.endswith(".*"):
+        return topic.startswith(pattern[:-1])
+    return False
 
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service

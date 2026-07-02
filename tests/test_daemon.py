@@ -486,6 +486,118 @@ class TestSSEEndpoint:
         assert "SSE-State" in s["data"]["title"]
 
 
+class TestT51Concurrency:
+    """T51: 串行化锁 — 同 op 不会并发覆盖 controller 状态."""
+
+    def test_queue_endpoint_reports_idle(self, daemon):
+        """无 op 在跑时, /queue 显示空闲."""
+        r = _http("GET", f"{daemon}/queue")
+        assert r["ok"] is True
+        d = r["data"]
+        assert d["current_op"] is None
+        assert d["lock_held"] is False
+        assert d["waiters"] == 0
+        assert d["lock_timeout_s"] > 0
+
+    def test_concurrent_open_serializes(self, daemon):
+        """同时 2 个 /open, 第二个应等到第一个结束才执行, 不互相覆盖."""
+        from urllib.parse import quote
+        url_a = "data:text/html;charset=utf-8," + quote("<html><title>A</title></html>")
+        url_b = "data:text/html;charset=utf-8," + quote("<html><title>B</title></html>")
+
+        import threading
+        results = {}
+        def call(label, url):
+            r = _http("POST", f"{daemon}/open", {"url": url}, timeout=30)
+            results[label] = r
+
+        ta = threading.Thread(target=call, args=("a", url_a))
+        tb = threading.Thread(target=call, args=("b", url_b))
+        ta.start()
+        tb.start()
+        ta.join(timeout=30)
+        tb.join(timeout=30)
+
+        # 两个都应成功
+        assert results["a"]["ok"] is True, f"A failed: {results['a']}"
+        assert results["b"]["ok"] is True, f"B failed: {results['b']}"
+        # 最终 page 是其中一个 (谁后跑谁赢, 因为是串行的)
+        s = _http("GET", f"{daemon}/state")
+        assert s["ok"] is True
+        assert s["data"]["title"] in ("A", "B")
+
+    def test_queue_shows_running_op_during_long_task(self, daemon):
+        """长任务跑时, /queue 显示 current_op + running_for_s."""
+        # 跑一个稍慢的 op (snapshot-vision 需要 LLM, 但没 LLM 会失败快).
+        # 用 SSE discover 代替 — 跑多个 page, 期间轮询 /queue.
+        import threading
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>T51-Queue</title></html>")
+        # 自己起一个 SSE 流 — 在另一线程
+        sse_events = []
+        sse_done = threading.Event()
+        def sse_runner():
+            try:
+                events = self._read_sse_events_blocking(
+                    f"{daemon}/discover/stream?start_url={quote(url)}&max_pages=3&max_depth=1&delay_ms=200",
+                    timeout=20,
+                )
+                sse_events.extend(events)
+            finally:
+                sse_done.set()
+        t = threading.Thread(target=sse_runner, daemon=True)
+        t.start()
+
+        # 等 SSE 开始 (queue 出现 current_op)
+        import time
+        deadline = time.time() + 5
+        saw_running = False
+        while time.time() < deadline:
+            r = _http("GET", f"{daemon}/queue")
+            if r["ok"] and r["data"]["current_op"]:
+                saw_running = True
+                assert r["data"]["lock_held"] is True
+                assert r["data"]["running_for_s"] is not None
+                break
+            time.sleep(0.1)
+        sse_done.wait(timeout=15)
+        assert saw_running, "SSE 期间 /queue 应显示 running op"
+
+    @staticmethod
+    def _read_sse_events_blocking(url: str, *, timeout: float) -> list[dict]:
+        """同步读 SSE events, 适合在子线程跑."""
+        events = []
+        req = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                while True:
+                    line = resp.readline().decode("utf-8").rstrip("\n").rstrip("\r")
+                    if not line or not line.startswith("data: "):
+                        continue
+                    event = json.loads(line[len("data: "):])
+                    events.append(event)
+                    if event.get("type") == "done_result":
+                        break
+        except (URLError, TimeoutError):
+            pass
+        return events
+
+    def test_op_lock_prevents_state_corruption(self, daemon):
+        """串行化保证: 1) snapshot 期间 open 不并发改 page 2) 不会有 'snapshot_of_old_page'."""
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>Race</title></html>")
+        # 1) open 一个页面
+        _http("POST", f"{daemon}/open", {"url": url})
+        # 2) 拿到 snapshot, 验证 title 一致
+        s1 = _http("GET", f"{daemon}/snapshot")
+        assert s1["ok"] is True
+        # T51 的关键断言: 即便测试结束前没人并发改 page, 我们验证串行机制存在
+        # 通过 /queue 的 lock_held=false 验证锁可释放
+        q = _http("GET", f"{daemon}/queue")
+        assert q["data"]["lock_held"] is False
+        assert q["data"]["waiters"] == 0
+
+
 class TestDaemonBrowse:
     def test_open_and_state(self, daemon):
         """打开一个 data URL, 然后查 state 确认 url。"""

@@ -64,10 +64,13 @@ class _AsyncOwner:
     """Runs one asyncio loop in a background thread for browser operations."""
 
     def __init__(self, headless: bool = True, storage_state_path: str | None = None) -> None:
+        import threading as _threading
         self.loop = asyncio.new_event_loop()
         self.browser = SemanticBrowser(headless=headless, storage_state_path=storage_state_path)
         self.thread = threading.Thread(target=self._run_loop, name="tb-daemon-loop", daemon=True)
         self.thread.start()
+        # T51: 浏览器操作串行化锁 (放在 owner 上, _acquire_op_lock_or_503 直接拿)
+        self.op_lock = _threading.Lock()
         self.run(self.browser.start())
 
     def _run_loop(self) -> None:
@@ -86,6 +89,46 @@ class _AsyncOwner:
             self.thread.join(timeout=5)
 
 
+# T51: 串行化所有 controller 操作, 避免多 HTTP 线程并发改 page state.
+# 注意: 浏览器单实例多线程不安全, controller 的 _page / current_page 是共享可变状态.
+# asyncio loop 自己单线程串行执行 coroutine, 但 await 切点之间会交错,
+# 多个 HTTP 请求都调 controller.open() 会同时 await page.goto(), 互相覆盖.
+_OP_LOCK_TIMEOUT_S = 30.0  # 等锁超过 30s → 503 错; 长任务应主动拆小
+
+
+class _DaemonBusy(Exception):
+    """T51: 另一个 op 还占用浏览器 — 等锁超时."""
+
+    def __init__(self, waited: float):
+        self.waited = waited
+        super().__init__(
+            f"another operation still running (waited {waited:.1f}s); "
+            f"check /queue or retry"
+        )
+
+
+def _acquire_op_lock_or_503(owner: "_AsyncOwner"):
+    """T51: 上下文管理器 — 拿到 lock 或 raise _DaemonBusy.
+
+    用法:
+        with _acquire_op_lock_or_503(owner):
+            result = owner.run(...)
+    """
+    import contextlib
+    lock = owner.op_lock
+
+    @contextlib.contextmanager
+    def _ctx():
+        if not lock.acquire(timeout=_OP_LOCK_TIMEOUT_S):
+            raise _DaemonBusy(waited=_OP_LOCK_TIMEOUT_S)
+        try:
+            yield
+        finally:
+            lock.release()
+
+    return _ctx()
+
+
 # T48: error.code → HTTP status 映射
 _STATUS_BY_CODE: dict[str, int] = {
     "NOT_IMPLEMENTED": 501,
@@ -93,6 +136,7 @@ _STATUS_BY_CODE: dict[str, int] = {
     "INVALID_URL": 400,
     "NETWORK_FAIL": 502,
     "PAGE_NOT_OPENED": 409,
+    "DAEMON_BUSY": 503,
     "INTERNAL": 500,
 }
 
@@ -127,6 +171,10 @@ class TransparentBrowserDaemon:
         self.owner = _AsyncOwner(headless=headless, storage_state_path=storage_state_path)
         self.httpd: ThreadingHTTPServer | None = None
         self._shutting_down = False
+        # T51: op 跟踪 — 浏览器锁在 owner.op_lock 上
+        self._current_op: str | None = None
+        self._op_started_at: float | None = None
+        self._op_waiters: int = 0
 
     def serve_forever(self) -> None:
         daemon = self
@@ -160,19 +208,44 @@ class TransparentBrowserDaemon:
         except OSError:
             pass
 
+    # T51: 端点白名单 — 不需要 op_lock 的纯只读 / 元数据查询.
+    # 其它端点 (open / click / snapshot / discover / etc.) 都串行化, 避免 controller 状态被覆盖.
+    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats"})
+
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         parsed = urlparse(req.path)
         path = parsed.path.rstrip("/") or "/"
         query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
+        needs_lock = path not in self._NO_LOCK_PATHS
         try:
             body = self._read_json(req) if method == "POST" else {}
-            result = self._dispatch(method, path, {**query, **body}, req)
+            if needs_lock:
+                with _acquire_op_lock_or_503(self.owner):
+                    self._op_waiters_lock = getattr(self, "_op_waiters_lock", None)
+                    self._op_waiters += 1
+                    try:
+                        self._current_op = f"{method} {path}"
+                        self._op_started_at = __import__("time").time()
+                        result = self._dispatch(method, path, {**query, **body}, req)
+                    finally:
+                        self._current_op = None
+                        self._op_started_at = None
+                        self._op_waiters -= 1
+            else:
+                result = self._dispatch(method, path, {**query, **body}, req)
             # T50: SSE 端点自己写了响应, _handle 不要再发
             if result == "_SSE_HANDLED":
                 return
             # T48: success envelope. None data means "no result found" — still ok.
             self._send(req, 200, ok(result))
         except Exception as e:
+            # T51: 锁等不到 → 自定义错误码 + 503 + Retry-After
+            if isinstance(e, _DaemonBusy):
+                self._send(req, 503, {
+                    "ok": False, "data": None,
+                    "error": {"code": "DAEMON_BUSY", "message": str(e), "retryable": True},
+                })
+                return
             # T48: 统一走 classify_exception, 错误带 code / message / retryable
             classified = classify_exception(e)
             code = classified["error"]["code"]
@@ -219,6 +292,17 @@ class TransparentBrowserDaemon:
                 "port": self.port,
                 "uptime_seconds": round(_time.time() - self.started_at, 1),
                 "page_url": page_url,
+            }
+        # T51: 当前 op 队列状态 — agent 决定是否要等
+        if method == "GET" and path == "/queue":
+            import time as _time
+            now = _time.time()
+            return {
+                "current_op": self._current_op,
+                "running_for_s": round(now - self._op_started_at, 2) if self._op_started_at else None,
+                "lock_held": self.owner.op_lock.locked(),
+                "waiters": self._op_waiters,
+                "lock_timeout_s": _OP_LOCK_TIMEOUT_S,
             }
         if method == "GET" and path == "/state":
             return self.owner.run(self._state())

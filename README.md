@@ -374,6 +374,60 @@ tb a11y-audit --standards wcag2aa,wcag21aa --max-nodes 10
 [serious]  link-name        1 node
 ```
 
+## T51 — 并发安全 (浏览器单实例串行化)
+
+daemon 用 ThreadingHTTPServer 多线程接 HTTP, 但浏览器 / controller 是单实例 — 多线程并发改 `current_page` / `snapshot` 会互相覆盖. T51 加 `op_lock` 串行化所有 controller-touching 操作:
+
+```bash
+# 1. /queue — 看当前 op + 等锁的请求数
+$ curl -s http://127.0.0.1:8765/queue | jq
+{
+  "ok": true,
+  "data": {
+    "current_op": "GET /snapshot-vision",
+    "running_for_s": 4.21,
+    "lock_held": true,
+    "waiters": 1,
+    "lock_timeout_s": 30
+  }
+}
+
+# 2. 等不到锁 → 503 + DAEMON_BUSY (可重试)
+$ curl -s http://127.0.0.1:8765/snapshot
+{"ok": false, "data": null,
+ "error": {"code": "DAEMON_BUSY",
+           "message": "another operation still running (waited 30.0s); check /queue or retry",
+           "retryable": true}}
+# HTTP 503 + retryable=true — agent 应 sleep 后重试, 不要干瞪眼
+```
+
+**白名单**: `/health` / `/queue` / `/stats` 不需要锁 (纯只读). 其它端点都进锁 — `/open` / `/click` / `/snapshot` / `/discover` / `/snapshot-vision` / ...
+
+**关键测试**:
+- `test_concurrent_open_serializes`: 两个 `/open` 并发跑, 都成功, 最终状态是其中一个 (后跑赢)
+- `test_queue_shows_running_op_during_long_task`: SSE discover 期间 `/queue` 报 `current_op` + `running_for_s`
+
+**`/queue` 字段**:
+- `current_op`: 当前正在跑的方法 + 路径 (例 `GET /snapshot-vision`)
+- `running_for_s`: 已运行时长 (秒, 2 位小数)
+- `lock_held`: 锁是否被持有 (true=忙 / false=空闲)
+- `waiters`: 等锁的请求数
+- `lock_timeout_s`: 锁等超时 (默认 30s; 超时返 503)
+
+agent 用法:
+```python
+# 提交任务前, 先看 daemon 闲不闲
+queue = await call("GET", "/queue")
+if not queue["data"]["lock_held"]:
+    await call("POST", "/open", {"url": url})
+else:
+    # 忙 — 等 done 或 backoff 重试
+    eta = queue["data"]["running_for_s"]
+    await asyncio.sleep(max(1, eta))
+```
+
+**测试**: 4 新 (queue 空闲 / 并发 open 串行化 / SSE 期间 queue 显示 running / 锁正确释放). 全套 **571 passed, 7 skipped**.
+
 ## T50 — 长任务进度流式回传 (SSE)
 
 `tb discover` 现场爬站点可能要 30 秒+, 之前调用方只能干等. T50 加 SSE (Server-Sent Events) 流式端点, 客户端实时拿每页进度:

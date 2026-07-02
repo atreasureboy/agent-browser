@@ -4261,12 +4261,41 @@ class TestT39DeepSnapshot:
         assert "set-cookie" in headers
 
     def test_get_response_headers_not_found(self):
-        """get_response_headers: 没找到 → 返回 None."""
+        """get_response_headers: 没找到 + httpx 也连不上 → 返回 None."""
         import asyncio
         from semantic_browser.browser.controller import BrowserController, BrowserConfig
         ctrl = BrowserController(BrowserConfig())
-        result = asyncio.run(ctrl.get_response_headers("https://never-seen.com/"))
+        # 用 .invalid TLD 强制 DNS 失败, 不依赖真实网络
+        result = asyncio.run(ctrl.get_response_headers("https://nonexistent-host-for-test.invalid/"))
         assert result is None
+
+    def test_get_response_headers_httpx_fallback_when_not_navigated(self, monkeypatch):
+        """T46 回归: 用户给了 URL 但没 open 过 → 走 httpx 兜底, 不再返回 None.
+
+        Bug: 原版只查 _network_requests 缓存, fresh install 用户第一次跑
+        `tb security-headers https://example.com` 就拿到 null 直接懵.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.headers = {"Server": "nginx", "Content-Type": "text/html"}
+        fake_client = AsyncMock()
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=None)
+        fake_client.head = AsyncMock(return_value=fake_resp)
+
+        import httpx
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: fake_client)
+
+        ctrl = BrowserController(BrowserConfig())
+        result = asyncio.run(ctrl.get_response_headers("https://never-navigated.example.com/"))
+        assert result is not None
+        assert result["server"] == "nginx"
+        fake_client.head.assert_awaited_once()
 
     def test_on_response_with_headers_pops_latest(self):
         """_on_response 把 headers 写回最近一条匹配的 request."""

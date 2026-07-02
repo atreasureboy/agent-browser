@@ -824,6 +824,16 @@ class BrowserController:
             for req in reversed(self._network_requests):
                 if req.get("url") == full and req.get("response_headers"):
                     return req["response_headers"]
+        # 兜底2: 用户给了 URL 但还没 open 过 — 用 httpx 直接 GET 拿头 (不跑 body)
+        if url.startswith(("http://", "https://")):
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                    r = await client.head(url, headers={"User-Agent": "semantic-browser/0.1"})
+                    if r.status_code < 400:
+                        return {k.lower(): v for k, v in r.headers.items()}
+            except Exception:
+                pass
         return None
 
     async def get_dom_diff(self, before_refs: set[str]) -> dict[str, Any]:

@@ -4,6 +4,38 @@
 
 **不是又一个浏览器工具，而是 Chromium 之上的 Site Intelligence Layer。**
 
+## 这是给谁用的？三个具体场景
+
+**1. 你在写一个 agent，agent 需要"看懂"网页**
+普通浏览器给 agent 的是像素 + DOM 字符串。Semantic Browser 给的是结构化 snapshot（页面类型 / 文本块 / 链接 ref / 表单字段 / 控件 / meta），agent 直接消费不用解析。
+
+```bash
+tb open https://blog.python.org/
+tb snapshot --json-out | jq '.text_blocks, .links'
+```
+
+**2. 你在做 web scraping，被 JS-heavy 站点卡住**
+Playwright 能跑 JS，但拿到的 HTML 是噪音。snapshot 给你的是 article / docs / search / login / list / dashboard / error 分类后的语义结构，外加 heal-click (自动重试点错时换 selector)。
+
+```bash
+tb open https://spa-heavy-site.example/
+tb snapshot --json-out | jq '.page_type, .forms'
+tb heal-click e5   # e5 失效时自动找最相近的可点元素
+```
+
+**3. 你在做 security recon / 站点巡检**
+39 项 site intelligence 工具 (T40–T44)：子域名枚举、DNS / SPF / DMARC、TLS cert SAN、JS secret 扫描、WAF 指纹、开放重定向 sink、DOM XSS sink、IDOR-prone URL、云资源泄露、CSP 深度解析、2FA / OAuth 检测、子域接管信号...
+
+```bash
+tb dns-records github.com              # SPF ~all? DMARC p=none?
+tb enumerate-subdomains github.com     # crt.sh + TLS SAN
+tb extract-secrets-from-js             # AWS key / GitHub token / Bearer
+tb find-xss-sinks                      # eval / innerHTML / document.cookie
+tb check-subdomain-takeover example.com
+```
+
+→ 完整工具列表见 [T40–T44 章节](#安全审计增强套件-t40--t42)。
+
 ## 核心理念
 
 普通浏览器是给人看的（像素画面 + 鼠标点击）。Semantic Browser 是给 Agent 看的：

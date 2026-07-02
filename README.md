@@ -599,6 +599,47 @@ POST /sessions/{id}/snapshots/sweep — 手动触发 sweep (管理员)
 
 **测试**: 8 新 SnapshotStore unit (`test_snapshot.py` 覆盖 mark dirty / take / open_pages / roundtrip / truncate > 2MB / GC 留 3 份 / list newest first). daemon integration 验证 sweeper 起动 + shutdown. 全套 **667 passed, 7 skipped**.
 
+## T62 — Graceful drain on SIGTERM (fable §5.8)
+
+daemon 收到 SIGTERM/SIGINT 改用 `shutdown()` 走完整 drain, 而不是直接 OS-default 退出. 之前在飞的 RPC 会断、agent 重连拿 connection reset, 整个工作流得重新跑. T62 把流程拆成三段:
+
+```text
+  signal SIGTERM
+        │
+        ▼
+  _begin_drain()   ── 标 _draining=True + 发 daemon.draining 事件到 bus
+        │
+        │ (后台 drain 线程, 不阻塞 signal handler)
+        ▼
+  _finish_shutdown_after_drain()
+        │ 等待 (默认 30s):
+        │  • 当前 op 完成 (op_lock 释放)
+        │  • 或 drain_timeout 到 → 发 daemon.drain_timeout 事件后强制
+        ▼
+  _finish_shutdown()  ── watchdog/sweeper task 取消 → httpd.shutdown() → owner.close()
+```
+
+**对 agent 的契约**:
+- drain 中所有 write op（`/open` / `/click` / `/agent/run` 等）返 `503 DAEMON_DRAINING` + `Retry-After: 5`，body 带 `error.draining: true`
+- 只读观测（`/health` / `/queue` / `/capacity` / `/metrics` / `/events` / `/admin/*`）照常工作 — agent 可以订阅 `/events?topics=daemon.*` 提前得到 `daemon.draining` 通知并切到备用节点
+- in-flight op 跑完才真关；如果超 30s 还卡，发 `daemon.drain_timeout{op, held_seconds}` 警告后强制
+
+**新增端点** `POST /admin/drain`（ops/测试手动触发，无需真杀进程）：
+```bash
+$ curl -X POST http://127.0.0.1:8765/admin/drain
+{"ok": true, "data": {"draining": true, "drain_timeout_s": 30.0, ...}}
+```
+
+**改动**:
+- `daemon/server.py`: `DAEMON_DRAINING` 错误码 (503) + `_DrainError` 异常 + `_begin_drain()` / `_finish_shutdown_after_drain()` / `_finish_shutdown()` 三段；`/health` 加 `draining / drain_elapsed_s / drain_timeout_s / in_flight_op` 字段；`POST /admin/drain` 端点；CLI `--drain-timeout=30`
+- `shutdown()` 改为只标记 + 启动后台线程，不阻塞信号 handler
+
+**测试**: 11 新 `TestT62GracefulDrain`（4 单元 + 7 集成），核心覆盖：
+- 单元: `_enforce_drain` 在 drain 中拒写、放观测；`_begin_drain` 幂等；`DAEMON_DRAINING` → 503
+- 集成: `/health.draining=false` 初始；`POST /admin/drain` → `/health` 报 `draining=true`；新 op 拿 503 + Retry-After:5；`/health /queue /metrics` drain 中仍可用；`daemon.draining` 事件进 bus
+
+全套 **678 passed, 7 skipped** （+11 vs T61 套件）。
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

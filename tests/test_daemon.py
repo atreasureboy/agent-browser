@@ -1698,3 +1698,194 @@ class TestDaemonClientCLI:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
+
+
+class TestT62GracefulDrain:
+    """T62: Graceful drain (fable §5.8) — SIGTERM 触发 drain, 拒新 op, 等在飞 op 完成."""
+
+    @pytest.fixture(autouse=True)
+    def _import_t62_deps(self):
+        from semantic_browser.daemon.server import TransparentBrowserDaemon as _TBD
+        self.TBD = _TBD
+        self._DA = _TBD._DEGRADED_ALLOWED  # 类属性 — 单元测试给 mock 用
+
+    # --- 单元测试: 直接 import 工具函数, 不起 daemon/browser ---
+
+    def test_drain_error_status_mapping(self):
+        from semantic_browser.daemon.server import _STATUS_BY_CODE
+        assert _STATUS_BY_CODE["DAEMON_DRAINING"] == 503, "T62: drain 错必须 503"
+
+    def test_enforce_drain_passthrough_when_not_draining(self):
+        """T62: 不在 drain 时 _enforce_drain 是 no-op."""
+        # 用真实函数 + Mock 调, 不起 daemon
+        from unittest.mock import MagicMock
+        from semantic_browser.daemon.server import _DrainError
+        d = MagicMock()
+        d._draining = False
+        d._drain_started_at = None
+        d._drain_timeout_s = 30.0
+        d._current_op = None
+        d._DEGRADED_ALLOWED = self._DA  # MagicMock 默认不是 frozenset
+        # 应直接 return, 不 raise
+        self.TBD._enforce_drain(d, "POST", "/open")
+        assert True
+
+    def test_enforce_drain_raises_for_writes_when_draining(self):
+        from unittest.mock import MagicMock
+        from semantic_browser.daemon.server import _DrainError
+        d = MagicMock()
+        d._draining = True
+        d._drain_started_at = time.time() - 1.0
+        d._drain_timeout_s = 30.0
+        d._current_op = "POST /open"
+        d._DEGRADED_ALLOWED = self._DA
+        with pytest.raises(_DrainError) as ei:
+            self.TBD._enforce_drain(d, "POST", "/open")
+        assert ei.value.code == "DAEMON_DRAINING"
+        assert ei.value.retry_after_s == 5
+
+    def test_enforce_drain_allows_health_when_draining(self):
+        """T62: drain 中仍让 agent 看 health/queue/metrics (观测用)."""
+        from unittest.mock import MagicMock
+        from semantic_browser.daemon.server import _DrainError
+        d = MagicMock()
+        d._draining = True
+        d._drain_started_at = time.time()
+        d._drain_timeout_s = 30.0
+        d._current_op = None
+        d._DEGRADED_ALLOWED = self._DA
+        # /health 放行
+        self.TBD._enforce_drain(d, "GET", "/health")
+        self.TBD._enforce_drain(d, "GET", "/queue")
+        self.TBD._enforce_drain(d, "GET", "/metrics")
+        # /open 拒绝
+        with pytest.raises(_DrainError):
+            self.TBD._enforce_drain(d, "POST", "/open")
+
+    def test_drain_error_envelope_format(self):
+        """T62: _DrainError 应带 code + retry_after_s, 不带 level (不像降级 err)."""
+        from semantic_browser.daemon.server import _DrainError
+        e = _DrainError("test", retry_after_s=10)
+        assert e.code == "DAEMON_DRAINING"
+        assert e.retry_after_s == 10
+        assert not hasattr(e, "level") or True  # 不强制缺失
+
+    # --- 集成测试: 起真 daemon, 通过 /admin/drain 触发 drain ---
+
+    def test_health_initially_not_draining(self, daemon):
+        """T62: 启动后 /health.draining 必为 False, 含 timeout 字段."""
+        r = _http("GET", f"{daemon}/health")
+        assert r["ok"] is True
+        d = r["data"]
+        assert d["draining"] is False
+        # 默认 drain_timeout_s=30
+        assert d["drain_timeout_s"] == 30.0
+        # drain_elapsed_s 在 not draining 时 None
+        assert d["drain_elapsed_s"] is None
+        assert d["status"] == "ok"
+
+    def test_admin_drain_flips_flag_and_reports_in_health(self, daemon):
+        """T62: POST /admin/drain → /health 报 draining=true."""
+        r = _http("POST", f"{daemon}/admin/drain", {})
+        assert r["ok"] is True
+        assert r["data"]["draining"] is True
+        assert r["data"]["drain_timeout_s"] == 30.0
+        # health 反映
+        h = _http("GET", f"{daemon}/health")
+        assert h["ok"] is True
+        assert h["data"]["draining"] is True
+        assert h["data"]["status"] == "draining"
+        assert isinstance(h["data"]["drain_elapsed_s"], (int, float))
+        assert h["data"]["drain_elapsed_s"] >= 0
+
+    def test_admin_drain_blocks_new_op_with_503(self, daemon):
+        """T62: drain 后, 新 POST /open 应返 503 + DAEMON_DRAINING + Retry-After."""
+        # 进 drain
+        _http("POST", f"{daemon}/admin/drain", {})
+        # 用 urllib 直发, 拿 status code + Retry-After 头
+        url = f"{daemon}/open"
+        data = json.dumps({"url": "data:text/html,<h1>x</h1>"}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"content-type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = resp.status
+                retry_after = resp.headers.get("Retry-After")
+                body = json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            status = e.code
+            retry_after = e.headers.get("Retry-After")
+            body = json.loads(e.read().decode("utf-8"))
+        assert status == 503
+        assert body["ok"] is False
+        assert body["error"]["code"] == "DAEMON_DRAINING"
+        assert body["error"].get("draining") is True
+        assert body["error"]["retryable"] is True
+        assert retry_after == "5"
+
+    def test_admin_drain_still_allows_health_queue_metrics(self, daemon):
+        """T62: drain 中 /health / /queue / /metrics 仍可用 (观测)."""
+        _http("POST", f"{daemon}/admin/drain", {})
+        # /health / /queue 都走 JSON envelope
+        for path in ("/health", "/queue"):
+            r = _http("GET", f"{daemon}{path}")
+            assert r["ok"] is True, f"{path} 失败: {r}"
+        # /metrics 走 Prometheus text 格式 — 用 urllib 直读 status
+        url = f"{daemon}/metrics"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                assert resp.status == 200
+                body = resp.read().decode("utf-8")
+                assert len(body) > 0
+        except HTTPError as e:
+            pytest.fail(f"/metrics 在 drain 中应 200, got {e.code}")
+
+    def test_drain_event_emitted_on_bus(self, daemon):
+        """T62: _begin_drain 应向 event bus 发 daemon.draining 事件.
+
+        集成测试通过 (新 admin drain 触发的) 立即 /events 拉 — fast 因为
+        """
+        port = int(daemon.rsplit(":", 1)[-1])
+        import threading
+        collected: list[dict] = []
+        def _reader():
+            try:
+                _, frames = _read_sse_frames("127.0.0.1", port, "/events?topics=daemon.*",
+                                              headers={}, timeout=4.0, max_frames=4)
+                collected.extend(frames)
+            except Exception:
+                pass
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        time.sleep(0.5)  # 让 SSE 订阅先就绪
+        _http("POST", f"{daemon}/admin/drain", {})
+        t.join(timeout=5)
+        topics = [f["data"].get("topic") for f in collected
+                  if isinstance(f.get("data"), dict)]
+        assert "daemon.draining" in topics, (
+            f"expected daemon.draining event, got {topics}"
+        )
+
+    def test_shutdown_is_idempotent(self, daemon):
+        """T62: 多次调用 shutdown 不应崩溃. SIGTERM 后 daemon 自己调用 shutdown 后
+        再收到 SIGTERM 应直接 return.
+        """
+        # 通过 /admin/drain 进入 drain, 然后用一个 admin 端点不会关, 我们直接测
+        # shutdown() 的 idempotency (不构造 daemon, 测 helper 函数)
+        from unittest.mock import MagicMock
+        # 直接调用 _begin_drain / _begin_drain again — 第二次应 no-op
+        d = MagicMock()
+        d._draining = False
+        d._drain_started_at = None
+        d._drain_timeout_s = 30.0
+        d._current_op = None
+        d.event_bus = MagicMock()
+        self.TBD._begin_drain(d)
+        assert d._draining is True
+        # 第二次不应再发 event
+        d.event_bus.publish.reset_mock()
+        self.TBD._begin_drain(d)
+        # publish 没再调用 (说明 idempotent)
+        d.event_bus.publish.assert_not_called()

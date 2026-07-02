@@ -209,6 +209,8 @@ _STATUS_BY_CODE: dict[str, int] = {
     "SERVICE_UNAVAILABLE": 503,  # L4: 全拒
     # T58: SSRF blocked — fable §7.1 (URL 命中私网/meta)
     "SSRF_BLOCKED": 400,
+    # T62: 收到 SIGTERM, daemon 进入 drain — 拒新 op, 等在飞完成
+    "DAEMON_DRAINING": 503,
     "INTERNAL": 500,
 }
 
@@ -228,6 +230,18 @@ class _DegradationError(Exception):
         super().__init__(message)
         self.code = code
         self.level = level
+
+
+class _DrainError(Exception):
+    """T62: daemon 在 drain 状态, 拒新 op — 让 agent 重试或换节点.
+
+    比 _DegradationError 简洁: 没有 level, 只有一个 reason.
+    """
+
+    def __init__(self, message: str, retry_after_s: int = 5) -> None:
+        super().__init__(message)
+        self.code = "DAEMON_DRAINING"
+        self.retry_after_s = retry_after_s
 
 
 # T52: 轻量 metrics registry — 不引 prometheus_client, 手写一个足够
@@ -338,7 +352,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, drain_timeout_s: float = 30.0) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -379,6 +393,12 @@ class TransparentBrowserDaemon:
         self.snapshot_store = SnapshotStore(snapshots_root, snapshots_db)
         self._sweep_interval_s = sweep_interval_s
         self._sweep_task: asyncio.Task | None = None
+        # T62: graceful drain (fable §5.8)
+        # SIGTERM/SIGINT 触发 _draining 标记, 拒新 op, 等在飞完成, 然后真退出.
+        self._draining: bool = False
+        self._drain_started_at: float | None = None
+        self._drain_timeout_s: float = drain_timeout_s
+        self._drain_event = threading.Event()  # 用于跨线程等 op_lock 释放
 
     def serve_forever(self) -> None:
         daemon = self
@@ -459,10 +479,68 @@ class TransparentBrowserDaemon:
             logger.exception("failed to publish heartbeat")
 
     def shutdown(self) -> None:
-        """T49: 优雅关闭 — 停 http server + 关闭 browser + 删 PID 文件."""
+        """T49/T62: 优雅关闭 — 走完整 drain 流程: 标记 draining → 等在飞
+        op 完成（或超时） → 真退出. 同步签名，调用方（信号 handler）拿到的
+        是 drain 启动后的不等结果。实际等待由后台 drain 线程完成.
+        """
         if self._shutting_down:
             return
+        self._begin_drain()
+        # 实际 close 在后台线程做 — 信号 handler 不能阻塞
+        threading.Thread(target=self._finish_shutdown_after_drain,
+                         name="tb-daemon-drain", daemon=True).start()
+
+    def _begin_drain(self) -> None:
+        """T62: 标记 daemon 开始 drain — 新 op 拿 503, /health 报 draining.
+
+        idempotent: 多次调用安全.
+        """
+        if self._draining:
+            return
+        self._draining = True
+        self._drain_started_at = time.time()
         self._shutting_down = True
+        # 通知在飞的 op — 走 event bus, agent 订阅可见
+        try:
+            self.event_bus.publish(
+                "daemon.draining",
+                {"drain_timeout_s": self._drain_timeout_s,
+                 "in_flight": self._current_op,
+                 "ts": self._drain_started_at},
+            )
+        except Exception:
+            logger.exception("drain: failed to publish daemon.draining")
+        logger.warning("daemon draining (timeout=%ds, in_flight=%r)",
+                       int(self._drain_timeout_s), self._current_op)
+
+    def _finish_shutdown_after_drain(self) -> None:
+        """T62: 实际关闭 — 等在飞 op 完成 (或超时) → 关 event loop/资源."""
+        # 等当前 op (若在飞) 完成, 或 drain 超时
+        if self._current_op is not None and self._op_started_at is not None:
+            deadline = self._drain_started_at + self._drain_timeout_s if self._drain_started_at else time.time() + self._drain_timeout_s
+            # 短间隔轮询 op_lock — 不抢锁, 只是等释放
+            while self.owner.op_lock.locked() and time.time() < deadline:
+                time.sleep(0.05)
+            held_for = time.time() - (self._op_started_at or time.time())
+            if self.owner.op_lock.locked():
+                logger.warning(
+                    "drain timeout: op %r still holding lock after %.1fs, forcing close",
+                    self._current_op, held_for,
+                )
+                try:
+                    self.event_bus.publish(
+                        "daemon.drain_timeout",
+                        {"op": self._current_op, "held_seconds": round(held_for, 1)},
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.info("drain: in-flight op completed after %.1fs", held_for)
+        self._drain_event.set()  # 通知任何阻塞 wait 的线程
+        self._finish_shutdown()
+
+    def _finish_shutdown(self) -> None:
+        """T62: 实际关闭 httpd / owner / snapshot store."""
         # T60: 停 watchdog 后台 task
         if self._watchdog_task is not None:
             try:
@@ -659,6 +737,19 @@ class TransparentBrowserDaemon:
                 level,
             )
 
+    def _enforce_drain(self, method: str, path: str) -> None:
+        """T62: drain 中 — 拒新 op. /health / /queue / /metrics 继续可用以便观测."""
+        if not self._draining:
+            return
+        if path in self._DEGRADED_ALLOWED:
+            return  # 仍让 agent 看 drain 状态
+        elapsed = (time.time() - self._drain_started_at) if self._drain_started_at else 0.0
+        raise _DrainError(
+            f"daemon draining ({elapsed:.1f}s elapsed, timeout={int(self._drain_timeout_s)}s); "
+            f"in_flight={self._current_op!r} — retry against a healthy daemon after drain completes",
+            retry_after_s=5,
+        )
+
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         import time as _time
         parsed = urlparse(req.path)
@@ -673,6 +764,8 @@ class TransparentBrowserDaemon:
         try:
             # T56: 降级阻挡 — 在拿 op_lock 前就拒 (L4 情况连锁都不该争)
             self._enforce_degradation(method, path)
+            # T62: drain 阻挡 — 在拿 op_lock 前就拒 (在飞的让它跑完, 新的一律拒)
+            self._enforce_drain(method, path)
             body = self._read_json(req) if method == "POST" else {}
             if needs_lock:
                 lock_wait_start = _time.time()
@@ -730,6 +823,18 @@ class TransparentBrowserDaemon:
                         "retryable": True, "level": e.level,
                     },
                 }, {"Retry-After": "30"})
+                return
+            # T62: drain 阻挡 — 503 + Retry-After (agent 应换节点或挂起)
+            if isinstance(e, _DrainError):
+                final_status = _STATUS_BY_CODE.get(e.code, 503)
+                final_code = e.code
+                self._send_with_extra_headers(req, final_status, {
+                    "ok": False, "data": None,
+                    "error": {
+                        "code": e.code, "message": str(e),
+                        "retryable": True, "draining": True,
+                    },
+                }, {"Retry-After": str(e.retry_after_s)})
                 return
             # T48: 统一走 classify_exception, 错误带 code / message / retryable
             classified = classify_exception(e)
@@ -799,6 +904,7 @@ class TransparentBrowserDaemon:
     def _dispatch(self, method: str, path: str, args: dict[str, Any], req: BaseHTTPRequestHandler | None = None) -> Any:
         if method == "GET" and path == "/health":
             # T49: 健康检查带上下文 — pid / uptime / 当前页 URL, agent 排查时省一次 roundtrip
+            # T62: drain 状态 — agent 看到 draining=true 时切到备份节点
             import time as _time
             page_url = None
             try:
@@ -809,13 +915,24 @@ class TransparentBrowserDaemon:
                     page_url = page.url
             except Exception:
                 pass
+            status = "draining" if self._draining else "ok"
+            elapsed = (
+                round(_time.time() - self._drain_started_at, 1)
+                if (self._draining and self._drain_started_at)
+                else None
+            )
             return {
-                "status": "ok",
+                "status": status,
                 "pid": os.getpid(),
                 "host": self.host,
                 "port": self.port,
                 "uptime_seconds": round(_time.time() - self.started_at, 1),
                 "page_url": page_url,
+                # T62: drain 字段
+                "draining": self._draining,
+                "drain_elapsed_s": elapsed,
+                "drain_timeout_s": self._drain_timeout_s,
+                "in_flight_op": self._current_op,
             }
         # T51: 当前 op 队列状态 — agent 决定是否要等
         if method == "GET" and path == "/queue":
@@ -891,6 +1008,13 @@ class TransparentBrowserDaemon:
             # T59: 恢复 → 发 normal pressure (让 agent 解锁)
             self._emit_pressure_event("normal", reason="admin_restore")
             return {"level": 0, "label": "L0_healthy"}
+        # T62: /admin/drain — 显式触发 drain (无需 SIGTERM, 给 ops/测试用).
+        # 仅翻标志, 不退出进程; 真实 drain+exit 仍由 SIGTERM 走 shutdown().
+        if method == "POST" and path == "/admin/drain":
+            self._begin_drain()
+            return {"draining": True, "in_flight": self._current_op,
+                    "drain_started_at": self._drain_started_at,
+                    "drain_timeout_s": self._drain_timeout_s}
         # T54: session CRUD — list / create / delete
         if method == "GET" and path == "/sessions":
             sessions = self.owner.list_sessions()
@@ -2128,6 +2252,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="T60: K — 每实例 BrowserContext 上限 (fable §1.2 默认 16)")
     parser.add_argument("--watchdog-interval", type=float, default=5.0,
                         help="T60: 心跳 watchdog tick 间隔秒 (0=关闭)")
+    parser.add_argument("--drain-timeout", type=float, default=30.0,
+                        help="T62: SIGTERM 后等在飞 op 完成的最长秒数 (fable §5.8)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -2149,6 +2275,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_data_scheme=args.allow_data_scheme,
         m_browsers=args.m_browsers, k_contexts=args.k_contexts,
         watchdog_interval_s=args.watchdog_interval,
+        drain_timeout_s=args.drain_timeout,
     )
 
     # T49: 优雅关闭 — SIGTERM/SIGINT 触发 shutdown() 而不是 OS 默认退出 (会跳过 finally)

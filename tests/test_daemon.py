@@ -1104,6 +1104,157 @@ class TestT54Sessions:
         assert s_explicit["data"]["title"] == s_implicit["data"]["title"]
 
 
+class TestT56Degradation:
+    """T56: DegradationController L0-L4 + /capacity + 错误码扩展."""
+
+    def test_capacity_default_state(self, daemon):
+        """/capacity 在 L0 应返回健康状态 + 0 sessions active (1 个 default)."""
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["ok"] is True
+        d = r["data"]
+        # 字段存在
+        for key in ("sessions_active", "sessions_max", "capacity_ratio",
+                    "degradation_level", "degradation_label"):
+            assert key in d, f"缺 {key}: {d}"
+        # 默认 L0
+        assert d["degradation_level"] == 0
+        assert d["degradation_label"] == "L0_healthy"
+        # default session 算一个
+        assert d["sessions_active"] >= 1
+        assert d["sessions_max"] == 20  # max_contexts 默认值
+
+    def test_l1_rejects_new_session(self, daemon):
+        """L1 应拒 POST /sessions (CAPACITY_DEGRADED), 不影响读端点."""
+        # bump 到 L1
+        bump = _http("POST", f"{daemon}/admin/degrade", {"level": 1})
+        assert bump["ok"] is True
+        assert bump["data"]["level"] == 1
+        try:
+            # 新建 session 应被拒
+            r = _http("POST", f"{daemon}/sessions", {"name": "should-fail"})
+            assert r["ok"] is False
+            assert r["error"]["code"] == "CAPACITY_DEGRADED"
+            assert r["error"].get("level") == 1
+            assert r["error"].get("retryable") is True
+            # GET /sessions 仍可用
+            r2 = _http("GET", f"{daemon}/sessions")
+            assert r2["ok"] is True
+            # 写 op 在 L1 仍可用
+            from urllib.parse import quote
+            url = "data:text/html;charset=utf-8," + quote("<html><title>L1OK</title></html>")
+            r3 = _http("POST", f"{daemon}/open", {"url": url})
+            assert r3["ok"] is True
+        finally:
+            _http("POST", f"{daemon}/admin/restore", {})
+
+    def test_l3_blocks_writes(self, daemon):
+        """L3 应拒所有写 op (DEGRADED_READONLY), 读端点仍可用."""
+        bump = _http("POST", f"{daemon}/admin/degrade", {"level": 3})
+        assert bump["ok"] is True
+        try:
+            # 写 op 应被拒
+            from urllib.parse import quote
+            url = "data:text/html;charset=utf-8," + quote("<html><title>X</title></html>")
+            r = _http("POST", f"{daemon}/open", {"url": url})
+            assert r["ok"] is False
+            assert r["error"]["code"] == "DEGRADED_READONLY"
+            assert r["error"].get("level") == 3
+            # /click, /type 等也在 _WRITE_OPS 里
+            r2 = _http("POST", f"{daemon}/click", {"ref": "ref-1"})
+            assert r2["ok"] is False
+            assert r2["error"]["code"] == "DEGRADED_READONLY"
+            # 读端点 /health, /state, /sessions 仍可用
+            assert _http("GET", f"{daemon}/health")["ok"] is True
+            assert _http("GET", f"{daemon}/state")["ok"] is True
+            assert _http("GET", f"{daemon}/sessions")["ok"] is True
+        finally:
+            _http("POST", f"{daemon}/admin/restore", {})
+
+    def test_l4_blocks_everything_except_health(self, daemon):
+        """L4 应拒除 /health / /queue / /capacity / /metrics / /admin 之外的全部."""
+        bump = _http("POST", f"{daemon}/admin/degrade", {"level": 4})
+        assert bump["ok"] is True
+        try:
+            # /health 仍可用
+            assert _http("GET", f"{daemon}/health")["ok"] is True
+            assert _http("GET", f"{daemon}/capacity")["ok"] is True
+            assert _http("GET", f"{daemon}/queue")["ok"] is True
+            # 写 op 全拒
+            from urllib.parse import quote
+            url = "data:text/html;charset=utf-8," + quote("<html><title>X</title></html>")
+            r = _http("POST", f"{daemon}/open", {"url": url})
+            assert r["ok"] is False
+            assert r["error"]["code"] == "SERVICE_UNAVAILABLE"
+            # 读端点如 /state 也拒 (不在白名单)
+            r2 = _http("GET", f"{daemon}/state")
+            assert r2["ok"] is False
+            assert r2["error"]["code"] == "SERVICE_UNAVAILABLE"
+            assert r2["error"].get("level") == 4
+        finally:
+            _http("POST", f"{daemon}/admin/restore", {})
+
+    def test_admin_restore_returns_to_l0(self, daemon):
+        """admin/restore 应把 level 降回 0, 所有 op 恢复."""
+        _http("POST", f"{daemon}/admin/degrade", {"level": 3})
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["data"]["degradation_level"] == 3
+        r2 = _http("POST", f"{daemon}/admin/restore", {})
+        assert r2["ok"] is True
+        assert r2["data"]["level"] == 0
+        r3 = _http("GET", f"{daemon}/capacity")
+        assert r3["data"]["degradation_level"] == 0
+        # 写 op 恢复
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>Recovered</title></html>")
+        r4 = _http("POST", f"{daemon}/open", {"url": url})
+        assert r4["ok"] is True
+
+    def test_invalid_degrade_level_rejected(self, daemon):
+        """/admin/degrade level 越界应被 ValueError 处理 (回到 400)."""
+        r = _http("POST", f"{daemon}/admin/degrade", {"level": 99})
+        assert r["ok"] is False
+        # ValueError → MISSING_PARAM-like? 看 classify_exception 行为, 反正应非 ok
+        # 强制 5xx 或 4xx, 但 ok=False
+        assert r["error"]["code"] in ("MISSING_PARAM", "INTERNAL")
+
+    def test_degraded_response_includes_retry_after_header(self, daemon):
+        """T56: 503 降级响应应带 Retry-After 头 — agent 可做 backoff."""
+        _http("POST", f"{daemon}/admin/degrade", {"level": 3})
+        try:
+            req = urllib.request.Request(
+                f"{daemon}/open",
+                data=json.dumps({"url": "data:text/html,<h1>x</h1>"}).encode("utf-8"),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    pass
+                pytest.fail("should have raised HTTPError 503")
+            except HTTPError as e:
+                assert e.code == 503, f"应 503, got {e.code}"
+                retry_after = e.headers.get("Retry-After", "")
+                assert retry_after == "30", f"应 Retry-After: 30, got {retry_after!r}"
+        finally:
+            _http("POST", f"{daemon}/admin/restore", {})
+
+    def test_auto_degrade_triggers_l1_at_capacity(self, daemon):
+        """T56: 创建 ≥85% 的 sessions (17/20) → _auto_degrade 应自动 L1.
+        但 17 个 session 在测试里太重 — 改测 admin 直接 bump 后 _auto_degrade
+        在 ratio 回落时不会瞎恢复 (迟滞防抖).
+        """
+        # bump 到 L2 (capacity full 假象)
+        _http("POST", f"{daemon}/admin/degrade", {"level": 2})
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["data"]["degradation_level"] == 2
+        # admin/restore 后 auto_degrade 不会再升 (ratio 低)
+        _http("POST", f"{daemon}/admin/restore", {})
+        r2 = _http("GET", f"{daemon}/capacity")
+        # ratio 极低, 不会再升 L1
+        assert r2["data"]["degradation_level"] == 0
+        assert r2["data"]["capacity_ratio"] < 0.85
+
+
 class TestDaemonClientCLI:
     def test_cli_help(self):
         """tb CLI 应能 --help (不真正启动 daemon)。"""

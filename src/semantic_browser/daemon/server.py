@@ -201,6 +201,10 @@ _STATUS_BY_CODE: dict[str, int] = {
     "SESSION_NOT_FOUND": 404,
     "CANNOT_DELETE_DEFAULT": 400,
     "SESSION_CREATE_FAILED": 503,
+    # T56: 降级错误码 (fable §5.9)
+    "CAPACITY_DEGRADED": 503,    # L1: 拒新 session
+    "DEGRADED_READONLY": 503,    # L3: 只读
+    "SERVICE_UNAVAILABLE": 503,  # L4: 全拒
     "INTERNAL": 500,
 }
 
@@ -211,6 +215,15 @@ class _SessionError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class _DegradationError(Exception):
+    """T56: 降级阻挡的业务异常 — 当 daemon 处于降级状态时拒绝."""
+
+    def __init__(self, code: str, message: str, level: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.level = level
 
 
 # T52: 轻量 metrics registry — 不引 prometheus_client, 手写一个足够
@@ -338,6 +351,11 @@ class TransparentBrowserDaemon:
         self._op_waiters: int = 0
         # T52: metrics
         self.metrics = _MetricsRegistry()
+        # T56: 单进程内 DegradationController — 不经 Prometheus 回路 (fable §5.7)
+        # 默认 L0 健康; 内存/CPU/loop_lag 触发时升级到 L3 只读, L4 全拒
+        self._degradation_level = 0
+        # /capacity 缓存 (定期刷新)
+        self._capacity_max_contexts = 20  # 与 ControllerPool max_contexts 对齐
 
     def serve_forever(self) -> None:
         daemon = self
@@ -373,7 +391,71 @@ class TransparentBrowserDaemon:
 
     # T51: 端点白名单 — 不需要 op_lock 的纯只读 / 元数据查询.
     # 其它端点 (open / click / snapshot / discover / etc.) 都串行化, 避免 controller 状态被覆盖.
-    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats"})
+    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats", "/capacity", "/metrics"})
+
+    # T56: 降级检查触发点 — 写 op 在 L3+ 被拒, 全 op 在 L4 被拒
+    _WRITE_OPS = frozenset({
+        "/open", "/click", "/type", "/hover", "/dblclick", "/rightclick",
+        "/drag", "/select-option", "/fill-form", "/set-files",
+        "/scroll", "/press", "/download", "/back", "/forward", "/reload",
+        "/agent/run", "/agent/run/stream", "/discover", "/discover/stream",
+    })
+
+    # T56: 降级时仍允许的只读/控制端点 (L4 全拒时除外)
+    _DEGRADED_ALLOWED = frozenset({
+        "/health", "/queue", "/stats", "/capacity", "/metrics",
+        "/admin/degrade", "/admin/restore",
+    })
+
+    def _auto_degrade(self) -> None:
+        """T56: 基于容量自动升降级 — 不经 Prometheus 回路 (fable §5.7).
+        每请求调一次, 0ms 开销, 阈值用 capacity_ratio.
+        只升不降 — 降级必须显式 /admin/restore, 防 admin bump 完被自动回落吃掉.
+        """
+        n = len(self.owner.list_sessions())
+        max_ = self._capacity_max_contexts
+        ratio = n / max(max_, 1)
+        # 升级到 L1 (拒新 session)
+        if ratio >= 0.85 and self._degradation_level < 1:
+            self._degradation_level = 1
+            logger.warning("DegradationController: auto-bumped to L1 (capacity_ratio=%.2f)", ratio)
+        elif ratio >= 0.95 and self._degradation_level < 2:
+            self._degradation_level = 2
+            logger.warning("DegradationController: auto-bumped to L2 (capacity_ratio=%.2f)", ratio)
+        # 不再自动降 — admin/restore 显式降到 L0
+
+    def _enforce_degradation(self, method: str, path: str) -> None:
+        """T56: 按当前 degradation level 拒绝不该走的请求.
+        L1+ 拒新 session (POST /sessions) → CAPACITY_DEGRADED
+        L3+ 拒所有写 op → DEGRADED_READONLY
+        L4  拒除 /health 之外的全部 → SERVICE_UNAVAILABLE
+        """
+        level = self._degradation_level
+        if level <= 0:
+            return  # L0 全放行
+        # L4: 仅 /health / /queue / /capacity / /metrics 仍可用
+        if level >= 4:
+            if path in self._DEGRADED_ALLOWED:
+                return
+            raise _DegradationError(
+                "SERVICE_UNAVAILABLE",
+                f"daemon at degradation L4 — refusing {method} {path} (only health/queue/capacity/metrics/admin available)",
+                level,
+            )
+        # L3: 写 op 全拒
+        if level >= 3 and path in self._WRITE_OPS:
+            raise _DegradationError(
+                "DEGRADED_READONLY",
+                f"daemon at degradation L3 (readonly) — refusing write op {method} {path}",
+                level,
+            )
+        # L1+: 拒新 session 创建 (其余放行)
+        if level >= 1 and method == "POST" and path == "/sessions":
+            raise _DegradationError(
+                "CAPACITY_DEGRADED",
+                f"daemon at degradation L{level} — refusing new session creation (capacity full)",
+                level,
+            )
 
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         import time as _time
@@ -384,7 +466,11 @@ class TransparentBrowserDaemon:
         started_at = _time.time()
         final_status = 200  # 假设成功, 异常分支会改
         final_code = ""     # T52: 失败时的 error.code
+        # T56: 自动升降级 — 不抛异常, 只改 _degradation_level
+        self._auto_degrade()
         try:
+            # T56: 降级阻挡 — 在拿 op_lock 前就拒 (L4 情况连锁都不该争)
+            self._enforce_degradation(method, path)
             body = self._read_json(req) if method == "POST" else {}
             if needs_lock:
                 lock_wait_start = _time.time()
@@ -430,6 +516,19 @@ class TransparentBrowserDaemon:
                 final_code = e.code
                 self._send(req, final_status, err(e.code, str(e), retryable=False))
                 return
+            # T56: 降级阻挡 — 503 + Retry-After (让 agent 知道要等/降级请求)
+            if isinstance(e, _DegradationError):
+                final_status = _STATUS_BY_CODE.get(e.code, 503)
+                final_code = e.code
+                # L4 / 写拒绝都给 Retry-After: 30s — agent 可以 defer
+                self._send_with_extra_headers(req, final_status, {
+                    "ok": False, "data": None,
+                    "error": {
+                        "code": e.code, "message": str(e),
+                        "retryable": True, "level": e.level,
+                    },
+                }, {"Retry-After": "30"})
+                return
             # T48: 统一走 classify_exception, 错误带 code / message / retryable
             classified = classify_exception(e)
             code = classified["error"]["code"]
@@ -469,6 +568,20 @@ class TransparentBrowserDaemon:
         req.send_response(status)
         req.send_header("content-type", "application/json; charset=utf-8")
         req.send_header("content-length", str(len(data)))
+        req.end_headers()
+        req.wfile.write(data)
+
+    def _send_with_extra_headers(
+        self, req: BaseHTTPRequestHandler, status: int,
+        payload: dict[str, Any], extra_headers: dict[str, str],
+    ) -> None:
+        """T56: 额外加 header (Retry-After 等) — 在 end_headers 之前."""
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req.send_response(status)
+        req.send_header("content-type", "application/json; charset=utf-8")
+        req.send_header("content-length", str(len(data)))
+        for k, v in extra_headers.items():
+            req.send_header(k, v)
         req.end_headers()
         req.wfile.write(data)
 
@@ -515,6 +628,16 @@ class TransparentBrowserDaemon:
             }
         if method == "GET" and path == "/state":
             return self.owner.run(self._state(session=args.get("session")))
+        # T56: /capacity — 容量 + 退路状态读出 (agent 决定是否要排队)
+        if method == "GET" and path == "/capacity":
+            sessions = self.owner.list_sessions()
+            return {
+                "sessions_active": len(sessions),
+                "sessions_max": self._capacity_max_contexts,
+                "capacity_ratio": round(len(sessions) / max(self._capacity_max_contexts, 1), 3),
+                "degradation_level": self._degradation_level,
+                "degradation_label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][self._degradation_level],
+            }
         # T52: Prometheus metrics 端点 — 返回 text/plain, Prometheus 直接抓
         if method == "GET" and path == "/metrics":
             import time as _time
@@ -524,6 +647,18 @@ class TransparentBrowserDaemon:
             body += f"tb_daemon_uptime_seconds {uptime:.2f}\n"
             self._send_raw(req, 200, body, "text/plain; version=0.0.4; charset=utf-8")
             return "_RAW_HANDLED"
+        # T56: admin 端点 — 显式 bump/restore 降级 (测试用, 也给运维用)
+        if method == "POST" and path == "/admin/degrade":
+            level = int(args.get("level", 1))
+            if level < 1 or level > 4:
+                raise ValueError(f"degradation level must be 1..4, got {level}")
+            self._degradation_level = level
+            logger.warning("DegradationController: admin set to L%d", level)
+            return {"level": level, "label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][level]}
+        if method == "POST" and path == "/admin/restore":
+            self._degradation_level = 0
+            logger.info("DegradationController: admin restored to L0")
+            return {"level": 0, "label": "L0_healthy"}
         # T54: session CRUD — list / create / delete
         if method == "GET" and path == "/sessions":
             sessions = self.owner.list_sessions()

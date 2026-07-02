@@ -428,6 +428,158 @@ else:
 
 **测试**: 4 新 (queue 空闲 / 并发 open 串行化 / SSE 期间 queue 显示 running / 锁正确释放). 全套 **571 passed, 7 skipped**.
 
+## T56 — DegradationController L0-L4 + /capacity + 错误码扩展
+
+daemon 在容量/资源压力下按 L0-L4 自动降级, agent 通过 `/capacity` 查当前退路, 不用猜; 阻挡的请求返回 503 + `Retry-After` 头让客户端做 backoff:
+
+```bash
+$ curl -s http://127.0.0.1:8765/capacity | jq
+{
+  "sessions_active": 1, "sessions_max": 20,
+  "capacity_ratio": 0.05,
+  "degradation_level": 0, "degradation_label": "L0_healthy"
+}
+
+# 测试: 强制 L3 (只读)
+$ curl -X POST http://127.0.0.1:8765/admin/degrade -d '{"level":3}'
+{"ok": true, "data": {"level": 3, "label": "L3_readonly"}}
+
+# 写 op 拒
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"..."}'
+HTTP/1.0 503
+Retry-After: 30
+{"ok": false, "data": null, "error": {
+  "code": "DEGRADED_READONLY", "message": "daemon at degradation L3 (readonly) — refusing write op POST /open",
+  "retryable": true, "level": 3}}
+
+# 恢复
+$ curl -X POST http://127.0.0.1:8765/admin/restore
+{"ok": true, "data": {"level": 0, "label": "L0_healthy"}}
+```
+
+**降级级别 (fable §5.7) — 单进程内, 0ms 开销**:
+| Level | 行为 | 触发条件 (auto) |
+|---|---|---|
+| L0_healthy | 全放行 | 默认 |
+| L1_reject_new | 拒 POST /sessions (CAPACITY_DEGRADED), 其余放行 | `capacity_ratio ≥ 0.85` |
+| L2_preempt_low | 同 L1 (fable 提议的抢占低优 session — 未实现, 留作 T57+) | `≥ 0.95` |
+| L3_readonly | 拒所有写 op (DEGRADED_READONLY), 读 op 放行 | admin 显式 / 后续 OOM hook |
+| L4_full | 拒除 /health / /queue / /capacity / /metrics / /admin 之外的全部 (SERVICE_UNAVAILABLE) | admin 显式 / 灾难模式 |
+
+**新错误码** (`_STATUS_BY_CODE`): `CAPACITY_DEGRADED` (503) / `DEGRADED_READONLY` (503) / `SERVICE_UNAVAILABLE` (503) — 全部 `retryable: true` + 503 + `Retry-After: 30` 头.
+
+**只升不降的自动机**: auto_degrade 只升级 (capacity 高时), 降级必须显式 `/admin/restore` — 避免 admin 刚 bump 完被下一请求 auto_degrade 回落.
+
+**测试**: 8 新 (capacity 默认 / L1 拒新 / L3 阻写 / L4 阻全 / restore / 越界校验 / Retry-After 头 / auto 升不降). 全套 **596 passed, 7 skipped**.
+
+## T55 — 持久化 Event Bus + SSE Last-Event-ID 续传
+
+daemon 长任务 (SSE 流) 现在跨连接/重启持久化, agent 重连不带 `Last-Event-ID` 不丢事件 — 跟 LLM 增量 token 流一样的"游标续传":
+
+```bash
+# 跑流, 中途 ctrl-C 断开
+$ tb agent-run "search for X" --stream
+[start] goal="search for X" max_steps=20
+[1/20] open https://google.com ✓
+[2/20] type 'X' into search box ✓
+... ctrl-C ...
+
+# 重连 — 带 Last-Event-ID
+$ curl -N -H "Last-Event-ID: 5" -X POST http://127.0.0.1:8765/agent/run/stream \
+    -H "content-type: application/json" -d '{"goal":"search for X","max_steps":20}'
+# daemon 读出 Last-Event-ID=5, 从 bus 拿 seq>5 的事件全 replay, 然后接 live
+id: 6
+data: {"type": "step", "step": 3, "action": "click", ...}
+...
+```
+
+**架构** (fable §3.1 简化版, 单进程 / SQLite WAL):
+- `EventBus.publish(topic, payload) → seq` — 同步写 SQLite WAL, 自增 seq, `event_id` UUID 去重 (LRU 200k)
+- `EventBus.replay(since_seq, topic) → [events]` — 同步读, 给 SSE 重连续传
+- `EventBus.subscribe(topic) → asyncio.Queue` — 给同进程内 live 推送 (T56+ 跨 controller)
+- 双层去重: LRU + UNIQUE(event_id) — 极小概率碰撞也安全
+- topic glob: `session.*` 匹配 `session.created`, `agent_run.foo` 精确匹配
+
+**SSE 帧格式 (W3C)**: 每帧前带 `id: <seq>` 行, 客户端用 `Last-Event-ID` 头重连时断点续传.
+
+**Topic 命名**: `agent_run.<goal前50字符>` / `discover.<start_url>` — 同一任务的多次连接能续到同一 stream.
+
+**测试**: 3 新 (publish+replay round-trip / SSE `id:` 字段 / Last-Event-ID 重连拿的事件 id 全部 > 游标).
+
+## T54 — 多 session 隔离 + /sessions CRUD
+
+每个 agent 一个独立 `BrowserContext` (cookie/storage/cache 独立), 共用一个 chromium 进程 — 内存省 10x, 隔离保真:
+
+```bash
+# 列活跃 session (default 必存在)
+$ curl -s http://127.0.0.1:8765/sessions | jq
+{"ok": true, "data": {"sessions": ["default"], "active_count": 1}}
+
+# 创建
+$ curl -X POST http://127.0.0.1:8765/sessions -d '{"name":"agent-1"}'
+{"ok": true, "data": {"name": "agent-1", "created": true, "active": ["default", "agent-1"]}}
+
+# 自动生成
+$ curl -X POST http://127.0.0.1:8765/sessions -d '{}'
+{"ok": true, "data": {"name": "agent-2", "created": true, ...}}
+
+# 显式 session 参数 — 操作落到该 session 的 context
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"https://a.com","session":"agent-1"}'
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"https://b.com","session":"agent-2"}'
+# 互不干扰 (cookie/storage/page state 各自独立)
+
+# 关闭
+$ curl -X DELETE http://127.0.0.1:8765/sessions/agent-1
+{"ok": true, "data": {"name": "agent-1", "released": true, ...}}
+```
+
+**架构** (沿用 T33 `ControllerPool`): 共享 chromium 进程, 每个 session 独立 `BrowserContext` (Playwright 的 incognito-like 沙箱). max_contexts=20 默认.
+
+**默认 session**: daemon 启动时预创建 `default` — 旧代码 (无 `session` 参数) 落到这里, 100% 兼容.
+
+**错误码**:
+- `SESSION_NOT_FOUND` (404) — DELETE 不存在的
+- `CANNOT_DELETE_DEFAULT` (400) — 不能删 default
+- `SESSION_CREATE_FAILED` (503) — pool 满 / chromium 拉不起来
+
+**`/sessions` POST 不传 `name`**: 自动 `agent-N` (N = 当前活跃数 + 1).
+
+**测试**: 9 新 (list 含 default / create 成功 / 自动生成名 / delete 成功 / 404 / 不能删 default / 跨 session 隔离 / state 隔离 / 默认 session 隐式). 全套 **588 passed, 7 skipped**.
+
+## T53 — /agent/run/stream SSE 流式 agent
+
+之前 `/agent/run` 阻塞等 GoalAgent 跑完 (20 step × ~3s/step = 60s+), agent 干等浪费时间. T53 加 SSE 流式端点, 每 step 实时回传, agent 可以边看边 abort:
+
+```bash
+# 流式
+$ tb agent-run "fill the form" --stream
+[start] goal="fill the form" max_steps=20
+[step 1] think ✓  Open login page
+[step 2] open https://example.com/login ✓
+[step 3] snapshot ✓  found 12 refs
+...
+[done] success=True steps=8 in 24.1s
+
+# 阻塞老接口 — 仍兼容
+$ tb agent-run "fill the form"
+```
+
+**协议** (同 /discover/stream):
+```
+POST /agent/run/stream
+{"goal": "...", "max_steps": 20, "tier": "smart", "allow_destructive": false}
+
+data: {"type": "start", "goal": "...", "max_steps": 20}
+data: {"type": "step", "step": 1, "action": "think", "args": {...}, "success": true, "thought": "..."}
+data: {"type": "step", "step": 2, "action": "open", "args": {"url": "..."}, "success": true, ...}
+...
+data: {"type": "done_result", "result": {完整 GoalResult.to_dict() 含 success/steps/elapsed/notes}}
+```
+
+复用 `GoalAgent.on_step` 钩子 — 跟 `/agent/run` 共享同 agent loop 实现, 不双轨.
+
+**测试**: 3 新 (SSE 头/格式 / on_step 数据正确 / 客户端可消费). 全套 **579 passed, 7 skipped**.
+
 ## T52 — Prometheus /metrics 端点
 
 daemon 现在原生吐 Prometheus 文本, 拿 `requests_total` / `request_duration_seconds` / `op_lock_wait` / `op_lock_hold` / `errors_total` / `daemon_uptime` 就能上 Grafana — 不用自造 exporter:

@@ -454,6 +454,68 @@ os.environ["SEMANTIC_BROWSER_DAEMON_URL"] = "http://127.0.0.1:8765"
 
 **测试**: 13 新 (3 T18 in-engine / 3 缺 daemon_url 错误 / 5 daemon 代理走通 / 1 错误透传 / 1 env 注入). 全套 **612 passed, 7 skipped**.
 
+## T58 — SSRF guardrail (fable §7.1)
+
+Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:
+
+```bash
+# 默认拒: 私网 / loopback / link-local / cloud meta / .internal / .local
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"file:///etc/passwd"}'
+{"ok": false, "error": {"code": "SSRF_BLOCKED", "message": "...", "retryable": false}}
+
+# 内网 IP
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"http://10.0.0.1/admin"}'
+{"ok": false, "error": {"code": "SSRF_BLOCKED", ...}}
+
+# cloud metadata (literal hostname)
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"http://metadata.google.internal/"}'
+{"ok": false, "error": {"code": "SSRF_BLOCKED", ...}}
+
+# 公网 OK
+$ curl -X POST http://127.0.0.1:8765/open -d '{"url":"https://example.com/"}'
+{"ok": true, ...}
+```
+
+**核心设计** (`safety/ssrf.py`, ~160 行):
+- `check_url(url, *, allowlist, resolver) → str | raise SSRFBlockedError` — pure function, 易测
+- **DNS rebinding 防护**: 先 `socket.getaddrinfo()` 拿到所有 A 记录, 任何 IP 命中黑名单 (RFC1918 / loopback / link-local / CGNAT / IPv6 ULA / IPv4-mapped IPv6) 即拒
+- **scheme 默认 deny**: 只放行 `http`/`https`. `file://` / `chrome://` / `javascript:` / `data:` / `view-source:` 全拒 (防浏览器内部 scheme 旁路 + data: URL XSS)
+- **host pattern 默认 deny**: `*.internal` / `*.local` / `*.localhost` / `metadata.google.internal` / `metadata.internal`
+- **公网 IP / 公网 host 直通** (有 resolver 可注入, 测试用 fake DNS)
+- **allowlist 支持精确 + `*.example.com` 通配** — 测试 fixture / 内网开发绕过
+- **解析失败默认拒** (避免 NXDOMAIN 状态穿过去)
+- **大小写不敏感**: `MyHost.LOCAL` 一样拒, `FILE://` 一样拒
+
+**daemon 集成** (`server.py:_open`):
+```python
+async def _open(self, url, session=None):
+    try:
+        checked_url = _ssrf_check(
+            url, allowlist=self._ssrf_allowlist,
+            allow_data=self._allow_data_scheme,
+        )
+    except SSRFBlockedError as e:
+        # 错误向上抛 → classified as SSRF_BLOCKED (400)
+        raise
+    ctrl = await self.owner.aget_controller(session)
+    page = await ctrl.open(checked_url)
+```
+
+**新错误码** (`_STATUS_BY_CODE` + `result.py`): `SSRF_BLOCKED` (400) — `retryable: false` (URL 不会自愈).
+
+**CLI 标志**:
+```bash
+# 测试 fixture / 内网开发
+tb daemon --ssrf-allowlist "*.test.example,internal.dev" --allow-data-scheme
+```
+
+**架构分层** (为什么放 daemon 而不是 controller):
+- `controller.open()` 是低层 Playwright 封装, 任何调用方都该受这道闸保护
+- 在 daemon HTTP 边界守着, MCP 客户端 + CLI + 直 API 调用全受益
+- engine / extractor 等内部模块自己解析 host 时可以独立调用 `check_url()` (后续 T60+ agent path 会接入)
+
+**测试**: 37 新 (29 unit `tests/test_ssrf.py` 覆盖 block/allow/allowlist/wildcard/IPv6/rebinding/case + 8 daemon integration `TestT58SSRFGuardrail` 通过 `/open` 验证返回 `SSRF_BLOCKED`). 全套 **649 passed, 7 skipped**.
+
 ## T56 — DegradationController L0-L4 + /capacity + 错误码扩展
 
 daemon 在容量/资源压力下按 L0-L4 自动降级, agent 通过 `/capacity` 查当前退路, 不用猜; 阻挡的请求返回 503 + `Retry-After` 头让客户端做 backoff:

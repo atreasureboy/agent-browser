@@ -205,6 +205,8 @@ _STATUS_BY_CODE: dict[str, int] = {
     "CAPACITY_DEGRADED": 503,    # L1: 拒新 session
     "DEGRADED_READONLY": 503,    # L3: 只读
     "SERVICE_UNAVAILABLE": 503,  # L4: 全拒
+    # T58: SSRF blocked — fable §7.1 (URL 命中私网/meta)
+    "SSRF_BLOCKED": 400,
     "INTERNAL": 500,
 }
 
@@ -334,7 +336,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -356,6 +358,10 @@ class TransparentBrowserDaemon:
         self._degradation_level = 0
         # /capacity 缓存 (定期刷新)
         self._capacity_max_contexts = 20  # 与 ControllerPool max_contexts 对齐
+        # T58: SSRF guardrail (fable §7.1) — 默认 deny, 可配 allowlist (测试 fixture / 内网工具)
+        self._ssrf_allowlist: frozenset[str] = ssrf_allowlist or frozenset()
+        # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
+        self._allow_data_scheme: bool = allow_data_scheme
 
     def serve_forever(self) -> None:
         daemon = self
@@ -1099,9 +1105,18 @@ class TransparentBrowserDaemon:
         return {"url": await ctrl.get_url(), "title": await ctrl.get_title()}
 
     async def _open(self, url: str, session: str | None = None) -> dict[str, Any]:
+        from semantic_browser.safety.ssrf import check_url as _ssrf_check, SSRFBlockedError
+        # T58: SSRF guardrail (fable §7.1) — default-deny 私网/loopback/meta
+        try:
+            checked_url = _ssrf_check(
+                url, allowlist=self._ssrf_allowlist,
+                allow_data=self._allow_data_scheme,
+            )
+        except SSRFBlockedError as e:
+            raise SSRFBlockedError(f"open() blocked: {e}") from None
         ctrl = await self.owner.aget_controller(session)
-        page = await ctrl.open(url)
-        snap = await SnapshotEngine(page).capture(base_url=url)
+        page = await ctrl.open(checked_url)
+        snap = await SnapshotEngine(page).capture(base_url=checked_url)
         from semantic_browser.classifier.heuristic import PageClassifier
         cls = PageClassifier().classify(snap)
         return {"url": snap.url, "title": snap.title, "type": cls.page_type}
@@ -1703,6 +1718,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--headed", action="store_true", help="show browser window")
     parser.add_argument("--state", help="Playwright storage_state JSON path")
+    # T58: SSRF allowlist — comma-separated host patterns (*.example.com 也支持).
+    # 生产不设 (默认 deny 私网); 测试 fixture 设 "data:,*testserver*" 之类的.
+    parser.add_argument("--ssrf-allowlist", default="",
+                        help="comma-separated allowlist (empty = default deny private/loopback/meta)")
+    # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
+    parser.add_argument("--allow-data-scheme", action="store_true",
+                        help="T58: allow data: URLs (testing only, NEVER in production)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1719,7 +1741,10 @@ def main(argv: list[str] | None = None) -> None:
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(f"{os.getpid()}\n{args.host}\n")
 
-    daemon = TransparentBrowserDaemon(args.host, args.port, headless=not args.headed, storage_state_path=args.state)
+    daemon = TransparentBrowserDaemon(args.host, args.port, headless=not args.headed, storage_state_path=args.state,
+        ssrf_allowlist=frozenset(p.strip() for p in args.ssrf_allowlist.split(",") if p.strip()),
+        allow_data_scheme=args.allow_data_scheme,
+    )
 
     # T49: 优雅关闭 — SIGTERM/SIGINT 触发 shutdown() 而不是 OS 默认退出 (会跳过 finally)
     import signal as _signal

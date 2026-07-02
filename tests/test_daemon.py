@@ -55,7 +55,8 @@ def daemon():
     log_path = f"/tmp/tb-daemon-test-{port}.log"
     env = os.environ.copy()
     proc = subprocess.Popen(
-        [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port)],
+        [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port),
+         "--allow-data-scheme"],
         stdout=open(log_path, "wb"),
         stderr=subprocess.STDOUT,
         env=env,
@@ -1253,6 +1254,57 @@ class TestT56Degradation:
         # ratio 极低, 不会再升 L1
         assert r2["data"]["degradation_level"] == 0
         assert r2["data"]["capacity_ratio"] < 0.85
+
+
+class TestT58SSRFGuardrail:
+    """T58: SSRF guardrail (fable §7.1) — daemon /open 拒私网/loopback/meta."""
+
+    def test_open_file_scheme_blocked(self, daemon):
+        """file:// 应被 SSRF 挡掉, 返 400 SSRF_BLOCKED."""
+        r = _http("POST", f"{daemon}/open", {"url": "file:///etc/passwd"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+        assert "file" in r["error"]["message"].lower()
+
+    def test_open_chrome_scheme_blocked(self, daemon):
+        r = _http("POST", f"{daemon}/open", {"url": "chrome://settings"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_open_aws_metadata_blocked(self, daemon):
+        """169.254.169.254 必被挡 (SSRF 最常见目标 — IAM 凭据)."""
+        r = _http("POST", f"{daemon}/open", {"url": "http://169.254.169.254/latest/meta-data/"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+        assert "169" in r["error"]["message"] or "blocked" in r["error"]["message"].lower()
+
+    def test_open_loopback_blocked(self, daemon):
+        r = _http("POST", f"{daemon}/open", {"url": "http://127.0.0.1:8080/admin"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_open_internal_tld_blocked(self, daemon):
+        r = _http("POST", f"{daemon}/open", {"url": "http://server.internal/"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_open_javascript_scheme_blocked(self, daemon):
+        r = _http("POST", f"{daemon}/open", {"url": "javascript:alert(1)"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_data_url_still_allowed_in_test_fixture(self, daemon):
+        """测试 fixture 用 --allow-data-scheme, data: URL 仍能 open."""
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>OK</title></html>")
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        assert r["ok"] is True
+        assert "OK" in r["data"]["title"]
+
+    def test_open_missing_scheme_blocked(self, daemon):
+        r = _http("POST", f"{daemon}/open", {"url": "example.com/page"})
+        assert r["ok"] is False
+        assert r["error"]["code"] == "SSRF_BLOCKED"
 
 
 class TestDaemonClientCLI:

@@ -33,6 +33,7 @@ CODE_INVALID_URL = "INVALID_URL"
 CODE_EMPTY_RESULT = "EMPTY_RESULT"
 CODE_MISSING_PARAM = "MISSING_PARAM"
 CODE_NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+CODE_SSRF_BLOCKED = "SSRF_BLOCKED"
 CODE_INTERNAL = "INTERNAL"
 
 
@@ -69,6 +70,10 @@ def classify_exception(e: BaseException) -> dict[str, Any]:
     if "Invalid URL" in msg or "invalid url" in msg.lower():
         return err(CODE_INVALID_URL, msg, retryable=False)
     if isinstance(e, ValueError):
+        # T58: SSRF error 是 ValueError 子类, 优先识别 (不在 else 走 MISSING_PARAM)
+        cls_name = type(e).__name__
+        if cls_name == "SSRFBlockedError" or "SSRF" in cls_name or "blocked" in msg.lower()[:50]:
+            return err(CODE_SSRF_BLOCKED, f"{name}: {msg}", retryable=False)
         return err(CODE_MISSING_PARAM, msg, retryable=False)
     if isinstance(e, NotImplementedError):
         return err(CODE_NOT_IMPLEMENTED, msg, retryable=False)

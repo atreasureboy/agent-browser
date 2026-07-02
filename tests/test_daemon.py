@@ -486,7 +486,92 @@ class TestSSEEndpoint:
         assert "SSE-State" in s["data"]["title"]
 
 
-class TestT51Concurrency:
+class TestT52Metrics:
+    """T52: /metrics 端点 — Prometheus 格式 + 必含关键指标."""
+
+    def test_metrics_endpoint_returns_prometheus_text(self, daemon):
+        """返回 text/plain (Prometheus 文本格式 0.0.4), 非 JSON envelope."""
+        req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            ct = resp.headers.get("content-type", "")
+            body = resp.read().decode("utf-8")
+        assert "text/plain" in ct, f"应 text/plain, got: {ct}"
+        # 不应是 JSON envelope
+        assert not body.startswith("{"), "metrics 不该走 JSON envelope"
+
+    def test_metrics_includes_required_series(self, daemon):
+        """/metrics 必含: tb_requests_total, tb_request_duration, tb_daemon_uptime."""
+        # 先触发一些请求, 让 metrics 有数据
+        _http("GET", f"{daemon}/health")
+        _http("GET", f"{daemon}/state")
+        req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+
+        # 必含的 metric 名
+        assert "tb_requests_total" in body, f"缺 requests_total:\n{body[:500]}"
+        # histogram: 渲染为 _bucket/_count/_sum 三件套
+        assert "tb_request_duration_bucket" in body, f"缺 duration histogram"
+        assert "tb_request_duration_count" in body
+        assert "tb_request_duration_sum" in body
+        assert "tb_daemon_uptime_seconds" in body, f"缺 uptime gauge"
+        # 至少一次 /health 调用应被记录
+        assert 'path="/health"' in body
+
+    def test_metrics_includes_error_counter(self, daemon):
+        """失败的请求 (404 / 400) 应被记到 tb_errors_total."""
+        # 触发 404
+        try:
+            _http("GET", f"{daemon}/nonsense")
+        except Exception:
+            pass
+        # 触发 400 (缺 url)
+        try:
+            _http("POST", f"{daemon}/open", {})
+        except Exception:
+            pass
+
+        req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+
+        # 404 是协议层错, 不会被分类; 400 是 MISSING_PARAM
+        assert "tb_errors_total" in body, f"缺 errors_total:\n{body[:500]}"
+
+    def test_metrics_records_op_lock_wait_and_hold(self, daemon):
+        """op_lock_wait / op_lock_hold histogram 在多 op 后应有数据."""
+        # 跑一些 controller-touching ops
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>M</title></html>")
+        _http("POST", f"{daemon}/open", {"url": url})
+        _http("GET", f"{daemon}/snapshot")
+
+        req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+        assert "tb_op_lock_wait_bucket" in body, "应记录 op_lock_wait"
+        assert "tb_op_lock_hold_bucket" in body, "应记录 op_lock_hold"
+
+    def test_metrics_increments_after_request(self, daemon):
+        """同一路径多请求 → counter 应递增."""
+        before_req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(before_req, timeout=5) as resp:
+            before = resp.read().decode("utf-8")
+        # 提取 /health 的 counter 值
+        def get_health_count(body: str) -> int:
+            for line in body.split("\n"):
+                if line.startswith('tb_requests_total{') and 'path="/health"' in line:
+                    return int(line.rsplit(" ", 1)[1])
+            return 0
+        n_before = get_health_count(before)
+        # 多发 3 次
+        for _ in range(3):
+            _http("GET", f"{daemon}/health")
+        after_req = urllib.request.Request(f"{daemon}/metrics")
+        with urllib.request.urlopen(after_req, timeout=5) as resp:
+            after = resp.read().decode("utf-8")
+        n_after = get_health_count(after)
+        assert n_after >= n_before + 3, f"counter 没递增: before={n_before}, after={n_after}"
     """T51: 串行化锁 — 同 op 不会并发覆盖 controller 状态."""
 
     def test_queue_endpoint_reports_idle(self, daemon):

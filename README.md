@@ -428,6 +428,64 @@ else:
 
 **测试**: 4 新 (queue 空闲 / 并发 open 串行化 / SSE 期间 queue 显示 running / 锁正确释放). 全套 **571 passed, 7 skipped**.
 
+## T52 — Prometheus /metrics 端点
+
+daemon 现在原生吐 Prometheus 文本, 拿 `requests_total` / `request_duration_seconds` / `op_lock_wait` / `op_lock_hold` / `errors_total` / `daemon_uptime` 就能上 Grafana — 不用自造 exporter:
+
+```bash
+$ curl -s http://127.0.0.1:8765/metrics
+# TYPE tb_requests counter
+tb_requests_total{method="GET",path="/health",status="200"} 4
+tb_requests_total{method="POST",path="/open",status="200"} 1
+tb_requests_total{method="GET",path="/snapshot",status="200"} 2
+# TYPE tb_request_duration histogram
+tb_request_duration_bucket{method="GET",path="/health",le="0.01"} 4
+tb_request_duration_bucket{method="GET",path="/health",le="+Inf"} 4
+tb_request_duration_count{method="GET",path="/health"} 4
+tb_request_duration_sum{method="GET",path="/health"} 0.002
+...
+# TYPE tb_op_lock_wait histogram
+tb_op_lock_wait_bucket{path="/snapshot",le="0.01"} 2
+tb_op_lock_wait_bucket{path="/snapshot",le="+Inf"} 2
+tb_op_lock_wait_count{path="/snapshot"} 2
+tb_op_lock_wait_sum{path="/snapshot"} 0.001
+# TYPE tb_op_lock_hold histogram
+tb_op_lock_hold_bucket{path="/snapshot",le="0.05"} 1
+...
+tb_op_lock_hold_count{path="/snapshot"} 2
+tb_op_lock_hold_sum{path="/snapshot"} 0.083
+# TYPE tb_errors counter
+tb_errors_total{method="POST",path="/open",code="MISSING_PARAM"} 1
+tb_daemon_uptime_seconds 142.37
+```
+
+Content-Type: `text/plain; version=0.0.4; charset=utf-8` — Prometheus / VictoriaMetrics / Grafana Agent 直接 scrape.
+
+**指标清单**:
+- `tb_requests_total{method,path,status}` — counter, 每个 HTTP 请求
+- `tb_request_duration_seconds{method,path}` — histogram, 端到端请求时长 (SSE 长流除外, 会扭曲)
+- `tb_op_lock_wait_seconds{path}` — histogram, 抢 op_lock 等待时长 (T51 串行化)
+- `tb_op_lock_hold_seconds{path}` — histogram, 拿到 op_lock 后持锁时长
+- `tb_errors_total{method,path,code}` — counter, 协议层 4xx + 业务层错误码 (例 `MISSING_PARAM` / `DAEMON_BUSY` / `INVALID_URL`)
+- `tb_daemon_uptime_seconds` — gauge, 进程启动时长
+
+**Prometheus scrape config** 一行搞定:
+```yaml
+scrape_configs:
+  - job_name: semantic_browser
+    static_configs:
+      - targets: ['127.0.0.1:8765']
+```
+
+**关键测试**:
+- `test_metrics_endpoint_returns_prometheus_text`: 验 `text/plain` + 非 JSON envelope
+- `test_metrics_includes_required_series`: 必含 4 类 series (request / duration / errors / uptime)
+- `test_metrics_includes_error_counter`: 4xx + 业务错码都进 `tb_errors_total`
+- `test_metrics_records_op_lock_wait_and_hold`: `op_lock_*` 在多 op 后有 bucket 数据
+- `test_metrics_increments_after_request`: 同一路径 N 次 → counter 准确递增
+
+**测试**: 5 新 (Prometheus text 格式 / 必含 series / errors / op_lock 直方图 / counter 递增). 全套 **576 passed, 7 skipped**.
+
 ## T50 — 长任务进度流式回传 (SSE)
 
 `tb discover` 现场爬站点可能要 30 秒+, 之前调用方只能干等. T50 加 SSE (Server-Sent Events) 流式端点, 客户端实时拿每页进度:

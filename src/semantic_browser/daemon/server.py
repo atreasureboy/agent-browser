@@ -141,6 +141,89 @@ _STATUS_BY_CODE: dict[str, int] = {
 }
 
 
+# T52: 轻量 metrics registry — 不引 prometheus_client, 手写一个足够
+class _MetricsRegistry:
+    """请求级 metrics — 计数 + 直方图 (固定 buckets).
+
+    Prometheus 文本格式输出. 在 _handle 钩子里采集, /metrics 暴露.
+    线程安全 (一个 daemon 多 HTTP 线程).
+    """
+
+    _LATENCY_BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
+
+    def __init__(self) -> None:
+        import threading as _threading
+        self._lock = _threading.Lock()
+        # {label_key: count} — e.g. ("GET", "/open", "200") → N
+        self._counters: dict[tuple[str, str, str], int] = {}
+        # {label_key: {"count": N, "sum": S, "buckets": [累加]}}
+        self._histograms: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _labels(self, labels: dict[str, str]) -> str:
+        return ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+
+    def inc(self, name: str, labels: dict[str, str], value: int = 1) -> None:
+        key = tuple(sorted(labels.items()))
+        full_key = (name, key)
+        with self._lock:
+            self._counters[full_key] = self._counters.get(full_key, 0) + value
+
+    def observe(self, name: str, labels: dict[str, str], value: float) -> None:
+        key = tuple(sorted(labels.items()))
+        full_key = (name, key)
+        with self._lock:
+            h = self._histograms.get(full_key)
+            if h is None:
+                h = {
+                    "count": 0,
+                    "sum": 0.0,
+                    "buckets": [0] * len(self._LATENCY_BUCKETS),
+                }
+                self._histograms[full_key] = h
+            h["count"] += 1
+            h["sum"] += value
+            for i, b in enumerate(self._LATENCY_BUCKETS):
+                if value <= b:
+                    h["buckets"][i] += 1
+
+    def render_prometheus(self) -> str:
+        """Prometheus 文本格式 (0.0.4). 例:
+          tb_requests_total{method="GET",path="/open",status="200"} 42
+          tb_request_duration_seconds_bucket{method="GET",path="/open",le="0.5"} 38
+        """
+        lines: list[str] = []
+        with self._lock:
+            # counters — group by metric name
+            counter_names = sorted({name for (name, _) in self._counters})
+            for name in counter_names:
+                lines.append(f"# TYPE tb_{name} counter")
+                for (n, labels), value in sorted(self._counters.items()):
+                    if n != name:
+                        continue
+                    label_str = self._labels(dict(labels))
+                    lines.append(f"tb_{n}_total{{{label_str}}} {value}")
+            # histograms
+            hist_names = sorted({name for (name, _) in self._histograms})
+            for name in hist_names:
+                lines.append(f"# TYPE tb_{name} histogram")
+                for (n, labels), h in sorted(self._histograms.items()):
+                    if n != name:
+                        continue
+                    label_str = self._labels(dict(labels))
+                    # bucket 行 — Prometheus 要求 bucket 累加 (le)
+                    running = 0
+                    for i, b in enumerate(self._LATENCY_BUCKETS):
+                        running = h["buckets"][i]  # already cumulative because observe 写累加
+                        # 注: 上面 observe 是对每个请求, 在所有 <= b 的 bucket 各 +1; 已经是累加
+                        lines.append(
+                            f'tb_{n}_bucket{{{label_str},le="{b}"}} {running}'
+                        )
+                    lines.append(f'tb_{n}_bucket{{{label_str},le="+Inf"}} {h["count"]}')
+                    lines.append(f'tb_{n}_count{{{label_str}}} {h["count"]}')
+                    lines.append(f'tb_{n}_sum{{{label_str}}} {h["sum"]:.6f}')
+        return "\n".join(lines) + "\n"
+
+
 def _make_handler(daemon: "TransparentBrowserDaemon"):
     """Build BaseHTTPRequestHandler subclass bound to a daemon instance.
 
@@ -175,6 +258,8 @@ class TransparentBrowserDaemon:
         self._current_op: str | None = None
         self._op_started_at: float | None = None
         self._op_waiters: int = 0
+        # T52: metrics
+        self.metrics = _MetricsRegistry()
 
     def serve_forever(self) -> None:
         daemon = self
@@ -213,20 +298,30 @@ class TransparentBrowserDaemon:
     _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats"})
 
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
+        import time as _time
         parsed = urlparse(req.path)
         path = parsed.path.rstrip("/") or "/"
         query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
         needs_lock = path not in self._NO_LOCK_PATHS
+        started_at = _time.time()
+        final_status = 200  # 假设成功, 异常分支会改
+        final_code = ""     # T52: 失败时的 error.code
         try:
             body = self._read_json(req) if method == "POST" else {}
             if needs_lock:
+                lock_wait_start = _time.time()
                 with _acquire_op_lock_or_503(self.owner):
+                    lock_wait_s = _time.time() - lock_wait_start
+                    self.metrics.observe("op_lock_wait", {"path": path}, lock_wait_s)
                     self._op_waiters_lock = getattr(self, "_op_waiters_lock", None)
                     self._op_waiters += 1
                     try:
                         self._current_op = f"{method} {path}"
-                        self._op_started_at = __import__("time").time()
+                        self._op_started_at = _time.time()
+                        op_hold_start = _time.time()
                         result = self._dispatch(method, path, {**query, **body}, req)
+                        op_hold_s = _time.time() - op_hold_start
+                        self.metrics.observe("op_lock_hold", {"path": path}, op_hold_s)
                     finally:
                         self._current_op = None
                         self._op_started_at = None
@@ -236,11 +331,16 @@ class TransparentBrowserDaemon:
             # T50: SSE 端点自己写了响应, _handle 不要再发
             if result == "_SSE_HANDLED":
                 return
+            # T52: /metrics 自己写了 text/plain 响应
+            if result == "_RAW_HANDLED":
+                return
             # T48: success envelope. None data means "no result found" — still ok.
             self._send(req, 200, ok(result))
         except Exception as e:
             # T51: 锁等不到 → 自定义错误码 + 503 + Retry-After
             if isinstance(e, _DaemonBusy):
+                final_status = 503
+                final_code = "DAEMON_BUSY"
                 self._send(req, 503, {
                     "ok": False, "data": None,
                     "error": {"code": "DAEMON_BUSY", "message": str(e), "retryable": True},
@@ -249,10 +349,26 @@ class TransparentBrowserDaemon:
             # T48: 统一走 classify_exception, 错误带 code / message / retryable
             classified = classify_exception(e)
             code = classified["error"]["code"]
-            status = _STATUS_BY_CODE.get(code, 500)
-            if status >= 500:
+            final_status = _STATUS_BY_CODE.get(code, 500)
+            final_code = code
+            if final_status >= 500:
                 logger.exception("Request failed: %s %s", method, path)
-            self._send(req, status, classified)
+            self._send(req, final_status, classified)
+        finally:
+            # T52: 记录 metrics — 即使 SSE / 异常也记录
+            elapsed = _time.time() - started_at
+            self.metrics.inc("requests", {
+                "method": method, "path": path, "status": str(final_status),
+            })
+            if final_code:
+                self.metrics.inc("errors", {
+                    "method": method, "path": path, "code": final_code,
+                })
+            # duration 只记非 SSE (SSE 长流会扭曲直方图)
+            if path != "/discover/stream":
+                self.metrics.observe("request_duration", {
+                    "method": method, "path": path,
+                }, elapsed)
 
     def _read_json(self, req: BaseHTTPRequestHandler) -> dict[str, Any]:
         length = int(req.headers.get("content-length", "0") or "0")
@@ -268,6 +384,15 @@ class TransparentBrowserDaemon:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req.send_response(status)
         req.send_header("content-type", "application/json; charset=utf-8")
+        req.send_header("content-length", str(len(data)))
+        req.end_headers()
+        req.wfile.write(data)
+
+    def _send_raw(self, req: BaseHTTPRequestHandler, status: int, body: str, content_type: str) -> None:
+        """T52: 非 JSON 响应 (text/plain for /metrics)."""
+        data = body.encode("utf-8")
+        req.send_response(status)
+        req.send_header("content-type", content_type)
         req.send_header("content-length", str(len(data)))
         req.end_headers()
         req.wfile.write(data)
@@ -306,6 +431,15 @@ class TransparentBrowserDaemon:
             }
         if method == "GET" and path == "/state":
             return self.owner.run(self._state())
+        # T52: Prometheus metrics 端点 — 返回 text/plain, Prometheus 直接抓
+        if method == "GET" and path == "/metrics":
+            import time as _time
+            body = self.metrics.render_prometheus()
+            # 附加 daemon_uptime gauge (非 histogram/counter, 直接拼)
+            uptime = _time.time() - self.started_at
+            body += f"tb_daemon_uptime_seconds {uptime:.2f}\n"
+            self._send_raw(req, 200, body, "text/plain; version=0.0.4; charset=utf-8")
+            return "_RAW_HANDLED"
         if method == "POST" and path == "/open":
             return self.owner.run(self._open(args["url"]))
         if method == "GET" and path == "/snapshot":

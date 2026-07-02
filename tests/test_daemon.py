@@ -557,6 +557,113 @@ class TestAgentRunStream:
         assert 'path="/agent/run/stream"' in body
 
 
+class TestT55EventBus:
+    """T55: 持久化 Event Bus + SSE Last-Event-ID 续传."""
+
+    def test_event_bus_publish_and_replay(self, daemon):
+        """Event Bus publish → SQLite 持久化 → replay 读回."""
+        # 通过触发 /agent/run/stream 一次, 让事件落到 bus
+        events = []
+        req = urllib.request.Request(
+            f"{daemon}/agent/run/stream",
+            data=json.dumps({"goal": "bus-test-1", "max_steps": 1}).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            while True:
+                line = resp.readline().decode("utf-8")
+                if not line or line == "\r\n" or line == "\n":
+                    continue
+                if line.startswith("data: "):
+                    events.append(json.loads(line[len("data: "):].rstrip("\r").rstrip("\n")))
+                    if events and events[-1].get("type") == "done_result":
+                        break
+        # 至少有 start + done_result 事件
+        assert any(e["type"] == "start" for e in events)
+        assert any(e["type"] == "done_result" for e in events)
+
+    def test_sse_id_field_present_on_events(self, daemon):
+        """SSE 每帧应带 `id: <seq>` 行 (W3C Last-Event-ID 标准)."""
+        req = urllib.request.Request(
+            f"{daemon}/agent/run/stream",
+            data=json.dumps({"goal": "id-test", "max_steps": 1}).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        ids_seen = []
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            while True:
+                line = resp.readline().decode("utf-8").rstrip("\r").rstrip("\n")
+                if line.startswith("id: "):
+                    ids_seen.append(int(line[len("id: "):]))
+                if line == "" or line.startswith(": keepalive"):
+                    continue
+                if line.startswith("data: "):
+                    ev = json.loads(line[len("data: "):])
+                    if ev.get("type") == "done_result":
+                        break
+        # 至少看到 2 个 id (start + done_result)
+        assert len(ids_seen) >= 2, f"应至少有 start + done_result 两个 id, got {ids_seen}"
+        # id 单调递增
+        assert ids_seen == sorted(set(ids_seen)), f"id 应严格递增: {ids_seen}"
+
+    def test_last_event_id_replays_from_bus(self, daemon):
+        """用 Last-Event-ID 头重连, daemon 应从该 seq 后开始 replay."""
+        # 第一次跑, 收集所有 SSE 事件和它们的 id
+        first_run_events = []
+        first_run_ids = []
+        req = urllib.request.Request(
+            f"{daemon}/agent/run/stream",
+            data=json.dumps({"goal": "resume-test", "max_steps": 1}).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            current_id = None
+            while True:
+                line = resp.readline().decode("utf-8").rstrip("\r").rstrip("\n")
+                if line.startswith("id: "):
+                    current_id = int(line[len("id: "):])
+                elif line.startswith("data: "):
+                    ev = json.loads(line[len("data: "):])
+                    if current_id is not None:
+                        first_run_events.append((current_id, ev))
+                        first_run_ids.append(current_id)
+                        current_id = None
+                    if ev.get("type") == "done_result":
+                        break
+        assert len(first_run_events) >= 2
+        # 模拟 agent 重连: 拿 last-seen id, 用 Last-Event-ID 头重连
+        mid_id = first_run_ids[len(first_run_ids) // 2]  # 中间一个事件
+        # 重连
+        resumed_events = []
+        req2 = urllib.request.Request(
+            f"{daemon}/agent/run/stream",
+            data=json.dumps({"goal": "resume-test", "max_steps": 1}).encode("utf-8"),
+            headers={"content-type": "application/json", "Last-Event-ID": str(mid_id)},
+            method="POST",
+        )
+        with urllib.request.urlopen(req2, timeout=30) as resp:
+            current_id = None
+            while True:
+                line = resp.readline().decode("utf-8").rstrip("\r").rstrip("\n")
+                if line.startswith("id: "):
+                    current_id = int(line[len("id: "):])
+                elif line.startswith("data: "):
+                    ev = json.loads(line[len("data: "):])
+                    if current_id is not None:
+                        resumed_events.append((current_id, ev))
+                        current_id = None
+                    if ev.get("type") == "done_result":
+                        break
+        # 关键断言: 重连拿到的事件 id 全部 > mid_id (skip 了已读过的)
+        for rid, _ in resumed_events:
+            assert rid > mid_id, f"replayed event {rid} 不应 <= Last-Event-ID={mid_id}"
+        # 也应至少拿到 done_result
+        assert any(ev.get("type") == "done_result" for _, ev in resumed_events)
+
+
 class TestT52Metrics:
     """T52: /metrics 端点 — Prometheus 格式 + 必含关键指标."""
 

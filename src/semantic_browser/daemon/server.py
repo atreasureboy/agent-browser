@@ -25,6 +25,7 @@ from semantic_browser.engine import SemanticBrowser
 from semantic_browser.snapshot.engine import SnapshotEngine
 from semantic_browser.browser.controller import BrowserConfig, BrowserController
 from semantic_browser.browser.pool import ControllerPool
+from semantic_browser.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,11 @@ class _AsyncOwner:
         """T54: async 版本 — 给已经在 event loop 上的 coroutine 用 (不会 deadlock)."""
         name = name or self.DEFAULT_SESSION
         return await self.pool.acquire(name)
+
+    def run_coro(self, coro):
+        """T55: 在 daemon event loop 上跑一个 coroutine (从 daemon 主线程调用)."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return fut.result(timeout=60)
 
     def list_sessions(self) -> list[str]:
         """T54: 列出所有活跃 session 名."""
@@ -315,12 +321,15 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None) -> None:
         import time as _time
         self.host = host
         self.port = port
         self.started_at = _time.time()
         self.owner = _AsyncOwner(headless=headless, storage_state_path=storage_state_path)
+        # T55: 持久化 Event Bus — SSE Last-Event-ID 续传 + 跨 SSE 状态共享
+        self.event_bus = EventBus(event_bus_path)
+        self.owner.run_coro(self.event_bus.start())
         self.httpd: ThreadingHTTPServer | None = None
         self._shutting_down = False
         # T51: op 跟踪 — 浏览器锁在 owner.op_lock 上
@@ -1242,6 +1251,7 @@ class TransparentBrowserDaemon:
 
     def _stream_discover(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
         """T50: SSE 流式 discover — 每页/失败/done 一个 event.
+        T55: 持久化到 Event Bus + Last-Event-ID 续传.
 
         Event 格式 (JSON, 一行):
           data: {"type": "start", "start_url": "...", ...}
@@ -1250,9 +1260,9 @@ class TransparentBrowserDaemon:
           data: {"type": "done_result", "result": {...完整 result...}}
 
         实现要点:
-        - controller 的 async 方法必须跑在 _AsyncOwner.loop (浏览器绑定该 loop)
-        - progress_cb 在该 loop 上被调用, 通过线程安全 queue 把 event 传给 HTTP handler 线程
-        - 最终结果也通过同一 queue 传回, HTTP 线程在 done_result event 里序列化完整 result
+        - 每 event 写入 event_bus (持久化) — SSE 帧带 `id: <seq>` 让 client 用 Last-Event-ID 续传
+        - 同样的 event 写到 thread-safe live_queue, HTTP handler 读 live 推送
+        - client 重连时: Last-Event-ID header → 从 bus replay + 然后接 live
         """
         import json as _json
         from semantic_browser.llm import discover, format_sitemap_for_llm
@@ -1263,6 +1273,9 @@ class TransparentBrowserDaemon:
         same_domain_only = bool(args.get("same_domain_only", True))
         delay_ms = int(args.get("delay_ms", 100))
 
+        # T55: SSE 续传游标 (W3C Last-Event-ID)
+        last_event_id = int(req.headers.get("Last-Event-ID", "0") or "0")
+
         # SSE headers
         req.send_response(200)
         req.send_header("content-type", "text/event-stream; charset=utf-8")
@@ -1271,15 +1284,31 @@ class TransparentBrowserDaemon:
         req.send_header("connection", "keep-alive")
         req.end_headers()
 
+        # T55: 先 replay 续传 (从 bus 读历史), 然后再接 live
+        topic = f"discover.{start_url}"
+        replayed = 0
+        if last_event_id > 0:
+            for ev in self.event_bus.replay(since_seq=last_event_id, topic=topic, limit=500):
+                frame = (b"id: " + str(ev["seq"]).encode("utf-8") + b"\n"
+                         + b"data: " + _json.dumps(ev["payload"], ensure_ascii=False).encode("utf-8") + b"\n\n")
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                    replayed += 1
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
         event_queue: queue.Queue = queue.Queue(maxsize=128)
 
         async def run_with_progress() -> None:
             async def progress_cb(event: dict) -> None:
-                event_queue.put_nowait(event)
+                # T55: 同时 publish 到 bus (持久) + queue (live)
+                seq = self.event_bus.publish(topic, event)
+                event_queue.put_nowait({**event, "_seq": seq})
 
             try:
                 result = await discover(
-                    self.owner.browser.controller,
+                    await self.owner.aget_controller(),
                     start_url=start_url,
                     max_pages=max_pages,
                     max_depth=max_depth,
@@ -1329,6 +1358,9 @@ class TransparentBrowserDaemon:
                 if event.get("type") == "_final":
                     final_result = event["result"]
                     break
+                seq = event.pop("_seq", None)
+                if seq is not None:
+                    req.wfile.write(f"id: {seq}\n".encode("utf-8"))
                 frame = b"data: " + _json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
                 try:
                     req.wfile.write(frame)
@@ -1342,6 +1374,8 @@ class TransparentBrowserDaemon:
                 done["error"] = final_result["_error"]
             elif final_result:
                 done["result"] = final_result
+            seq_final = self.event_bus.publish(topic, done)
+            req.wfile.write(f"id: {seq_final}\n".encode("utf-8"))
             req.wfile.write(b"data: " + _json.dumps(done, ensure_ascii=False).encode("utf-8") + b"\n\n")
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -1349,13 +1383,12 @@ class TransparentBrowserDaemon:
 
     def _stream_agent_run(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
         """T53: SSE 流式 agent_run — 每 step 一个 event (复用 on_step 钩子).
+        T55: 持久化到 Event Bus + Last-Event-ID 续传.
 
         Event 格式 (JSON 一行):
           data: {"type": "start", "goal": "...", "max_steps": N}
-          data: {"type": "step", "step": N, "action": "...", "args": {...},
-                 "success": bool, "error": "...", "thought": "..."}
+          data: {"type": "step", "step": N, "action": "...", ...}
           data: {"type": "done_result", "result": {完整 GoalResult.to_dict()}}
-          data: {"type": "done_result", "error": "..."}  # 异常时
         """
         import json as _json
         from semantic_browser.agent import GoalAgent
@@ -1366,12 +1399,27 @@ class TransparentBrowserDaemon:
         allow_destructive = bool(args.get("allow_destructive", False))
         start_url = args.get("start_url") or None
 
+        # T55: SSE 续传游标
+        last_event_id = int(req.headers.get("Last-Event-ID", "0") or "0")
+
         req.send_response(200)
         req.send_header("content-type", "text/event-stream; charset=utf-8")
         req.send_header("cache-control", "no-cache")
         req.send_header("x-accel-buffering", "no")
         req.send_header("connection", "keep-alive")
         req.end_headers()
+
+        topic = f"agent_run.{goal[:50]}"
+        # T55: replay 历史
+        if last_event_id > 0:
+            for ev in self.event_bus.replay(since_seq=last_event_id, topic=topic, limit=500):
+                frame = (b"id: " + str(ev["seq"]).encode("utf-8") + b"\n"
+                         + b"data: " + _json.dumps(ev["payload"], ensure_ascii=False).encode("utf-8") + b"\n\n")
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
         event_queue: queue.Queue = queue.Queue(maxsize=128)
         loop_ref = self.owner.loop
@@ -1386,16 +1434,16 @@ class TransparentBrowserDaemon:
                 "error": record.error,
                 "thought": record.thought,
             }
-            # on_step 跑在 daemon 的 event loop 上, queue 是线程安全的
             try:
-                event_queue.put_nowait(entry)
+                seq = self.event_bus.publish(topic, entry)
+                event_queue.put_nowait({**entry, "_seq": seq})
             except queue.Full:
                 logger.warning("agent_run SSE queue full; dropping step %s", record.step)
 
         async def run_agent() -> None:
             try:
                 agent = GoalAgent(
-                    self.owner.browser.controller,
+                    await self.owner.aget_controller(),
                     tier=tier,
                     max_steps=max_steps,
                     on_step=on_step,
@@ -1407,13 +1455,12 @@ class TransparentBrowserDaemon:
                 logger.exception("agent/run/stream failed")
                 event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
 
-        # start event
+        # start event — 先 publish 到 bus 拿 seq, 再写 SSE 帧
+        start_payload = {"type": "start", "goal": goal, "max_steps": max_steps}
+        seq_start = self.event_bus.publish(topic, start_payload)
         try:
-            start_frame = b"data: " + _json.dumps(
-                {"type": "start", "goal": goal, "max_steps": max_steps},
-                ensure_ascii=False,
-            ).encode("utf-8") + b"\n\n"
-            req.wfile.write(start_frame)
+            req.wfile.write(f"id: {seq_start}\n".encode("utf-8"))
+            req.wfile.write(b"data: " + _json.dumps(start_payload, ensure_ascii=False).encode("utf-8") + b"\n\n")
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
@@ -1441,6 +1488,9 @@ class TransparentBrowserDaemon:
                 if event.get("type") == "_final":
                     final_result = event["result"]
                     break
+                seq = event.pop("_seq", None)
+                if seq is not None:
+                    req.wfile.write(f"id: {seq}\n".encode("utf-8"))
                 frame = b"data: " + _json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
                 try:
                     req.wfile.write(frame)
@@ -1454,6 +1504,8 @@ class TransparentBrowserDaemon:
                 done["error"] = final_result["_error"]
             elif final_result:
                 done["result"] = final_result
+            seq_final = self.event_bus.publish(topic, done)
+            req.wfile.write(f"id: {seq_final}\n".encode("utf-8"))
             req.wfile.write(b"data: " + _json.dumps(done, ensure_ascii=False).encode("utf-8") + b"\n\n")
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

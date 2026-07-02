@@ -21,3 +21,7 @@ tb-daemon = "semantic_browser.daemon.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"semantic_browser" = ["assets/*.js"]
+"semantic_browser.assets" = ["*.js"]

@@ -3955,6 +3955,126 @@ class BrowserController:
             "risky": risky,
         }
 
+    # ── T47: Accessibility audit (axe-core) ────────────────────────────
+
+    async def a11y_audit(
+        self,
+        max_nodes_per_violation: int = 5,
+        standards: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """T47: 注入 axe-core 跑 WCAG 审计, 返回结构化 violations.
+
+        Args:
+          max_nodes_per_violation: 每个 violation 最多保留几个 node, 默认 5
+                                   (axe 可能返回几百个相同 rule 的 element).
+          standards: WCAG 标准 tag 列表, 默认 ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"].
+
+        Returns: {
+          "url", "axe_version",
+          "summary": {violations, passes, incomplete, inapplicable, by_impact},
+          "violations": [{id, impact, description, help, help_url, tags,
+                          node_count, nodes: [{html, target, failure_summary}]}],
+          "error": str  # 仅在 axe 注入 / 跑失败时
+        }
+        """
+        page = await self._ensure_page()
+        if standards is None:
+            standards = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]
+
+        # 找 vendored axe.min.js (兼容 editable install)
+        from pathlib import Path
+        try:
+            from importlib.resources import files
+            axe_path = str(files("semantic_browser.assets").joinpath("axe.min.js"))
+        except Exception:
+            axe_path = str(Path(__file__).resolve().parent.parent / "assets" / "axe.min.js")
+
+        try:
+            await page.add_script_tag(path=axe_path)
+        except Exception as e:
+            return {
+                "url": page.url,
+                "axe_version": None,
+                "summary": {"violations": 0, "passes": 0, "incomplete": 0,
+                            "inapplicable": 0, "by_impact": {}},
+                "violations": [],
+                "error": f"failed to inject axe-core: {e}",
+            }
+
+        try:
+            raw = await page.evaluate(
+                """async ({standards, maxNodes}) => {
+                    const opts = {
+                        runOnly: { type: 'tag', values: standards },
+                        resultTypes: ['violations', 'passes', 'incomplete', 'inapplicable'],
+                    };
+                    const r = await axe.run(document, opts);
+                    return {
+                        version: axe.version,
+                        violations: r.violations.map(v => ({
+                            id: v.id,
+                            impact: v.impact,
+                            description: v.description,
+                            help: v.help,
+                            helpUrl: v.helpUrl,
+                            tags: v.tags,
+                            nodes: v.nodes.slice(0, maxNodes).map(n => ({
+                                html: n.html.slice(0, 500),
+                                target: n.target,
+                                failureSummary: n.failureSummary,
+                            })),
+                            helpUrl: v.helpUrl,
+                            _total_nodes: v.nodes.length,
+                        })),
+                        passes_count: r.passes.length,
+                        incomplete_count: r.incomplete.length,
+                        inapplicable_count: r.inapplicable.length,
+                    };
+                }""",
+                {"standards": standards, "maxNodes": max_nodes_per_violation},
+            )
+        except Exception as e:
+            return {
+                "url": page.url,
+                "axe_version": None,
+                "summary": {"violations": 0, "passes": 0, "incomplete": 0,
+                            "inapplicable": 0, "by_impact": {}},
+                "violations": [],
+                "error": f"axe.run failed: {e}",
+            }
+
+        violations = raw.get("violations", [])
+        # axe 用 camelCase (helpUrl), 项目统一 snake_case
+        for v in violations:
+            if "helpUrl" in v:
+                v["help_url"] = v.pop("helpUrl")
+            if "failureSummary" in v.get("nodes", [{}])[0] if v.get("nodes") else False:
+                for n in v["nodes"]:
+                    if "failureSummary" in n:
+                        n["failure_summary"] = n.pop("failureSummary")
+
+        by_impact: dict[str, int] = {}
+        for v in violations:
+            imp = v.get("impact") or "minor"
+            by_impact[imp] = by_impact.get(imp, 0) + 1
+
+        # 把 _total_nodes 提出来, 不污染返回
+        for v in violations:
+            v["node_count"] = v.pop("_total_nodes", len(v["nodes"]))
+
+        return {
+            "url": page.url,
+            "axe_version": raw.get("version"),
+            "summary": {
+                "violations": len(violations),
+                "passes": raw.get("passes_count", 0),
+                "incomplete": raw.get("incomplete_count", 0),
+                "inapplicable": raw.get("inapplicable_count", 0),
+                "by_impact": by_impact,
+            },
+            "violations": violations,
+        }
+
     # ── T12: 通用 retry ─────────────────────────────────────────────
 
     # 这些异常 / 错误信号被识别为"短暂错误" — 自动 retry 一次

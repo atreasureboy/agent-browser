@@ -6323,4 +6323,122 @@ class TestT44lSubdomainTakeover:
         asyncio.run(go())
 
 
+class TestT47A11yAudit:
+    """T47: axe-core 集成 — vendored asset / CLI / MCP / 真实页面."""
+
+    def test_axe_asset_vendored(self):
+        """T47: axe.min.js 必须 vendored 在包内 (offline 工作)."""
+        from pathlib import Path
+        from importlib.resources import files
+        p = files("semantic_browser.assets").joinpath("axe.min.js")
+        assert Path(str(p)).is_file(), f"axe.min.js not vendored at {p}"
+        content = Path(str(p)).read_text(encoding="utf-8", errors="ignore")
+        assert "axe.version" in content
+        assert "axe.run" in content
+
+    def test_mcp_tool_sb_a11y_audit_registered(self):
+        from semantic_browser.mcp_server.server import TOOL_DEFINITIONS
+        names = [t["name"] for t in TOOL_DEFINITIONS]
+        assert "sb_a11y_audit" in names
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "sb_a11y_audit")
+        assert "max_nodes_per_violation" in tool["inputSchema"]["properties"]
+
+    def test_cli_a11y_audit_registered(self):
+        from semantic_browser.client.cli import a11y_audit
+        assert a11y_audit.name == "a11y-audit"
+        # 关键 option 都在
+        opt_names = {p.name for p in a11y_audit.params}
+        assert "max_nodes" in opt_names
+        assert "standards" in opt_names
+        assert "json_out" in opt_names
+
+    def test_a11y_audit_returns_expected_shape(self, tmp_path):
+        """Mock page.evaluate 模拟 axe 输出, 验证 controller 解析 shape 正确."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        fake_axe_output = {
+            "version": "4.10.2",
+            "violations": [
+                {
+                    "id": "image-alt",
+                    "impact": "critical",
+                    "description": "Images must have alternate text",
+                    "help": "Images must have alternate text",
+                    "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/image-alt",
+                    "tags": ["wcag2a", "wcag111", "section508"],
+                    "nodes": [
+                        {"html": "<img src='foo.png'>", "target": ["img:nth-child(1)"],
+                         "failureSummary": "Fix: add alt attr"},
+                        {"html": "<img src='bar.png'>", "target": ["img:nth-child(2)"],
+                         "failureSummary": "Fix: add alt attr"},
+                    ],
+                    "_total_nodes": 7,
+                },
+                {
+                    "id": "color-contrast",
+                    "impact": "serious",
+                    "description": "Elements must have sufficient color contrast",
+                    "help": "Elements must have sufficient color contrast",
+                    "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/color-contrast",
+                    "tags": ["wcag2aa", "wcag143"],
+                    "nodes": [{"html": "<p>low contrast</p>", "target": ["p.bad"],
+                               "failureSummary": "Fix: increase contrast"}],
+                    "_total_nodes": 1,
+                },
+            ],
+            "passes_count": 42,
+            "incomplete_count": 1,
+            "inapplicable_count": 100,
+        }
+
+        ctrl = BrowserController(BrowserConfig())
+        fake_page = MagicMock()
+        fake_page.url = "https://test.example/"
+        # _ensure_page 返回 fake_page, add_script_tag no-op
+        ctrl._ensure_page = AsyncMock(return_value=fake_page)
+        fake_page.add_script_tag = AsyncMock(return_value=None)
+        fake_page.evaluate = AsyncMock(return_value=fake_axe_output)
+
+        result = asyncio.run(ctrl.a11y_audit())
+        assert result["url"] == "https://test.example/"
+        assert result["axe_version"] == "4.10.2"
+        assert result["summary"]["violations"] == 2
+        assert result["summary"]["passes"] == 42
+        assert result["summary"]["inapplicable"] == 100
+        assert result["summary"]["by_impact"] == {"critical": 1, "serious": 1}
+        assert len(result["violations"]) == 2
+
+        # image-alt violation
+        img = next(v for v in result["violations"] if v["id"] == "image-alt")
+        assert img["impact"] == "critical"
+        assert img["node_count"] == 7   # _total_nodes 被提取
+        assert len(img["nodes"]) == 2  # 实际保留的 nodes
+        assert "wcag2a" in img["tags"]
+        assert img["help_url"].startswith("https://")
+
+    def test_a11y_audit_handles_inject_failure(self):
+        """注入失败 (CSP 阻止 / asset 找不到) → 返回 error 字段不抛异常."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from semantic_browser.browser.controller import BrowserController, BrowserConfig
+
+        ctrl = BrowserController(BrowserConfig())
+        fake_page = MagicMock()
+        fake_page.url = "https://blocked.example/"
+        ctrl._ensure_page = AsyncMock(return_value=fake_page)
+        fake_page.add_script_tag = AsyncMock(side_effect=Exception("CSP blocked"))
+        # evaluate 不会被调用, 但兜底返回 error dict
+
+        result = asyncio.run(ctrl.a11y_audit())
+        assert result["url"] == "https://blocked.example/"
+        assert result["summary"]["violations"] == 0
+        assert "failed to inject axe-core" in result["error"]
+        assert result["violations"] == []
+        assert result["axe_version"] is None
+
+
 

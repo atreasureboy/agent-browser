@@ -150,6 +150,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({})},
     {"name": "sb_check_subdomain_takeover", "description": "T44l: 子域接管信号 — 查 CNAME 跟易被接管服务签名比对.",
      "inputSchema": _schema({"host": {"type": "string"}, "subdomains": {"type": "array", "items": {"type": "string"}}})},
+    {"name": "sb_a11y_audit", "description": "T47: 注入 axe-core 跑当前页 WCAG 2.1 A/AA 审计 — 返回按 impact 分级的 violations + 节点位置和失败原因.",
+     "inputSchema": _schema({
+         "max_nodes_per_violation": {"type": "integer", "default": 5,
+                                     "description": "每个 violation 最多保留几个 node (axe 可能返回几百)"},
+         "standards": {"type": "array", "items": {"type": "string"},
+                       "description": "WCAG tag 列表, 默认 wcag2a/wcag2aa/wcag21a/wcag21aa"},
+     })},
 ]
 
 
@@ -464,6 +471,13 @@ class MCPServer:
             return await engine.controller.check_subdomain_takeover(
                 host=args.get("host") or None,
                 subdomains=subs,
+            )
+        if name == "sb_a11y_audit":
+            engine = await self._ensure_started()
+            standards = args.get("standards")
+            return await engine.controller.a11y_audit(
+                max_nodes_per_violation=int(args.get("max_nodes_per_violation", 5)),
+                standards=standards if isinstance(standards, list) else None,
             )
         raise ValueError(f"Unknown tool: {name}")
 

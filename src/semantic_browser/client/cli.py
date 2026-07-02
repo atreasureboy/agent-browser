@@ -857,6 +857,24 @@ def parse_csp(ctx, json_out):
     _print(_request("GET", "/parse-csp", base=ctx.obj["base"]), json_out=json_out)
 
 
+@tb.command("a11y-audit")
+@click.option("--max-nodes", default=5, help="每个 violation 最多保留几个 node (默认 5)")
+@click.option("--standards", default="wcag2a,wcag2aa,wcag21a,wcag21aa",
+              help="WCAG 标准 tag (逗号分隔)")
+@click.option("--json-out", is_flag=True)
+def a11y_audit(max_nodes, standards, json_out):
+    """T47: 注入 axe-core 跑当前页 WCAG 2.1 A/AA 审计.
+
+    返回结构化 violations (按 impact 分级) + 每个 violation 的节点位置和失败原因.
+    必须先 `tb open <url>` 加载页面.
+    """
+    q = {
+        "max_nodes_per_violation": max_nodes,
+        "standards": [s.strip() for s in standards.split(",") if s.strip()],
+    }
+    _print(_request("GET", "/a11y-audit", q))
+
+
 @tb.command("check-subdomain-takeover")
 @click.argument("host", required=False)
 @click.option("--subdomains", help="逗号分隔的子域列表 (默认 14 个常见子域)")

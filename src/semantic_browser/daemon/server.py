@@ -378,6 +378,16 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.check_subdomain_takeover(
                 subdomains=subs if isinstance(subs, list) else None,
             ))
+        # T47: a11y audit (axe-core)
+        if method == "GET" and path == "/a11y-audit":
+            max_nodes = int(args.get("max_nodes_per_violation", 5))
+            standards = args.get("standards")
+            if not isinstance(standards, list):
+                standards = None
+            return self.owner.run(self.owner.browser.controller.a11y_audit(
+                max_nodes_per_violation=max_nodes,
+                standards=standards,
+            ))
         # T17: cookie / storage 管理
         if method == "GET" and path == "/cookies":
             url = args.get("url") or None

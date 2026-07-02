@@ -349,6 +349,31 @@ tb check-subdomain-takeover example.com
 - `tb find-xss-sinks` 在 github.com 抓到 5 处 `document.cookie` 读取 + 3 处 `innerHTML` 赋值
 - `tb find-cloud-resources` 在 github.com 抓到 `github-cloud.s3.amazonaws.com`
 
+## T47 — 可访问性审计 (axe-core 集成)
+
+axe-core 4.10.2 已 vendored 进包 (`src/semantic_browser/assets/axe.min.js`, MPL 2.0, ~540KB), offline 就能跑 WCAG 2.1 A/AA 审计, 不依赖 CDN:
+
+```bash
+# 必须先 tb open 一个页面 (axe 在页面上下文跑)
+tb open https://example.com/
+tb a11y-audit --json-out | jq '.summary, .violations[:3]'
+
+# 自定义标准 / 每个 violation 保留节点数
+tb a11y-audit --standards wcag2aa,wcag21aa --max-nodes 10
+```
+
+返回结构:
+- `summary.violations` / `passes` / `incomplete` / `inapplicable` + `by_impact` (critical / serious / moderate / minor 计数)
+- 每个 violation 含 `id` / `impact` / `help_url` (Deque 文档) / `tags` (WCAG 条款) / `node_count` / `nodes` (html + target + failure_summary)
+
+实测: 故意写一个无 alt 的 `<img>` + 空 `<button>` + 空 `<a>` 的页面, axe 准确抓到 4 处违规:
+```
+[critical] button-name      1 node
+[critical] image-alt        1 node
+[serious]  html-has-lang    1 node
+[serious]  link-name        1 node
+```
+
 ## T45 — 架构级别审计 (错误 / 重复 / 冲突)
 
 T40+T42+T43+T44 共 39 项工具加完后, 跑了一轮 AST 级 + 跨层一致性审计, **零 findings** — 代码库结构干净:

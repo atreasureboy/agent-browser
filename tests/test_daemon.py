@@ -167,7 +167,7 @@ class TestDaemonBrowse:
         """/foobar 应返回 ok=false 错误。"""
         r = _http("GET", f"{daemon}/foobar")
         assert r["ok"] is False
-        assert "unknown endpoint" in r["error"].lower()
+        assert "unknown endpoint" in r["error"]["message"].lower()
 
     def test_unknown_endpoint_returns_http_400(self, daemon):
         """错误端点必须返回 HTTP 400 (不仅是 ok=false 包络); HTTP-only 客户端才能靠
@@ -194,7 +194,7 @@ class TestDaemonBrowse:
             assert e.code == 400
             body = json.loads(e.read())
             assert body["ok"] is False
-            assert "url" in body["error"]
+            assert "url" in body["error"]["message"]
 
     def test_state_no_page_returns_http_400(self, daemon):
         """GET /read 没 open 过页面时, daemon 应抛 ValueError → 400。"""
@@ -205,7 +205,7 @@ class TestDaemonBrowse:
         except HTTPError as e:
             assert e.code == 400
             body = json.loads(e.read())
-            assert "no active page" in body["error"] or "open" in body["error"]
+            assert "no active page" in body["error"]["message"] or "open" in body["error"]["message"]
 
 
 class TestDaemonClientCLI:

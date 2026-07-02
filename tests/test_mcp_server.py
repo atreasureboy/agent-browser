@@ -10,6 +10,15 @@ import json
 
 import pytest
 
+
+def _unwrap(inner):
+    """T48: 工具响应包了 Result envelope, 返回 data 部分."""
+    if isinstance(inner, dict) and "ok" in inner and "data" in inner:
+        return inner["data"]
+    return inner
+
+
+
 from semantic_browser.mcp_server.server import (
     MCPServer,
     TOOL_DEFINITIONS,
@@ -192,9 +201,9 @@ class TestMCPToolDispatch:
         assert resp["id"] == 10
         assert resp["result"]["isError"] is False
         assert resp["result"]["content"][0]["type"] == "text"
-        # 解析内层 JSON 确认是 browse 的输出
+        # T48: 解析内层 JSON envelope, data 字段是工具输出
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["classification"]["page_type"] == "article"
+        assert _unwrap(inner)["classification"]["page_type"] == "article"
 
     async def test_sb_snapshot(self, monkeypatch):
         from semantic_browser.snapshot.engine import SnapshotEngine
@@ -213,7 +222,7 @@ class TestMCPToolDispatch:
         })
         assert resp["result"]["isError"] is False
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert "text_blocks" in inner
+        assert "text_blocks" in _unwrap(inner)
 
     async def test_sb_click(self):
         engine = _FakeEngine()
@@ -223,8 +232,8 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_click", "arguments": {"ref": "e3"}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["success"] is True
-        assert inner["ref"] == "e3"
+        assert _unwrap(inner)["success"] is True
+        assert _unwrap(inner)["ref"] == "e3"
         assert engine.controller.clicked == ["e3"]
 
     async def test_sb_type(self):
@@ -235,8 +244,8 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_type", "arguments": {"ref": "e3", "text": "hi"}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["success"] is True
-        assert inner["text_length"] == 2
+        assert _unwrap(inner)["success"] is True
+        assert _unwrap(inner)["text_length"] == 2
 
     async def test_sb_scroll(self):
         engine = _FakeEngine()
@@ -246,8 +255,8 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_scroll", "arguments": {"direction": "down", "amount": 200}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["direction"] == "down"
-        assert inner["amount"] == 200
+        assert _unwrap(inner)["direction"] == "down"
+        assert _unwrap(inner)["amount"] == 200
 
     async def test_sb_back(self):
         engine = _FakeEngine()
@@ -257,7 +266,7 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_back", "arguments": {}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["url"] == "about:blank"
+        assert _unwrap(inner)["url"] == "about:blank"
 
     async def test_sb_forward(self):
         engine = _FakeEngine()
@@ -267,7 +276,7 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_forward", "arguments": {}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["url"] == "https://x.com/fwd"
+        assert _unwrap(inner)["url"] == "https://x.com/fwd"
 
     async def test_sb_screenshot_to_base64(self):
         engine = _FakeEngine()
@@ -277,8 +286,8 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_screenshot", "arguments": {}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["bytes"] > 0
-        assert inner["base64"]  # non-empty base64 string
+        assert _unwrap(inner)["bytes"] > 0
+        assert _unwrap(inner)["base64"]  # non-empty base64 string
 
     async def test_sb_press_key(self):
         engine = _FakeEngine()
@@ -288,7 +297,7 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_press_key", "arguments": {"key": "Enter"}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["key"] == "Enter"
+        assert _unwrap(inner)["key"] == "Enter"
 
     async def test_sb_graph(self):
         engine = _FakeEngine()
@@ -298,7 +307,7 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_graph", "arguments": {"url": "https://x.com"}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert inner["domain"] == "x.com"
+        assert _unwrap(inner)["domain"] == "x.com"
 
     async def test_sb_history(self):
         engine = _FakeEngine()
@@ -308,8 +317,8 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_history", "arguments": {}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert "pages" in inner
-        assert "count" in inner
+        assert "pages" in _unwrap(inner)
+        assert "count" in _unwrap(inner)
 
     async def test_sb_stats(self):
         engine = _FakeEngine()
@@ -319,7 +328,7 @@ class TestMCPToolDispatch:
             "params": {"name": "sb_stats", "arguments": {}},
         })
         inner = json.loads(resp["result"]["content"][0]["text"])
-        assert "pages" in inner
+        assert "pages" in _unwrap(inner)
 
     async def test_unknown_tool_returns_invalid_params(self):
         engine = _FakeEngine()
@@ -328,8 +337,11 @@ class TestMCPToolDispatch:
             "jsonrpc": "2.0", "id": 22, "method": "tools/call",
             "params": {"name": "sb_nope", "arguments": {}},
         })
-        assert resp["error"]["code"] == INVALID_PARAMS
-        assert "Unknown tool" in resp["error"]["message"]
+        # T48: tool 错误包成 Result envelope, MCP 层 isError=true
+        assert resp["result"]["isError"] is True
+        inner = json.loads(resp["result"]["content"][0]["text"])
+        assert inner["ok"] is False
+        assert inner["error"]["code"] == "MISSING_PARAM"
 
     async def test_missing_required_argument_returns_invalid_params(self):
         engine = _FakeEngine()
@@ -338,9 +350,13 @@ class TestMCPToolDispatch:
             "jsonrpc": "2.0", "id": 23, "method": "tools/call",
             "params": {"name": "sb_click", "arguments": {}},
         })
-        assert resp["error"]["code"] == INVALID_PARAMS
+        # T48: KeyError("ref") → classify_exception → MISSING_PARAM
+        assert resp["result"]["isError"] is True
+        inner = json.loads(resp["result"]["content"][0]["text"])
+        assert inner["error"]["code"] == "MISSING_PARAM"
 
     async def test_params_not_dict_returns_invalid_params(self):
+        # params 层校验在 tool dispatch 之前 — 仍是 MCP 协议层 INVALID_PARAMS
         srv = MCPServer(engine=_FakeEngine())
         resp = await srv.handle({
             "jsonrpc": "2.0", "id": 24, "method": "tools/call",
@@ -366,8 +382,11 @@ class TestMCPToolDispatch:
             "jsonrpc": "2.0", "id": 26, "method": "tools/call",
             "params": {"name": "sb_browse", "arguments": {"url": "https://x.com"}},
         })
-        assert resp["error"]["code"] == INTERNAL_ERROR
-        assert "explode" in resp["error"]["message"]
+        # T48: 工具异常 → Result envelope, MCP isError=true
+        assert resp["result"]["isError"] is True
+        inner = json.loads(resp["result"]["content"][0]["text"])
+        assert inner["error"]["code"] == "INTERNAL"
+        assert "explode" in inner["error"]["message"]
 
 
 # ── _error / _ok helpers ──────────────────────────────────────

@@ -374,6 +374,47 @@ tb a11y-audit --standards wcag2aa,wcag21aa --max-nodes 10
 [serious]  link-name        1 node
 ```
 
+## T48 — 类型化 Result 契约 (跨层一致)
+
+daemon / MCP / CLI 三处都改用统一 `Result<T> = {ok, data, error}` envelope, agent 不用再为不同入口写不同错误处理:
+
+```python
+# 成功
+{"ok": True,  "data": {...},  "error": None}
+
+# 失败 (含稳定错误码 + 是否可重试)
+{"ok": False, "data": None,   "error": {"code": "NETWORK_FAIL", "message": "...", "retryable": True}}
+```
+
+**稳定错误码 (7 个)**: `PAGE_NOT_OPENED` / `NETWORK_FAIL` / `INVALID_URL` / `EMPTY_RESULT` / `MISSING_PARAM` / `NOT_IMPLEMENTED` / `INTERNAL`
+
+**HTTP 状态码映射 (daemon)**: 错误码 → 4xx/5xx — 客户端不用解析 body 也能粗判:
+- `MISSING_PARAM` / `INVALID_URL` → 400
+- `PAGE_NOT_OPENED` → 409
+- `NETWORK_FAIL` → 502
+- `NOT_IMPLEMENTED` → 501
+- 其它 → 500
+
+**MCP 透传**: tool 错误不破坏 JSON-RPC 200, 改用 `isError: true` + 内层 Result envelope. agent 一次调用拿全错误语义:
+```json
+{"isError": true, "content": [{"type": "text", "text": "{\"ok\": false, \"data\": null, \"error\": {\"code\": \"MISSING_PARAM\", ...}}"}]}
+```
+
+**CLI 转换**: `tb` 命令自动把 `error` 字段转成 `[CODE] message (retryable: yes/no)` 一行, 失败时 exit 码非 0.
+
+agent 写一次错误处理:
+```python
+r = await call_tool(...)
+if not r["ok"]:
+    if r["error"]["retryable"]:
+        await asyncio.sleep(2 ** attempt)
+        # retry
+    else:
+        log(f"non-retryable: {r['error']['code']}: {r['error']['message']}")
+```
+
+**测试覆盖**: 16 个新测试 (result.py 9 + daemon 4 + MCP 2 + CLI 1) + 旧测试全部更新到 envelope 形状, **548 passed, 7 skipped**.
+
 ## T45 — 架构级别审计 (错误 / 重复 / 冲突)
 
 T40+T42+T43+T44 共 39 项工具加完后, 跑了一轮 AST 级 + 跨层一致性审计, **零 findings** — 代码库结构干净:

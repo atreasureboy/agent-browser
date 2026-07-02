@@ -14,6 +14,7 @@ import sys
 from typing import Any, Optional
 
 from semantic_browser.engine import SemanticBrowser
+from semantic_browser.result import classify_exception
 from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)
@@ -208,14 +209,17 @@ class MCPServer:
             return self._error(req_id, INVALID_PARAMS, "params.arguments must be an object")
         try:
             result = await self._call_tool(name, args)
-        except KeyError as e:
-            return self._error(req_id, INVALID_PARAMS, f"Missing required argument: {e.args[0]}")
-        except ValueError as e:
-            return self._error(req_id, INVALID_PARAMS, str(e))
+            # T48: 成功包成 Result envelope (与 daemon 一致)
+            return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(
+                {"ok": True, "data": result, "error": None}, ensure_ascii=False, indent=2)}],
+                "isError": False})
         except Exception as e:
-            logger.exception("Tool %s failed", name)
-            return self._error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}")
-        return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}], "isError": False})
+            # T48: 错误也走 Result envelope, 然后再包 MCP content. agent 在 text 里 parse ok/data/error
+            classified = classify_exception(e)
+            logger.warning("Tool %s failed: %s", name, classified["error"]["code"])
+            return self._ok(req_id, {"content": [{"type": "text", "text": json.dumps(
+                classified, ensure_ascii=False, indent=2)}],
+                "isError": True})
 
     async def _call_tool(self, name: str, args: dict[str, Any]) -> Any:
         if name == "sb_browse":

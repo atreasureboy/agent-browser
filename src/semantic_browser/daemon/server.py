@@ -15,6 +15,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+from semantic_browser.result import classify_exception, err, ok
 from urllib.parse import parse_qs, urlparse
 
 from semantic_browser.engine import SemanticBrowser
@@ -55,6 +57,38 @@ class _AsyncOwner:
             self.thread.join(timeout=5)
 
 
+# T48: error.code → HTTP status 映射
+_STATUS_BY_CODE: dict[str, int] = {
+    "NOT_IMPLEMENTED": 501,
+    "MISSING_PARAM": 400,
+    "INVALID_URL": 400,
+    "NETWORK_FAIL": 502,
+    "PAGE_NOT_OPENED": 409,
+    "INTERNAL": 500,
+}
+
+
+def _make_handler(daemon: "TransparentBrowserDaemon"):
+    """Build BaseHTTPRequestHandler subclass bound to a daemon instance.
+
+    T48: extracted as module-level factory so tests can construct a daemon
+    and inspect / hit the handler without subprocess.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "TransparentBrowser/0.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            logger.debug(fmt, *args)
+
+        def do_GET(self) -> None:
+            daemon._handle(self, "GET")
+
+        def do_POST(self) -> None:
+            daemon._handle(self, "POST")
+
+    return Handler
+
+
 class TransparentBrowserDaemon:
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None) -> None:
         self.host = host
@@ -64,20 +98,7 @@ class TransparentBrowserDaemon:
 
     def serve_forever(self) -> None:
         daemon = self
-
-        class Handler(BaseHTTPRequestHandler):
-            server_version = "TransparentBrowser/0.1"
-
-            def log_message(self, fmt: str, *args: Any) -> None:  # keep stdout JSON-clean for wrappers
-                logger.debug(fmt, *args)
-
-            def do_GET(self) -> None:
-                daemon._handle(self, "GET")
-
-            def do_POST(self) -> None:
-                daemon._handle(self, "POST")
-
-        self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.httpd = ThreadingHTTPServer((self.host, self.port), _make_handler(daemon))
         logger.warning("Transparent Browser daemon listening on http://%s:%d", self.host, self.port)
         try:
             self.httpd.serve_forever()
@@ -91,18 +112,16 @@ class TransparentBrowserDaemon:
         try:
             body = self._read_json(req) if method == "POST" else {}
             result = self._dispatch(method, path, {**query, **body})
-            self._send(req, 200, {"ok": True, "data": result})
-        except KeyError as e:
-            self._send(req, 400, {"ok": False, "error": f"missing parameter: {e.args[0]}"})
-        except ValueError as e:
-            # 业务错 (URL 错、状态非法等) → 400
-            self._send(req, 400, {"ok": False, "error": str(e)})
-        except NotImplementedError as e:
-            self._send(req, 501, {"ok": False, "error": str(e)})
+            # T48: success envelope. None data means "no result found" — still ok.
+            self._send(req, 200, ok(result))
         except Exception as e:
-            # 未预期异常 → 500, body 仍带 envelope 供 client/_request 解析
-            logger.exception("Request failed: %s %s", method, path)
-            self._send(req, 500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            # T48: 统一走 classify_exception, 错误带 code / message / retryable
+            classified = classify_exception(e)
+            code = classified["error"]["code"]
+            status = _STATUS_BY_CODE.get(code, 500)
+            if status >= 500:
+                logger.exception("Request failed: %s %s", method, path)
+            self._send(req, status, classified)
 
     def _read_json(self, req: BaseHTTPRequestHandler) -> dict[str, Any]:
         length = int(req.headers.get("content-length", "0") or "0")

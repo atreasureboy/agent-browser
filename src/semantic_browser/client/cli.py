@@ -18,6 +18,11 @@ DEFAULT_BASE = "http://127.0.0.1:8765"
 
 
 def _request(method: str, path: str, data: dict | None = None, *, base: str = DEFAULT_BASE) -> dict:
+    """Call daemon. Returns Result envelope data on success, raises ClickException on error.
+
+    T48: error envelope is {code, message, retryable}. We render it as
+    "[CODE] message (retryable: yes/no)" so agent scripts / logs get a stable code.
+    """
     url = base.rstrip("/") + path
     body = None
     headers = {}
@@ -31,12 +36,23 @@ def _request(method: str, path: str, data: dict | None = None, *, base: str = DE
         with urlopen(req, timeout=120) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        payload = json.loads(e.read().decode("utf-8"))
+        # daemon 用非 200 状态码返回 error envelope — 同样 parse
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            raise click.ClickException(f"daemon HTTP {e.code}: {e.reason}") from e
     except URLError as e:
         raise click.ClickException(f"daemon unavailable at {base}: {e.reason}") from e
-    if not payload.get("ok"):
-        raise click.ClickException(payload.get("error", "unknown daemon error"))
-    return payload["data"]
+    if payload.get("error"):
+        e = payload["error"]
+        if isinstance(e, dict):
+            retry = "yes" if e.get("retryable") else "no"
+            raise click.ClickException(
+                f"[{e.get('code', 'UNKNOWN')}] {e.get('message', '')} (retryable: {retry})"
+            )
+        # 老格式 fallback
+        raise click.ClickException(str(e))
+    return payload.get("data")
 
 
 def _print(data, json_out: bool = False):

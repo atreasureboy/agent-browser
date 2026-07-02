@@ -6441,4 +6441,264 @@ class TestT47A11yAudit:
         assert result["axe_version"] is None
 
 
+class TestT48ResultEnvelope:
+    """T48: typed Result 契约 — daemon / MCP / CLI 三层都包 {ok, data, error:{code, message, retryable}}."""
+
+    # ── result.py 单元测试 ──
+
+    def test_ok_envelope_shape(self):
+        from semantic_browser.result import ok
+        e = ok({"foo": 1})
+        assert e["ok"] is True
+        assert e["data"] == {"foo": 1}
+        assert e["error"] is None
+
+    def test_err_envelope_shape(self):
+        from semantic_browser.result import err
+        e = err("NETWORK_FAIL", "dns timeout", retryable=True)
+        assert e["ok"] is False
+        assert e["data"] is None
+        assert e["error"]["code"] == "NETWORK_FAIL"
+        assert e["error"]["retryable"] is True
+
+    def test_classify_timeout_is_retryable(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(TimeoutError("connect timeout"))
+        assert e["error"]["code"] == "NETWORK_FAIL"
+        assert e["error"]["retryable"] is True
+
+    def test_classify_connection_refused_is_retryable(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(ConnectionRefusedError("nope"))
+        assert e["error"]["code"] == "NETWORK_FAIL"
+        assert e["error"]["retryable"] is True
+
+    def test_classify_keyerror_is_missing_param(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(KeyError("url"))
+        assert e["error"]["code"] == "MISSING_PARAM"
+        assert "url" in e["error"]["message"]
+        assert e["error"]["retryable"] is False
+
+    def test_classify_valueerror_missing_param(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(ValueError("url required"))
+        assert e["error"]["code"] == "MISSING_PARAM"
+
+    def test_classify_valueerror_invalid_url(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(ValueError("Invalid URL: bad://x"))
+        assert e["error"]["code"] == "INVALID_URL"
+
+    def test_classify_not_implemented(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(NotImplementedError("todo"))
+        assert e["error"]["code"] == "NOT_IMPLEMENTED"
+
+    def test_classify_unknown_is_internal(self):
+        from semantic_browser.result import classify_exception
+        e = classify_exception(RuntimeError("weird"))
+        assert e["error"]["code"] == "INTERNAL"
+        assert e["error"]["retryable"] is False
+
+    # ── daemon envelope 测试 ──
+
+    def test_daemon_returns_envelope_on_success(self):
+        """Daemon 成功路径: {ok: True, data: ..., error: None}."""
+        import json
+        import socket
+        import threading
+        from http.server import HTTPServer
+        from unittest.mock import patch
+        from urllib.request import Request, urlopen
+
+        from semantic_browser.daemon.server import TransparentBrowserDaemon, _make_handler
+
+        daemon = TransparentBrowserDaemon(host="127.0.0.1", port=0)
+        # stub _dispatch 让 /health 走真实路径, /anything-else 也走真实路径
+        # _dispatch 内 /health 直接返回 {"status": "ok"}, 所以不需要 patch
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        daemon.port = port
+        server = HTTPServer(("127.0.0.1", port), _make_handler(daemon))
+        t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
+        try:
+            req = Request(f"http://127.0.0.1:{port}/health")
+            with urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            assert payload["ok"] is True
+            assert payload["error"] is None
+            assert payload["data"] == {"status": "ok"}
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_daemon_returns_envelope_on_internal_error(self):
+        """Daemon 未预期异常 → {ok: False, error: {code: INTERNAL, ...}}."""
+        import json
+        import socket
+        import threading
+        from http.server import HTTPServer
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+
+        from semantic_browser.daemon.server import TransparentBrowserDaemon, _make_handler
+
+        daemon = TransparentBrowserDaemon(host="127.0.0.1", port=0)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        daemon.port = port
+
+        # patch _dispatch 让它抛 RuntimeError
+        def boom(method, path, args):
+            raise RuntimeError("boom: test injected failure")
+        with patch.object(daemon, "_dispatch", side_effect=boom):
+            server = HTTPServer(("127.0.0.1", port), _make_handler(daemon))
+            t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
+            try:
+                req = Request(f"http://127.0.0.1:{port}/anything")
+                try:
+                    urlopen(req, timeout=5)
+                    assert False, "expected HTTPError"
+                except HTTPError as e:
+                    payload = json.loads(e.read().decode("utf-8"))
+                    assert payload["ok"] is False
+                    assert payload["error"]["code"] == "INTERNAL"
+                    assert "boom" in payload["error"]["message"]
+                    assert payload["error"]["retryable"] is False
+                    assert payload["data"] is None
+                    assert e.code == 500
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_daemon_network_failure_returns_retryable_502(self):
+        """NetworkError → NETWORK_FAIL + retryable=True + HTTP 502."""
+        import json
+        import socket
+        import threading
+        from http.server import HTTPServer
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+
+        from semantic_browser.daemon.server import TransparentBrowserDaemon, _make_handler
+
+        daemon = TransparentBrowserDaemon(host="127.0.0.1", port=0)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        daemon.port = port
+
+        def boom(method, path, args):
+            raise ConnectionError("DNS lookup failed: no such host")
+        with patch.object(daemon, "_dispatch", side_effect=boom):
+            server = HTTPServer(("127.0.0.1", port), _make_handler(daemon))
+            t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
+            try:
+                req = Request(f"http://127.0.0.1:{port}/anything")
+                try:
+                    urlopen(req, timeout=5)
+                    assert False, "expected HTTPError"
+                except HTTPError as e:
+                    payload = json.loads(e.read().decode("utf-8"))
+                    assert payload["error"]["code"] == "NETWORK_FAIL"
+                    assert payload["error"]["retryable"] is True
+                    assert e.code == 502
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_daemon_status_by_code_exported(self):
+        """T48: _STATUS_BY_CODE 模块级常量, 供 agent / 文档参考."""
+        from semantic_browser.daemon.server import _STATUS_BY_CODE
+        assert _STATUS_BY_CODE["NETWORK_FAIL"] == 502
+        assert _STATUS_BY_CODE["MISSING_PARAM"] == 400
+        assert _STATUS_BY_CODE["INTERNAL"] == 500
+        assert _STATUS_BY_CODE["NOT_IMPLEMENTED"] == 501
+
+    # ── MCP envelope 测试 ──
+
+    def test_mcp_tool_success_wrapped_in_envelope(self):
+        """MCP 成功响应: text 里 parse 出来 {ok: True, data, error: None}."""
+        import asyncio
+        import json
+        from unittest.mock import AsyncMock
+
+        from semantic_browser.mcp_server.server import MCPServer
+
+        server = MCPServer()
+        server._call_tool = AsyncMock(return_value={"foo": "bar"})
+
+        async def go():
+            req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "sb_a11y_audit", "arguments": {}}}
+            resp = await server._handle_tool_call(1, req["params"])
+            return resp
+
+        resp = asyncio.run(go())
+        assert "result" in resp
+        text = resp["result"]["content"][0]["text"]
+        envelope = json.loads(text)
+        assert envelope["ok"] is True
+        assert envelope["data"] == {"foo": "bar"}
+        assert envelope["error"] is None
+        assert resp["result"]["isError"] is False
+
+    def test_mcp_tool_failure_uses_classify_exception(self):
+        """MCP 失败响应: 错误走 classify_exception, isError=True."""
+        import asyncio
+        import json
+
+        from semantic_browser.mcp_server.server import MCPServer
+
+        server = MCPServer()
+        async def boom(*a, **kw): raise KeyError("host")
+        server._call_tool = boom
+
+        async def go():
+            return await server._handle_tool_call(1, {"name": "x", "arguments": {}})
+
+        resp = asyncio.run(go())
+        text = resp["result"]["content"][0]["text"]
+        envelope = json.loads(text)
+        assert envelope["ok"] is False
+        assert envelope["error"]["code"] == "MISSING_PARAM"
+        assert "host" in envelope["error"]["message"]
+        assert envelope["error"]["retryable"] is False
+        assert resp["result"]["isError"] is True
+
+    # ── CLI error display ──
+
+    def test_cli_renders_structured_error(self):
+        """CLI 拿到 error envelope 时, ClickException 带 [CODE] message (retryable: yes/no)."""
+        from click.testing import CliRunner
+
+        from semantic_browser.client.cli import tb
+
+        # 起 daemon stub, 任何 GET 都返回 error envelope
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from urllib.parse import urlparse
+
+        captured = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                body = b'{"ok": false, "data": null, "error": {"code": "NETWORK_FAIL", "message": "Connection refused", "retryable": true}}'
+                self.wfile.write(body)
+            def log_message(self, *a): pass
+
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        server = HTTPServer(("127.0.0.1", port), H)
+        t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
+        try:
+            runner = CliRunner()
+            result = runner.invoke(tb, ["--base", f"http://127.0.0.1:{port}", "dns-records", "example.com"])
+            assert result.exit_code != 0
+            assert "NETWORK_FAIL" in result.output
+            assert "Connection refused" in result.output
+            assert "retryable: yes" in result.output
+        finally:
+            server.shutdown(); server.server_close()
+
+
 

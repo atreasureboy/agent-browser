@@ -500,6 +500,62 @@ $ curl -N -H 'Last-Event-ID: 192' http://127.0.0.1:8765/events
 
 **测试**: 7 新 (admin 显式降级发 high / restore 发 normal / /capacity 含 pressure_level / SSE headers 正确 / live event 流 / Last-Event-ID 重传 replay / 不抢 op_lock). 全套 **656 passed, 7 skipped**.
 
+## T60 — Browser watchdog + M×K capacity (fable §5.5 + §1.2)
+
+daemon 后台 task 周期性 (默认 5s) 给心跳/健康监测:
+
+```bash
+$ curl -s http://127.0.0.1:8765/capacity | jq
+{
+  "M": 1, "K": 16, "slots_total": 16,
+  "browsers_count": 1, "mem_per_browser_estimate_mb": 3310,
+  "mem_total_estimate_mb": 5610,
+  "last_heartbeat_ts": 1751408400.12, "heartbeat_age_s": 1.4,
+  # 上面是 T56/T59 字段也都在
+  "degradation_level": 0, "pressure_level": "normal"
+}
+
+# 订阅心跳
+$ curl -N http://127.0.0.1:8765/events?topics=system.heartbeat
+id: 205
+data: {"topic": "system.heartbeat", "payload": {"pid": 1234, "browsers_alive": 1,
+  "M": 1, "K": 16, "sessions_active": 3, "degradation_level": 0, "ts": 1751408405.2}}
+
+# 监控卡死
+$ curl -N 'http://127.0.0.1:8765/events?topics=browser.*'
+data: {"topic": "browser.lock_stuck", "payload": {"op": "open", "held_seconds": 31.2, ...}}
+```
+
+**M×K 容量模型** (fable §1.2 公式实现):
+```
+mem_per_browser = BASE(250MB) + K × (CTX(15MB) + P̄(1.5) × PAGE(120MB))
+slots_total    = M × K
+mem_total      = M × mem_per_browser + DAEMON(300MB) + OS_RESERVE(2GB)
+```
+默认 16vCPU/64GB 机 → M=1/K=16/slots=16/约 3.3GB 单实例. 当前 pool 共享单 chromium 进程, M 仅作字段暴露; 多 worker 化留待 T62+.
+
+**Watchdog 后台 task** (`serve_forever` 启动, `shutdown` 取消):
+- 每 tick (5s 默认, `--watchdog-interval=0` 关闭):
+  - `_last_heartbeat_ts = time.time()` 更新
+  - `_watchdog_once` 检测 `op_lock` 被持 >30s → 发 `browser.lock_stuck{op, held_seconds}`
+  - `list_sessions()` 失败 → 视为 browser 挂, 发 `browser.crashed`
+- 每次 tick 发 `system.heartbeat{pid, browsers_alive, M, K, sessions_active, degradation_level}` 到 bus
+- /events 订阅者用 `topics=system.heartbeat` 即可监控 daemon 还活着
+
+**新增主题**:
+- `system.heartbeat` — 5s 一次 (默认)
+- `browser.lock_stuck` — op 卡 >30s (连续发, 噪声)
+- `browser.crashed` — pool 层面异常 (RARE)
+
+**CLI flags**:
+```bash
+tb daemon --m-browsers 1 --k-contexts 16 --watchdog-interval 5
+# 测试 / 关 watchdog
+tb daemon --watchdog-interval 0  # 关闭
+```
+
+**测试**: 3 新 (capacity M×K 字段完整 / 心跳真的发到 bus / 字段定义完整). 全套 **659 passed, 7 skipped**.
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

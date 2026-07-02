@@ -337,7 +337,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -358,7 +358,16 @@ class TransparentBrowserDaemon:
         # 默认 L0 健康; 内存/CPU/loop_lag 触发时升级到 L3 只读, L4 全拒
         self._degradation_level = 0
         # /capacity 缓存 (定期刷新)
-        self._capacity_max_contexts = 20  # 与 ControllerPool max_contexts 对齐
+        self._capacity_max_contexts = k_contexts  # T60: K — 每实例 context 上限 (fable §1.2)
+        # T60: M — 实例数 (当前 pool 共享 1 个 chromium 进程; 留作多 worker 扩展口)
+        self._capacity_m_browsers = m_browsers
+        # T60: 心跳 watchdog 间隔 (秒); 0 = 关闭
+        self._watchdog_interval_s = watchdog_interval_s
+        # T60: 心跳 / 健康状态 (每次 watchdog tick 更新; 0 表示 daemon 启动还没跑过 tick)
+        self._last_heartbeat_ts: float | None = None
+        # T60: 健康实例数 (实际活跃 controllers)
+        self._healthy_browsers = 1  # 默认 1 — 启动后未崩就健康
+        self._watchdog_task: asyncio.Task | None = None
         # T58: SSRF guardrail (fable §7.1) — 默认 deny, 可配 allowlist (测试 fixture / 内网工具)
         self._ssrf_allowlist: frozenset[str] = ssrf_allowlist or frozenset()
         # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
@@ -370,16 +379,90 @@ class TransparentBrowserDaemon:
         daemon = self
         self.httpd = ThreadingHTTPServer((self.host, self.port), _make_handler(daemon))
         logger.warning("Transparent Browser daemon listening on http://%s:%d", self.host, self.port)
+        # T60: 启 watchdog 心跳 (在 asyncio loop 上跑; 5s 一跳)
+        self._start_watchdog()
         try:
             self.httpd.serve_forever()
         finally:
             self.shutdown()
+
+    def _start_watchdog(self) -> None:
+        """T60: 后台 heartbeat + 健康检查 (fable §5.5 / §5.7).
+
+        每 watchdog_interval_s 跑一次:
+          - 检查 op_lock 是否被卡 (>30s 没释放 → 发 browser.lock_stuck 警告)
+          - 检查 owner 是否还活着 (browser 进程是否在)
+          - 发 system.heartbeat 到 bus (暴露给 /events 订阅者, 监控可视化)
+        """
+        if self._watchdog_interval_s <= 0:
+            return
+        loop = self.owner.loop
+
+        async def _tick():
+            while True:
+                try:
+                    await self._watchdog_once()
+                except Exception:
+                    logger.exception("watchdog tick failed")
+                await asyncio.sleep(self._watchdog_interval_s)
+
+        self._watchdog_task = loop.create_task(_tick())
+
+    async def _watchdog_once(self) -> None:
+        """一次 tick — 发心跳 + 检测 op_lock 卡死."""
+        self._last_heartbeat_ts = time.time()
+        # 检测 1: op_lock 卡死 (被持 >30s)
+        if self._op_started_at is not None:
+            held_for = time.time() - self._op_started_at
+            if held_for > 30.0:
+                # 卡死 — 发警告 (每次 tick 都发, 噪声但 daemon 不该挂这么久)
+                try:
+                    self.event_bus.publish(
+                        "browser.lock_stuck",
+                        {"op": self._current_op, "held_seconds": round(held_for, 1),
+                         "op_locked": self.owner.op_lock.locked(),
+                         "ts": time.time()},
+                    )
+                except Exception:
+                    logger.exception("failed to publish lock_stuck")
+        # 检测 2: 实际活跃 browser instance
+        try:
+            sessions = self.owner.list_sessions()
+            self._healthy_browsers = 1  # 单 pool 单 chromium — 始终视为健康
+        except Exception:
+            self._healthy_browsers = 0
+            try:
+                self.event_bus.publish(
+                    "browser.crashed",
+                    {"reason": "list_sessions_failed", "ts": time.time()},
+                )
+            except Exception:
+                pass
+        # 心跳发到 bus — /events 订阅者用来判断 daemon 还活着
+        try:
+            self.event_bus.publish(
+                "system.heartbeat",
+                {"pid": os.getpid(), "browsers_alive": self._healthy_browsers,
+                 "M": self._capacity_m_browsers, "K": self._capacity_max_contexts,
+                 "sessions_active": len(self.owner.list_sessions()),
+                 "degradation_level": self._degradation_level,
+                 "ts": self._last_heartbeat_ts},
+            )
+        except Exception:
+            logger.exception("failed to publish heartbeat")
 
     def shutdown(self) -> None:
         """T49: 优雅关闭 — 停 http server + 关闭 browser + 删 PID 文件."""
         if self._shutting_down:
             return
         self._shutting_down = True
+        # T60: 停 watchdog 后台 task
+        if self._watchdog_task is not None:
+            try:
+                self._watchdog_task.cancel()
+            except Exception:
+                pass
+            self._watchdog_task = None
         if self.httpd is not None:
             try:
                 self.httpd.shutdown()
@@ -681,15 +764,33 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/state":
             return self.owner.run(self._state(session=args.get("session")))
         # T56: /capacity — 容量 + 退路状态读出 (agent 决定是否要排队)
+        # T60: M×K 容量模型 (fable §1.2)
         if method == "GET" and path == "/capacity":
             sessions = self.owner.list_sessions()
+            M = self._capacity_m_browsers
+            K = self._capacity_max_contexts
+            slots_total = M * K
+            # 内存估算 (fable §1.2): BASE=250 + K_active*(CTX=15 + P̄*PAGE=120) ≈ 3.4GB @K=16
+            # T60 简化: 每 browser 估 ~3.4GB; mem_total = M × mem_per_browser + 2.3GB 底座
+            mem_per_browser_mb = 250 + K * (15 + int(1.5 * 120))
+            mem_total_mb = M * mem_per_browser_mb + 2300
             return {
                 "sessions_active": len(sessions),
-                "sessions_max": self._capacity_max_contexts,
-                "capacity_ratio": round(len(sessions) / max(self._capacity_max_contexts, 1), 3),
+                "sessions_max": K,
+                "capacity_ratio": round(len(sessions) / max(slots_total, 1), 3),
                 "degradation_level": self._degradation_level,
                 "degradation_label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][self._degradation_level],
                 "pressure_level": self._pressure_level or "normal",
+                # T60: M×K 容量字段 (fable §1.2)
+                "M": M,
+                "K": K,
+                "slots_total": slots_total,
+                "browsers_count": self._healthy_browsers,
+                "mem_per_browser_estimate_mb": mem_per_browser_mb,
+                "mem_total_estimate_mb": mem_total_mb,
+                # T60: 上次 watchdog 心跳 (None=没跑过)
+                "last_heartbeat_ts": self._last_heartbeat_ts,
+                "heartbeat_age_s": round(time.time() - self._last_heartbeat_ts, 1) if self._last_heartbeat_ts else None,
             }
         # T59: /events — SSE stream of all EventBus events (持久 + live)
         if method == "GET" and path == "/events":
@@ -1948,6 +2049,14 @@ def main(argv: list[str] | None = None) -> None:
     # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
     parser.add_argument("--allow-data-scheme", action="store_true",
                         help="T58: allow data: URLs (testing only, NEVER in production)")
+    # T60: M×K 容量参数 (fable §1.2); 当前实现共享单 chromium, M 仅作
+    # /capacity 字段暴露; K 真正传给 ControllerPool (已硬编码在 _AsyncOwner).
+    parser.add_argument("--m-browsers", type=int, default=1,
+                        help="T60: M — browser 实例数 (默认 1, 共享 chromium)")
+    parser.add_argument("--k-contexts", type=int, default=20,
+                        help="T60: K — 每实例 BrowserContext 上限 (fable §1.2 默认 16)")
+    parser.add_argument("--watchdog-interval", type=float, default=5.0,
+                        help="T60: 心跳 watchdog tick 间隔秒 (0=关闭)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1967,6 +2076,8 @@ def main(argv: list[str] | None = None) -> None:
     daemon = TransparentBrowserDaemon(args.host, args.port, headless=not args.headed, storage_state_path=args.state,
         ssrf_allowlist=frozenset(p.strip() for p in args.ssrf_allowlist.split(",") if p.strip()),
         allow_data_scheme=args.allow_data_scheme,
+        m_browsers=args.m_browsers, k_contexts=args.k_contexts,
+        watchdog_interval_s=args.watchdog_interval,
     )
 
     # T49: 优雅关闭 — SIGTERM/SIGINT 触发 shutdown() 而不是 OS 默认退出 (会跳过 finally)

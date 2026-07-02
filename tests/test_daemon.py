@@ -1378,10 +1378,11 @@ class TestT59PressureEvents:
         collected: list[dict] = []
         stop = [False]
         # 用 _read_sse_frames 但要并发的 — 拿个简单方式: 后台读 frames
+        # max_frames=8 留出余量给 T60 新增的 system.heartbeat 事件
         def _reader():
             try:
                 _, frames = _read_sse_frames(host, port, "/events",
-                                              headers={}, timeout=4.0, max_frames=2)
+                                              headers={}, timeout=4.0, max_frames=8)
                 collected.extend(frames)
             except Exception as e:
                 collected.append({"_error": str(e)})
@@ -1556,6 +1557,81 @@ class TestT59PressureEvents:
         r = _http("GET", f"{daemon}/health")
         assert r["ok"] is True
         t.join(timeout=3)
+
+
+class TestT60WatchdogMxK:
+    """T60: Browser watchdog + M×K capacity (fable §5.5/§1.2)."""
+
+    def test_capacity_includes_mk_fields(self, daemon):
+        """/capacity 应暴露 M / K / slots_total / mem_* / browsers_count / heartbeat 信息."""
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["ok"] is True
+        data = r["data"]
+        # M×K 字段都在
+        for f in ("M", "K", "slots_total", "browsers_count",
+                  "mem_per_browser_estimate_mb", "mem_total_estimate_mb",
+                  "last_heartbeat_ts", "heartbeat_age_s"):
+            assert f in data, f"missing field {f}"
+        # 默认值 (fixture 默认 m=1, k=20, watchdog=5s)
+        assert data["M"] == 1
+        assert data["K"] == 20
+        assert data["slots_total"] == 20
+        # mem_per_browser formula: 250 + 20 * (15 + 180) = 250 + 3900 = 4150
+        assert data["mem_per_browser_estimate_mb"] == 4150
+        # mem_total = 1 * 4150 + 2300 = 6450
+        assert data["mem_total_estimate_mb"] == 6450
+        # browsers_count 默认 1
+        assert data["browsers_count"] == 1
+
+    def test_heartbeat_event_published_to_bus(self, daemon):
+        """watchdog 每 5s 发 system.heartbeat 到 bus; /events 订阅应能收到."""
+        host = "127.0.0.1"
+        port = int(daemon.rsplit(":", 1)[-1])
+        import threading
+        collected: list[dict] = []
+        def _reader():
+            try:
+                _, frames = _read_sse_frames(host, port, "/events?topics=system.*",
+                                              headers={}, timeout=10.0, max_frames=4)
+                collected.extend(frames)
+            except Exception:
+                pass
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        # 默认 watchdog_interval=5s — 等一个 tick 触发 (开箱即用)
+        time.sleep(6.5)
+        t.join(timeout=12)
+        topics = [f["data"].get("topic") for f in collected
+                  if isinstance(f.get("data"), dict)]
+        # 应有 system.heartbeat (watchdog tick) — 最多 1 帧
+        assert "system.heartbeat" in topics, (
+            f"expected system.heartbeat in {topics}"
+        )
+        # 验证 payload 内容
+        for f in collected:
+            if isinstance(f.get("data"), dict) and f["data"].get("topic") == "system.heartbeat":
+                payload = f["data"]["payload"]
+                assert "M" in payload
+                assert "K" in payload
+                assert "browsers_alive" in payload
+                assert payload["browsers_alive"] >= 0
+                break
+
+    def test_heartbeat_field_present_in_capacity(self, daemon):
+        """/capacity 应包含 last_heartbeat_ts + heartbeat_age_s 字段 (§5.5 健康监测).
+
+        此测试不强制断言值非 None — 因为 daemon 启动后是否已 tick 取决于
+        时序. heartbeat 实际触发的能力由 test_heartbeat_event_published_to_bus 验证.
+        """
+        r = _http("GET", f"{daemon}/capacity")
+        assert r["ok"] is True
+        data = r["data"]
+        # 字段必在 (即使值为 None; 表示 daemon 还没 tick 过)
+        assert "last_heartbeat_ts" in data
+        assert "heartbeat_age_s" in data
+        # 类型: None 或数字
+        assert data["last_heartbeat_ts"] is None or isinstance(data["last_heartbeat_ts"], (int, float))
+        assert data["heartbeat_age_s"] is None or isinstance(data["heartbeat_age_s"], (int, float))
 
 
 class TestDaemonClientCLI:

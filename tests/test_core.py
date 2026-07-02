@@ -6592,7 +6592,7 @@ class TestT48ResultEnvelope:
         s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
         daemon.port = port
 
-        def boom(method, path, args):
+        def boom(method, path, args, *extra):
             raise ConnectionError("DNS lookup failed: no such host")
         with patch.object(daemon, "_dispatch", side_effect=boom):
             server = HTTPServer(("127.0.0.1", port), _make_handler(daemon))

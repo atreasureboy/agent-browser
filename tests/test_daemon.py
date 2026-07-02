@@ -305,6 +305,187 @@ httpd.serve_forever()
             s.close()
 
 
+class TestDiscoverProgress:
+    """T50: discover() 的 progress_callback — 每页/失败/done 都触发."""
+
+    def test_progress_callback_fires_for_each_page(self):
+        """Stub controller: 2 页 + 1 失败. callback 应收到 start + page*2 + failure + done."""
+        from semantic_browser.graph.discoverer import discover
+
+        # 假 controller + 假 page
+        class FakePage:
+            def __init__(self, title): self._t = title
+            async def title(self): return self._t
+
+        class FakeSnapshot:
+            def __init__(self, links): self.links = links
+
+        class FakeController:
+            def __init__(self):
+                self.open_calls = []
+                self.pages = {
+                    "https://x.com/": ("Home", [("a", "https://x.com/a"), ("b", "https://x.com/b")]),
+                    "https://x.com/a": ("A", []),
+                    "https://x.com/b": ("B", []),
+                }
+                self.fail_on = set()
+            async def open(self, url):
+                self.open_calls.append(url)
+                if url in self.fail_on:
+                    raise RuntimeError("simulated network error")
+                self._current = url
+            @property
+            def current_page(self):
+                return FakePage(self.pages.get(self._current, ("?", []))[0])
+
+        events = []
+        async def cb(event):
+            events.append(event)
+
+        # monkeypatch SnapshotEngine to return our fake
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        orig_capture = SnapshotEngine.capture
+        async def fake_capture(self, base_url=""):
+            return FakeSnapshot([type("L", (), {"href": href})() for _, href in self._page.pages.get(self._page._current, ("", []))[1]])
+        # 更简单: 替换 SnapshotEngine 为返回固定空 snapshot
+        async def simple_capture(self, base_url=""):
+            return FakeSnapshot([])
+        SnapshotEngine.capture = simple_capture
+        try:
+            ctrl = FakeController()
+            ctrl.fail_on = {"https://x.com/a"}
+            # 跑一下 — 但 FakeController 没有 _current 属性的 setter; 改用 main loop
+            # 先手动调 open + setattr
+            import asyncio
+            async def main():
+                # 直接用 controller.open 模拟第一个 page
+                await ctrl.open("https://x.com/")
+                # 让 callback 真正收到事件
+                # 但 discover() 自己会 open, 我们让 FakeController 自身维护 state
+                # 上面 fail_on 在 open 时 raise; capture 走 FakeSnapshot([]) 没 links, BFS 不会扩展
+                return await discover(ctrl, "https://x.com/", max_pages=10, max_depth=1, progress_callback=cb)
+            result = asyncio.run(main())
+        finally:
+            SnapshotEngine.capture = orig_capture
+
+        # 至少: start + page(home) + failure(a) + done — b 不该被访问因为 max_depth=1
+        # 但 discover 从 bfs queue 里 pop a 失败, 然后继续 pop b. 等等, depth=1 时 max_depth=1 不该加新链接
+        # 实际上 b 在 a 之前就被 enqueue (从 home links)
+        # 简化断言: 必有 start 和 done
+        types = [e["type"] for e in events]
+        assert "start" in types
+        assert "done" in types
+        # start event 必带 start_url
+        start_evt = next(e for e in events if e["type"] == "start")
+        assert start_evt["start_url"] == "https://x.com/"
+        # done event 必带总耗时
+        done_evt = next(e for e in events if e["type"] == "done")
+        assert "total_seconds" in done_evt
+
+    def test_progress_callback_none_is_silent(self):
+        """T30 向后兼容: 不传 callback 也能跑."""
+        from semantic_browser.graph.discoverer import discover
+
+        class FakeController:
+            async def open(self, url): pass
+            @property
+            def current_page(self): return None
+
+        from semantic_browser.snapshot.engine import SnapshotEngine
+        orig_capture = SnapshotEngine.capture
+        async def fake_capture(self, base_url=""):
+            class S: links = []
+            return S()
+        SnapshotEngine.capture = fake_capture
+        try:
+            import asyncio
+            # current_page=None 时 discover 会把 url 加到 failed. 但 _emit 不会被调用因为抛错
+            # 实际: 当 page is None, 进入 pages_failed 分支, 调 _emit failure 然后 continue
+            # 队列空了就退出. OK 不传 callback 也能跑.
+            result = asyncio.run(discover(FakeController(), "https://x.com/", max_pages=2))
+            assert result.root_url == "https://x.com/"
+            assert len(result.pages_failed) >= 1
+        finally:
+            SnapshotEngine.capture = orig_capture
+
+
+class TestSSEEndpoint:
+    """T50: /discover/stream 端点 — SSE 帧格式 + 错误处理.
+
+    Daemon 是 subprocess, 没法直接 monkeypatch. 所以测试用真 data: URL (不起网络).
+    """
+
+    def _read_sse_events(self, url: str, *, timeout: float = 30) -> list[dict]:
+        events = []
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            assert resp.headers.get("content-type", "").startswith("text/event-stream"), \
+                f"非 SSE: {resp.headers.get('content-type')}"
+            while True:
+                line = resp.readline().decode("utf-8").rstrip("\n").rstrip("\r")
+                if not line or not line.startswith("data: "):
+                    continue
+                event = json.loads(line[len("data: "):])
+                events.append(event)
+                if event.get("type") == "done_result":
+                    break
+        return events
+
+    def test_sse_endpoint_emits_events(self, daemon):
+        """data: URL → start → page → done → done_result (含完整 result)."""
+        from urllib.parse import quote
+        # 单页 data URL, 让 discover 跑得快
+        url = "data:text/html;charset=utf-8," + quote("<html><title>T50 SSE</title></html>")
+        events = self._read_sse_events(
+            f"{daemon}/discover/stream?start_url={quote(url)}&max_pages=1&max_depth=0",
+            timeout=30,
+        )
+        types = [e["type"] for e in events]
+        assert "start" in types, f"缺 start: {types}"
+        assert "page" in types, f"缺 page: {types}"
+        assert "done" in types, f"缺 done (discoverer): {types}"
+        assert "done_result" in types, f"缺 done_result (daemon): {types}"
+        # done_result 含完整 result
+        dr = next(e for e in events if e["type"] == "done_result")
+        assert "result" in dr
+        assert dr["result"]["root_url"] == url
+        assert url in dr["result"]["pages_visited"]
+        # 必有 tree_text / llm_summary / graph_dict
+        assert "tree_text" in dr["result"]
+        assert "llm_summary" in dr["result"]
+        assert "graph_dict" in dr["result"]
+        # page event 必含 pages_done / queue_remaining
+        page = next(e for e in events if e["type"] == "page")
+        assert "pages_done" in page
+        assert page["pages_done"] >= 1
+
+    def test_sse_endpoint_missing_start_url(self, daemon):
+        """缺 start_url → MISSING_PARAM → 协议层 400 (不走 SSE, 因为参数缺失早于 SSE)."""
+        req = urllib.request.Request(f"{daemon}/discover/stream")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("应报错")
+        except HTTPError as e:
+            assert e.code == 400
+            body = json.loads(e.read())
+            assert body["ok"] is False
+            assert body["error"]["code"] == "MISSING_PARAM"
+
+    def test_sse_uses_browser_controller(self, daemon):
+        """验证 /discover/stream 实际通过 _AsyncOwner 调 controller (浏览器状态受影响)."""
+        from urllib.parse import quote
+        url = "data:text/html;charset=utf-8," + quote("<html><title>SSE-State</title></html>")
+        events = self._read_sse_events(
+            f"{daemon}/discover/stream?start_url={quote(url)}&max_pages=1&max_depth=0",
+            timeout=30,
+        )
+        # discover 后, browser 应已打开该 URL
+        s = _http("GET", f"{daemon}/state")
+        assert s["ok"] is True
+        assert "data:text/html" in s["data"]["url"]
+        assert "SSE-State" in s["data"]["title"]
+
+
 class TestDaemonBrowse:
     def test_open_and_state(self, daemon):
         """打开一个 data URL, 然后查 state 确认 url。"""

@@ -44,6 +44,7 @@ async def discover(
     max_depth: int = 2,
     same_domain_only: bool = True,
     delay_ms: int = 100,
+    progress_callback: Optional[Any] = None,
 ) -> DiscoveryResult:
     """T30: BFS 现场爬站点, 收集 page graph.
 
@@ -54,14 +55,30 @@ async def discover(
         max_depth: BFS 深度上限 (从 start_url = depth 0)
         same_domain_only: True → 只跟同域链接, 不跳外站
         delay_ms: 每页之间延迟 (ms), 礼貌爬取
+        progress_callback: T50 — 可选 async callable(event_dict). 每完成一页/失败时调一次.
+                           event_dict = {"type": "page"|"failure"|"done", ...}
+                           None = 静默 (向后兼容)
 
     Returns:
         DiscoveryResult 含 SiteGraph + tree_text + flat_list
     """
+    import time as _time
     result = DiscoveryResult(root_url=start_url)
     parsed_start = urlparse(start_url)
     start_domain = parsed_start.netloc
     result.graph = SiteGraph(root_url=start_url, domain=start_domain)
+    started_at = _time.time()
+
+    async def _emit(event: dict) -> None:
+        if progress_callback is None:
+            return
+        event.setdefault("elapsed_s", round(_time.time() - started_at, 2))
+        try:
+            await progress_callback(event)
+        except Exception as cb_err:
+            logger.warning("progress_callback raised: %s", cb_err)
+
+    await _emit({"type": "start", "start_url": start_url, "max_pages": max_pages, "max_depth": max_depth})
 
     visited: set[str] = set()
     queue: list[tuple[str, int]] = [(start_url, 0)]  # (url, depth)
@@ -76,13 +93,18 @@ async def discover(
             page = controller.current_page
             if page is None:
                 result.pages_failed.append((url, "no page after open"))
+                await _emit({"type": "failure", "url": url, "error": "no page after open",
+                             "pages_done": len(visited), "pages_failed": len(result.pages_failed)})
                 continue
             title = await page.title()
             engine = SnapshotEngine(page)
             snap = await engine.capture(base_url=url)
         except Exception as e:
-            result.pages_failed.append((url, f"{type(e).__name__}: {e}"[:100]))
+            err = f"{type(e).__name__}: {e}"[:100]
+            result.pages_failed.append((url, err))
             logger.warning("discover failed at %s: %s", url, e)
+            await _emit({"type": "failure", "url": url, "error": err,
+                         "pages_done": len(visited), "pages_failed": len(result.pages_failed)})
             continue
 
         visited.add(url)
@@ -92,6 +114,10 @@ async def discover(
             visited=True, depth=depth,
         )
         result.flat_list.append({"url": url, "title": title, "depth": depth})
+
+        await _emit({"type": "page", "url": url, "title": title, "depth": depth,
+                     "pages_done": len(visited), "pages_failed": len(result.pages_failed),
+                     "queue_remaining": len(queue)})
 
         if depth >= max_depth:
             continue
@@ -113,6 +139,10 @@ async def discover(
         "discover() done: visited=%d failed=%d max_pages=%d",
         len(result.pages_visited), len(result.pages_failed), max_pages,
     )
+    await _emit({"type": "done",
+                 "pages_done": len(visited),
+                 "pages_failed": len(result.pages_failed),
+                 "total_seconds": round(_time.time() - started_at, 2)})
     return result
 
 

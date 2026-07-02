@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -165,7 +166,10 @@ class TransparentBrowserDaemon:
         query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
         try:
             body = self._read_json(req) if method == "POST" else {}
-            result = self._dispatch(method, path, {**query, **body})
+            result = self._dispatch(method, path, {**query, **body}, req)
+            # T50: SSE 端点自己写了响应, _handle 不要再发
+            if result == "_SSE_HANDLED":
+                return
             # T48: success envelope. None data means "no result found" — still ok.
             self._send(req, 200, ok(result))
         except Exception as e:
@@ -195,7 +199,7 @@ class TransparentBrowserDaemon:
         req.end_headers()
         req.wfile.write(data)
 
-    def _dispatch(self, method: str, path: str, args: dict[str, Any]) -> Any:
+    def _dispatch(self, method: str, path: str, args: dict[str, Any], req: BaseHTTPRequestHandler | None = None) -> Any:
         if method == "GET" and path == "/health":
             # T49: 健康检查带上下文 — pid / uptime / 当前页 URL, agent 排查时省一次 roundtrip
             import time as _time
@@ -585,6 +589,12 @@ class TransparentBrowserDaemon:
         # T30: live site map discovery (vs /graph 走历史库)
         if method == "POST" and path == "/discover":
             return self.owner.run(self._discover(args))
+        # T50: 流式版 — SSE (Server-Sent Events), 客户端可用 EventSource 消费
+        if method == "GET" and path == "/discover/stream":
+            if req is None:
+                raise ValueError("/discover/stream requires req context")
+            self._stream_discover(req, args)
+            return "_SSE_HANDLED"
         if method == "POST" and path == "/find":
             url = args["url"]
             keyword = args["keyword"]
@@ -900,6 +910,113 @@ class TransparentBrowserDaemon:
             "llm_summary": format_sitemap_for_llm(result),
             "graph_dict": result.graph.to_dict(),
         }
+
+    def _stream_discover(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
+        """T50: SSE 流式 discover — 每页/失败/done 一个 event.
+
+        Event 格式 (JSON, 一行):
+          data: {"type": "start", "start_url": "...", ...}
+          data: {"type": "page", "url": "...", "title": "...", "pages_done": N}
+          data: {"type": "failure", "url": "...", "error": "..."}
+          data: {"type": "done_result", "result": {...完整 result...}}
+
+        实现要点:
+        - controller 的 async 方法必须跑在 _AsyncOwner.loop (浏览器绑定该 loop)
+        - progress_cb 在该 loop 上被调用, 通过线程安全 queue 把 event 传给 HTTP handler 线程
+        - 最终结果也通过同一 queue 传回, HTTP 线程在 done_result event 里序列化完整 result
+        """
+        import json as _json
+        from semantic_browser.llm import discover, format_sitemap_for_llm
+
+        start_url = args["start_url"]
+        max_pages = int(args.get("max_pages", 15))
+        max_depth = int(args.get("max_depth", 2))
+        same_domain_only = bool(args.get("same_domain_only", True))
+        delay_ms = int(args.get("delay_ms", 100))
+
+        # SSE headers
+        req.send_response(200)
+        req.send_header("content-type", "text/event-stream; charset=utf-8")
+        req.send_header("cache-control", "no-cache")
+        req.send_header("x-accel-buffering", "no")  # 禁用 nginx buffering
+        req.send_header("connection", "keep-alive")
+        req.end_headers()
+
+        event_queue: queue.Queue = queue.Queue(maxsize=128)
+
+        async def run_with_progress() -> None:
+            async def progress_cb(event: dict) -> None:
+                event_queue.put_nowait(event)
+
+            try:
+                result = await discover(
+                    self.owner.browser.controller,
+                    start_url=start_url,
+                    max_pages=max_pages,
+                    max_depth=max_depth,
+                    same_domain_only=same_domain_only,
+                    delay_ms=delay_ms,
+                    progress_callback=progress_cb,
+                )
+                final = {
+                    "root_url": result.root_url,
+                    "pages_visited": result.pages_visited,
+                    "pages_failed": [{"url": u, "error": e} for u, e in result.pages_failed],
+                    "flat_list": result.flat_list,
+                    "tree_text": result.tree_text,
+                    "llm_summary": format_sitemap_for_llm(result),
+                    "graph_dict": result.graph.to_dict(),
+                }
+                event_queue.put_nowait({"type": "_final", "result": final})
+            except Exception as e:
+                logger.exception("discover/stream failed")
+                event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
+
+        # 在 daemon 自己的 event loop 上调度 discover
+        self.owner.loop.call_soon_threadsafe(
+            asyncio.ensure_future, run_with_progress()
+        )
+
+        # HTTP handler 线程 (当前): 从 queue 读 event, 写 SSE 帧
+        try:
+            final_result: dict[str, Any] | None = None
+            idle_ticks = 0
+            while True:
+                try:
+                    event = event_queue.get(timeout=15)
+                    idle_ticks = 0
+                except queue.Empty:
+                    idle_ticks += 1
+                    # 超时 — 发 keepalive 防中间设备断连; 上限 4 次 (60s) 后放弃
+                    if idle_ticks > 4:
+                        logger.warning("SSE stream idle too long; closing")
+                        break
+                    try:
+                        req.wfile.write(b": keepalive\n\n")
+                        req.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    continue
+                if event.get("type") == "_final":
+                    final_result = event["result"]
+                    break
+                frame = b"data: " + _json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    logger.warning("SSE client disconnected mid-stream")
+                    return
+
+            done = {"type": "done_result"}
+            if final_result and "_error" in final_result:
+                done["error"] = final_result["_error"]
+            elif final_result:
+                done["result"] = final_result
+            req.wfile.write(b"data: " + _json.dumps(done, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            req.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.warning("SSE client disconnected")
 
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service

@@ -374,6 +374,61 @@ tb a11y-audit --standards wcag2aa,wcag21aa --max-nodes 10
 [serious]  link-name        1 node
 ```
 
+## T50 — 长任务进度流式回传 (SSE)
+
+`tb discover` 现场爬站点可能要 30 秒+, 之前调用方只能干等. T50 加 SSE (Server-Sent Events) 流式端点, 客户端实时拿每页进度:
+
+```bash
+# 流式 (推荐) — 边爬边打印, 不再 dry wait
+$ tb discover https://example.com --stream --max-pages 10
+[start] https://example.com max_pages=10 max_depth=2
+[1/10] https://example.com/ — Example Domain
+[2/8] https://example.com/page2 — Page Two
+[3/8] https://example.com/page3 — Page Three
+[done] pages=3 failed=0 in 1.2s
+Pages visited: 3
+Pages failed:  0
+
+example.com/
+├── /
+└── /page2
+    └── /page3
+
+# 老式 (阻塞, 等全部完成才返回) — 仍兼容
+$ tb discover https://example.com
+```
+
+**协议** (任何 HTTP client / EventSource 都能消费):
+```
+GET /discover/stream?start_url=...&max_pages=N&max_depth=N
+
+data: {"type": "start", "start_url": "...", "max_pages": N}
+data: {"type": "page", "url": "...", "title": "...", "pages_done": N, "queue_remaining": M}
+data: {"type": "failure", "url": "...", "error": "..."}
+data: {"type": "done", "pages_done": N, "pages_failed": M, "total_seconds": S}
+data: {"type": "done_result", "result": {完整 discover 结果, 含 tree_text / llm_summary / graph_dict}}
+```
+
+SSE header: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, keepalive comment (`:`) 每 15s 一次防中间设备断连.
+
+**Agent 用法** (Python):
+```python
+import urllib.request, json
+req = urllib.request.Request(f"{base}/discover/stream?start_url=...")
+with urllib.request.urlopen(req, timeout=300) as resp:
+    for line in resp:
+        if not line.startswith(b"data: "): continue
+        event = json.loads(line[6:])
+        if event["type"] == "page":
+            log(f"[{event['pages_done']}] {event['url']}")
+        elif event["type"] == "done_result":
+            result = event["result"]  # 完整 tree / graph
+```
+
+`discover()` 内部加可选 `progress_callback` 参数, SSE 端点只是它的 HTTP 包装; 想做别的传输 (websocket / 长轮询 / MCP progress notification) 也能复用同一回调.
+
+**测试**: 5 新 (2 unit 验证 discover 的 progress_callback 行为含 None 静默, 3 SSE 端点含 missing param / 真实 data URL 完整流 / browser state 副作用). 全套 **567 passed, 7 skipped**.
+
 ## T49 — Daemon 生命周期加固
 
 `tb daemon` 现在能正确处理崩溃/端口冲突/僵尸, 不再让用户面对裸 `OSError: address in use`:

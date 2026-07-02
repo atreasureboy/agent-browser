@@ -12,6 +12,8 @@ from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import urllib.parse  # T50: SSE stream url building
+
 import click
 
 DEFAULT_BASE = "http://127.0.0.1:8765"
@@ -62,6 +64,57 @@ def _print(data, json_out: bool = False):
         click.echo(data)
     else:
         click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _discover_stream(ctx, start_url: str, max_pages: int, max_depth: int, delay_ms: int) -> None:
+    """T50: 消费 /discover/stream 的 SSE 流, 实时打印进度, 结束打印最终 tree."""
+    params = {
+        "start_url": start_url,
+        "max_pages": str(max_pages),
+        "max_depth": str(max_depth),
+        "delay_ms": str(delay_ms),
+    }
+    url = ctx.obj["base"] + "/discover/stream?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url)
+    final_result: dict | None = None
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        # 逐行解析 SSE — "data: {...}\n" 格式
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").rstrip("\n").rstrip("\r")
+            if not line or line.startswith(":"):
+                continue  # 空行 / keepalive
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            t = event.get("type")
+            if t == "start":
+                click.echo(f"[start] {event.get('start_url')} max_pages={event.get('max_pages')} max_depth={event.get('max_depth')}", err=True)
+            elif t == "page":
+                click.echo(f"[{event.get('pages_done')}/{event.get('pages_done') + event.get('queue_remaining', 0)}] {event.get('url')} — {event.get('title', '')[:50]}", err=True)
+            elif t == "failure":
+                click.echo(f"[fail] {event.get('url')}: {event.get('error')}", err=True)
+            elif t == "done_result":
+                if "error" in event:
+                    raise click.ClickException(event["error"])
+                final_result = event.get("result")
+            elif t == "done":
+                click.echo(f"[done] pages={event.get('pages_done')} failed={event.get('pages_failed')} in {event.get('total_seconds', '?')}s", err=True)
+
+    if not final_result:
+        raise click.ClickException("SSE stream ended without done_result event")
+
+    click.echo(f"Pages visited: {len(final_result.get('pages_visited', []))}")
+    click.echo(f"Pages failed:  {len(final_result.get('pages_failed', []))}")
+    click.echo("")
+    click.echo(final_result.get("tree_text", "(empty)"))
+    if final_result.get("llm_summary"):
+        click.echo("")
+        click.echo("--- LLM summary (for agent) ---")
+        click.echo(final_result["llm_summary"])
 
 
 @click.group()
@@ -1672,16 +1725,23 @@ def memory_clear(ctx):
               help="BFS 深度 (从 start_url = 0)")
 @click.option("--delay-ms", default=100, show_default=True,
               help="每页之间延迟 (礼貌爬取)")
+@click.option("--stream", "stream_progress", is_flag=True,
+              help="T50: 流式 — 每页实时打印进度, 而不是等全部结束")
 @click.option("--json-out", is_flag=True)
 @click.pass_context
-def discover_cmd(ctx, start_url, max_pages, max_depth, delay_ms, json_out):
+def discover_cmd(ctx, start_url, max_pages, max_depth, delay_ms, stream_progress, json_out):
     """T30: 现场爬站点, 生成导航图给 agent 当参考.
 
     \b
     Examples:
       tb discover https://example.com
       tb discover https://example.com --max-pages 30 --max-depth 3
+      tb discover https://example.com --stream     # 实时打印进度
     """
+    if stream_progress:
+        _discover_stream(ctx, start_url, max_pages, max_depth, delay_ms)
+        return
+
     body = {
         "start_url": start_url,
         "max_pages": max_pages,

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,11 +25,38 @@ from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)
 
-_PID_DIR = Path.home() / ".semantic-browser"
-
-
 def _pid_path(port: int) -> Path:
-    return _PID_DIR / f"daemon-{port}.pid"
+    """每个 daemon 端口一个 PID 文件. 每次读 HOME env (而不是模块级常量),
+    让测试能改 HOME 隔离状态."""
+    return Path.home() / ".semantic-browser" / f"daemon-{port}.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着. signal 0 不发信号, 只检查权限/存在."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 进程存在, 但属于其他用户 (例如 root 起的 daemon)
+        return True
+
+
+def _read_pid_file(path: Path) -> tuple[int, str] | None:
+    """读 PID 文件, 解析 'pid\\nhost\\n' 格式. 失败返回 None."""
+    try:
+        lines = path.read_text().splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    if not lines:
+        return None
+    try:
+        pid = int(lines[0].strip())
+    except ValueError:
+        return None
+    host = lines[1].strip() if len(lines) > 1 else ""
+    return (pid, host)
 
 
 class _AsyncOwner:
@@ -91,10 +119,13 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 class TransparentBrowserDaemon:
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None) -> None:
+        import time as _time
         self.host = host
         self.port = port
+        self.started_at = _time.time()
         self.owner = _AsyncOwner(headless=headless, storage_state_path=storage_state_path)
         self.httpd: ThreadingHTTPServer | None = None
+        self._shutting_down = False
 
     def serve_forever(self) -> None:
         daemon = self
@@ -103,7 +134,30 @@ class TransparentBrowserDaemon:
         try:
             self.httpd.serve_forever()
         finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        """T49: 优雅关闭 — 停 http server + 关闭 browser + 删 PID 文件."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        if self.httpd is not None:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                logger.exception("Error stopping http server")
+        try:
             self.owner.close()
+        except Exception:
+            logger.exception("Error closing browser owner")
+        # 删 PID 文件 (我们自己起的 daemon 才有)
+        pid_file = _pid_path(self.port)
+        try:
+            if pid_file.exists() and pid_file.read_text().splitlines()[:1] == [str(os.getpid())]:
+                pid_file.unlink()
+        except OSError:
+            pass
 
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         parsed = urlparse(req.path)
@@ -143,7 +197,25 @@ class TransparentBrowserDaemon:
 
     def _dispatch(self, method: str, path: str, args: dict[str, Any]) -> Any:
         if method == "GET" and path == "/health":
-            return {"status": "ok"}
+            # T49: 健康检查带上下文 — pid / uptime / 当前页 URL, agent 排查时省一次 roundtrip
+            import time as _time
+            page_url = None
+            try:
+                # T49: 只读 current_page.url — 不要触发 _ensure_page 创建 about:blank
+                # (会污染 state — 例如 test_state_no_page_returns_http_400)
+                page = self.owner.browser.controller.current_page
+                if page is not None and not page.is_closed():
+                    page_url = page.url
+            except Exception:
+                pass
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "host": self.host,
+                "port": self.port,
+                "uptime_seconds": round(_time.time() - self.started_at, 1),
+                "page_url": page_url,
+            }
         if method == "GET" and path == "/state":
             return self.owner.run(self._state())
         if method == "POST" and path == "/open":
@@ -889,17 +961,69 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # 写 PID 文件供 `tb daemon stop` 使用。start_new_session 让子进程独立, 不影响父进程。
+
+    # T49: 启动前检查 PID 文件 + 端口占用 — 比 OSError 早一步给清晰错误
     pid_file = _pid_path(args.port)
+    stale = _check_stale_pid(pid_file)
+    if stale:
+        print(f"warning: removed stale PID file {pid_file} (pid {stale} not running)", file=__import__("sys").stderr)
+    if _port_in_use(args.host, args.port):
+        sys.exit(f"error: port {args.port} already in use on {args.host} (another daemon or process?)")
+
+    # 写 PID 文件供 `tb daemon stop` 使用。start_new_session 让子进程独立, 不影响父进程。
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(f"{os.getpid()}\n{args.host}\n")
+
+    daemon = TransparentBrowserDaemon(args.host, args.port, headless=not args.headed, storage_state_path=args.state)
+
+    # T49: 优雅关闭 — SIGTERM/SIGINT 触发 shutdown() 而不是 OS 默认退出 (会跳过 finally)
+    import signal as _signal
+    def _graceful(signum, frame):
+        logger.warning("Received signal %d, shutting down", signum)
+        daemon.shutdown()
+    _signal.signal(_signal.SIGTERM, _graceful)
+    _signal.signal(_signal.SIGINT, _graceful)
+
     try:
-        TransparentBrowserDaemon(args.host, args.port, headless=not args.headed, storage_state_path=args.state).serve_forever()
+        daemon.serve_forever()
     finally:
         try:
             pid_file.unlink()
         except FileNotFoundError:
             pass
+
+
+def _check_stale_pid(pid_file: Path) -> int | None:
+    """PID 文件存在但进程已死 → 删. 返回死掉的 PID (供提示), 否则 None."""
+    info = _read_pid_file(pid_file)
+    if info is None:
+        return None
+    pid, _ = info
+    if _pid_alive(pid):
+        return None
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
+    return pid
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """端口是否已被占用. 用 socket.bind 试, 失败即占用.
+
+    SO_REUSEADDR=1 让 TIME_WAIT 状态的端口也能 bind 成功 (因为我们后续真起 daemon 也要 REUSEADDR),
+    否则 daemon 死后立刻重启会误报 'port in use'.
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((host, port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
 
 
 if __name__ == "__main__":

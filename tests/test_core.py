@@ -6527,7 +6527,14 @@ class TestT48ResultEnvelope:
                 payload = json.loads(resp.read().decode("utf-8"))
             assert payload["ok"] is True
             assert payload["error"] is None
-            assert payload["data"] == {"status": "ok"}
+            d = payload["data"]
+            assert d["status"] == "ok"
+            # T49: /health 增强 — 必有 pid/port/host/uptime_seconds, page_url 可空
+            assert isinstance(d["pid"], int) and d["pid"] > 0
+            assert d["port"] == port
+            assert d["host"] == "127.0.0.1"
+            assert d["uptime_seconds"] >= 0
+            assert "page_url" in d
         finally:
             server.shutdown(); server.server_close()
 

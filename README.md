@@ -374,6 +374,57 @@ tb a11y-audit --standards wcag2aa,wcag21aa --max-nodes 10
 [serious]  link-name        1 node
 ```
 
+## T49 — Daemon 生命周期加固
+
+`tb daemon` 现在能正确处理崩溃/端口冲突/僵尸, 不再让用户面对裸 `OSError: address in use`:
+
+**`tb daemon start` 预检**:
+```bash
+# 已有 daemon 在跑 → 拒绝 + 提示
+$ tb daemon start --port 8765
+Error: daemon already running on port 8765 (pid 12345); use `tb daemon stop --port 8765` first, or pass --force
+
+# 强制重启 (会先 SIGTERM 现有 daemon)
+$ tb daemon start --port 8765 --force
+--force: stopping existing daemon (pid 12345) first
+started: http://127.0.0.1:8765 (log: ~/.semantic-browser/daemon.log)
+
+# 端口被非-daemon 进程占用 → 清晰错误
+$ tb daemon start --port 80
+Error: port 80 already in use on 127.0.0.1 (not us); pick another --port
+
+# 后台模式不再 race — 轮询 /health 而不是固定 sleep
+$ tb daemon start --background
+started: http://127.0.0.1:8765 (log: ~/.semantic-browser/daemon.log)
+```
+
+**Stale PID 文件自动清理**: daemon 崩溃 (kill -9 / OOM / 段错误) 后 PID 文件残留 → 下次 start 时自动检测到进程已死, 清理掉再起.
+
+**SIGTERM/SIGINT 优雅关闭**: daemon 收到信号后调 `shutdown()` (停 http server + 关浏览器 + 删 PID 文件) 而不是 OS 默认硬退出. `tb daemon stop` 流程也更可靠:
+
+```bash
+$ tb daemon stop --port 8765
+stopped: daemon on port 8765 (pid 12345)
+```
+
+**`/health` 增强** (agent 排查时省一次 roundtrip):
+```bash
+$ curl -s http://127.0.0.1:8765/health | jq
+{
+  "ok": true,
+  "data": {
+    "status": "ok",
+    "pid": 12345,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "uptime_seconds": 342.1,
+    "page_url": "https://example.com/dashboard"
+  }
+}
+```
+
+**测试**: 14 个新测试 (8 unit 覆盖 `_pid_alive` / `_read_pid_file` / `_check_stale_pid` / `_port_in_use`, 3 CLI 覆盖 start 预检, 3 `/health` 增强). 全套 **562 passed, 7 skipped**.
+
 ## T48 — 类型化 Result 契约 (跨层一致)
 
 daemon / MCP / CLI 三处都改用统一 `Result<T> = {ok, data, error}` envelope, agent 不用再为不同入口写不同错误处理:

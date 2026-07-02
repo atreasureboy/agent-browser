@@ -94,6 +94,216 @@ class TestDaemonLifecycle:
         assert r["ok"] is True
         assert r["data"]["status"] == "ok"
 
+    def test_health_includes_t49_context(self, daemon):
+        """T49: /health 必须带 pid/port/uptime/page_url — agent 排查时省一次 roundtrip."""
+        r = _http("GET", f"{daemon}/health")
+        d = r["data"]
+        assert isinstance(d["pid"], int) and d["pid"] > 0
+        assert isinstance(d["port"], int) and d["port"] > 0
+        assert d["host"]
+        assert d["uptime_seconds"] >= 0
+        # page_url: 还没 open 页面时是 None, open 之后才填
+        assert d["page_url"] is None
+
+    def test_health_page_url_after_open(self, daemon):
+        """T49: open 后 /health.page_url 应反映当前 URL."""
+        data_url = "data:text/html,<html><title>t49</title></html>"
+        _http("POST", f"{daemon}/open", {"url": data_url})
+        r = _http("GET", f"{daemon}/health")
+        assert "data:text/html" in r["data"]["page_url"]
+
+
+class TestDaemonLifecycleT49:
+    """T49: 启动前预检 / 优雅关闭 / 后台模式等就绪 — 直接 import 函数, 不起真 daemon."""
+
+    def test_pid_alive_for_current_process(self):
+        from semantic_browser.daemon.server import _pid_alive
+        assert _pid_alive(os.getpid()) is True
+
+    def test_pid_alive_for_nonexistent_pid(self):
+        from semantic_browser.daemon.server import _pid_alive
+        # 4M 是远超 PID 最大值的数字, 一定不存在
+        assert _pid_alive(4_000_000) is False
+
+    def test_read_pid_file_roundtrip(self, tmp_path):
+        from semantic_browser.daemon.server import _read_pid_file
+        f = tmp_path / "x.pid"
+        f.write_text("12345\n127.0.0.1\n")
+        assert _read_pid_file(f) == (12345, "127.0.0.1")
+
+    def test_read_pid_file_handles_missing(self, tmp_path):
+        from semantic_browser.daemon.server import _read_pid_file
+        assert _read_pid_file(tmp_path / "absent.pid") is None
+
+    def test_read_pid_file_handles_corrupt(self, tmp_path):
+        from semantic_browser.daemon.server import _read_pid_file
+        f = tmp_path / "x.pid"
+        f.write_text("not-a-number\n")
+        assert _read_pid_file(f) is None
+
+    def test_check_stale_pid_removes_dead_pid(self, tmp_path):
+        from semantic_browser.daemon.server import _check_stale_pid
+        f = tmp_path / "stale.pid"
+        f.write_text("4000000\n")  # 不存在的 PID
+        dead = _check_stale_pid(f)
+        assert dead == 4_000_000
+        assert not f.exists()
+
+    def test_check_stale_pid_keeps_live_pid(self, tmp_path):
+        from semantic_browser.daemon.server import _check_stale_pid
+        f = tmp_path / "live.pid"
+        f.write_text(f"{os.getpid()}\n")
+        assert _check_stale_pid(f) is None
+        assert f.exists()  # 不删
+
+    def test_port_in_use_detects_bind(self):
+        """我们手动 bind 一个端口, _port_in_use 应检出."""
+        from semantic_browser.daemon.server import _port_in_use
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            # s 没 listen; bind 已占
+            assert _port_in_use("127.0.0.1", port) is True
+        finally:
+            s.close()
+
+    def test_port_in_use_returns_false_for_free_port(self):
+        from semantic_browser.daemon.server import _port_in_use
+        # 找系统分配的空闲端口 (立刻释放)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        # 现在应该是空闲的 (有微小竞争但 99% 成立)
+        assert _port_in_use("127.0.0.1", port) is False
+
+
+class TestDaemonCLIStartPrecheck:
+    """T49: tb daemon start 的预检行为. 用真子进程 + 桩 /health 模拟 daemon."""
+
+    @staticmethod
+    def _fake_health_script(port: int) -> str:
+        """一个最小 HTTP server 脚本, 只响应 /health=200. SIGTERM/SIGINT 优雅退出.
+
+        用 os._exit 不用 sys.exit — signal handler 在 serve_forever 的 C-level select 中
+        被调用时, sys.exit 抛 SystemExit 可能被 select 吞掉; os._exit 强制立即终止.
+        """
+        return f"""
+import signal, sys, os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{{"status":"ok"}}')
+        else:
+            self.send_response(404); self.end_headers()
+    def log_message(self, *a, **k): pass
+
+httpd = ThreadingHTTPServer(('127.0.0.1', {port}), H)
+def _shutdown(*a):
+    try:
+        httpd.server_close()
+    finally:
+        os._exit(0)
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGINT, _shutdown)
+httpd.serve_forever()
+"""
+
+    def _spawn_fake_daemon(self, tmp_path, port: int):
+        """起 fake 子进程, 写 PID 文件指向它. 返回 (proc, pid_file)."""
+        script_path = tmp_path / "fake_daemon.py"
+        script_path.write_text(self._fake_health_script(port))
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        sb_dir = tmp_path / "home" / ".semantic-browser"
+        sb_dir.mkdir(parents=True)
+        pid_file = sb_dir / f"daemon-{port}.pid"
+        pid_file.write_text(f"{proc.pid}\n127.0.0.1\n")
+        # 等 /health ready
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
+                    if r.status == 200:
+                        return proc, pid_file
+            except Exception:
+                time.sleep(0.1)
+        proc.kill()
+        raise AssertionError("fake daemon never became ready")
+
+    def test_start_refuses_when_daemon_alive(self, tmp_path):
+        """已有一个 daemon 在跑 (PID 活着 + /health 通), 应拒绝并报错."""
+        from semantic_browser.client.cli import daemon_start
+        from click.testing import CliRunner
+
+        port = _free_port()
+        proc, _ = self._spawn_fake_daemon(tmp_path, port)
+        try:
+            runner = CliRunner()
+            result = runner.invoke(
+                daemon_start, ["--port", str(port)],
+                env={"HOME": str(tmp_path / "home")},
+            )
+            assert result.exit_code != 0, f"应拒绝 start, got exit={result.exit_code}: {result.output}"
+            assert "already running" in result.output or "use --force" in result.output
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def test_start_force_sends_sigterm_to_existing(self, tmp_path):
+        """--force: 应 SIGTERM 现有 daemon, 而不是直接报 'port in use'."""
+        from semantic_browser.client.cli import daemon_start
+        from click.testing import CliRunner
+
+        port = _free_port()
+        proc, _ = self._spawn_fake_daemon(tmp_path, port)
+        try:
+            runner = CliRunner()
+            # --background + --force: 先 SIGTERM 旧 daemon, 然后 Popen 新 daemon, 然后等就绪
+            # 我们只验证 SIGTERM 被发到原 PID (原 proc 被杀), 不真等新 daemon 就绪
+            # 用 catch_exceptions=False + 自己 timeout 即可; CliRunner 默认会跑完
+            # 实际这会卡住直到 10s 等就绪超时 — 但 PROC 已被 SIGTERM, 验证已生效
+            result = runner.invoke(
+                daemon_start, ["--port", str(port), "--force", "--background"],
+                env={"HOME": str(tmp_path / "home")},
+            )
+            # 关键断言: 原 fake daemon 进程已死 (被 SIGTERM 干掉)
+            assert proc.poll() is not None, (
+                f"原 fake daemon 应被 SIGTERM 杀, 但仍活着. cli output: {result.output}"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_start_refuses_port_in_use(self, tmp_path):
+        """端口被非-daemon 进程占用时, start 应给清晰错误."""
+        from semantic_browser.client.cli import daemon_start
+        from click.testing import CliRunner
+
+        port = _free_port()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", port))
+        try:
+            runner = CliRunner()
+            result = runner.invoke(
+                daemon_start, ["--port", str(port)],
+                env={"HOME": str(tmp_path / "home")},
+            )
+            assert result.exit_code != 0, f"应拒绝 start, got: {result.output}"
+            assert "already in use" in result.output or "port" in result.output.lower()
+        finally:
+            s.close()
+
 
 class TestDaemonBrowse:
     def test_open_and_state(self, daemon):

@@ -83,7 +83,75 @@ def daemon():
 @click.option("--headed", is_flag=True)
 @click.option("--state", help="storage_state JSON path")
 @click.option("--background", is_flag=True, help="start in background")
-def daemon_start(port, host, headed, state, background):
+@click.option("--force", is_flag=True,
+              help="Kill existing daemon on the same port before starting")
+def daemon_start(port, host, headed, state, background, force):
+    """Start the local browser daemon.
+
+    \b
+    Pre-checks (T49):
+    - PID file stale (process dead) → 自动清理
+    - 已有 daemon 在同端口 → 拒绝 (用 --force 强制重启)
+    - 端口被其他进程占用 → 清晰报错
+    """
+    from semantic_browser.daemon.server import (
+        _pid_path, _read_pid_file, _pid_alive, _check_stale_pid, _port_in_use,
+    )
+
+    pid_file = _pid_path(port)
+
+    # 1. 检查是否有 daemon 已在跑 (PID 文件 + 进程活 + /health 通)
+    info = _read_pid_file(pid_file)
+    if info:
+        existing_pid, existing_host = info
+        if _pid_alive(existing_pid):
+            # 进程活着, 试着打 /health 确认是 daemon (而非名字撞车的别的进程)
+            try:
+                with urlopen(f"http://{existing_host or host}:{port}/health", timeout=1) as r:
+                    if r.status == 200:
+                        if force:
+                            click.echo(f"--force: stopping existing daemon (pid {existing_pid}) first")
+                            os.kill(existing_pid, 15)
+                            # 等它退出 (最多 3s) — 用 /health 不可达作为信号, 比 _pid_alive 更可靠
+                            # (进程可能死透但 socket 还 hold)
+                            for _ in range(30):
+                                time.sleep(0.1)
+                                if not _pid_alive(existing_pid):
+                                    # 进程死了; 再多等一下确保 socket 释放
+                                    time.sleep(0.2)
+                                    break
+                            else:
+                                raise click.ClickException(
+                                    f"existing daemon (pid {existing_pid}) did not stop; try `tb daemon stop --port {port}` then retry"
+                                )
+                            pid_file.unlink(missing_ok=True)
+                        else:
+                            raise click.ClickException(
+                                f"daemon already running on port {port} (pid {existing_pid}); "
+                                f"use `tb daemon stop --port {port}` first, or pass --force"
+                            )
+            except (URLError, HTTPError, OSError):
+                # 进程活着但不是 daemon (或端口被别的占) — 不自动 kill, 让用户决定
+                if not force:
+                    raise click.ClickException(
+                        f"pid {existing_pid} alive on port {port} but not responding to /health; "
+                        f"pass --force to kill it, or stop manually first"
+                    )
+                os.kill(existing_pid, 15)
+                time.sleep(0.5)
+                pid_file.unlink(missing_ok=True)
+
+    # 2. 清理 stale PID 文件 (进程已死但文件还在)
+    stale = _check_stale_pid(pid_file)
+    if stale:
+        click.echo(f"removed stale PID file (pid {stale} no longer running)")
+
+    # 3. 端口预检
+    if _port_in_use(host, port):
+        raise click.ClickException(
+            f"port {port} already in use on {host} (not us); pick another --port"
+        )
+
     cmd = [sys.executable, "-m", "semantic_browser.daemon.server", "--host", host, "--port", str(port)]
     if headed:
         cmd.append("--headed")
@@ -94,8 +162,21 @@ def daemon_start(port, host, headed, state, background):
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("ab") as f:
             subprocess.Popen(cmd, stdout=f, stderr=f, stdin=subprocess.DEVNULL, start_new_session=True)
-        time.sleep(0.5)
-        click.echo(f"started: http://{host}:{port} (log: {log})")
+        # T49: 不再用固定 sleep; 轮询 /health 直到就绪 (最多 10s)
+        deadline = time.time() + 10
+        last_err = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://{host}:{port}/health", timeout=1) as r:
+                    if r.status == 200:
+                        click.echo(f"started: http://{host}:{port} (log: {log})")
+                        return
+            except (URLError, HTTPError, OSError) as e:
+                last_err = e
+                time.sleep(0.2)
+        raise click.ClickException(
+            f"daemon did not become ready within 10s; check {log}. last error: {last_err}"
+        )
     else:
         subprocess.call(cmd)
 

@@ -26,6 +26,7 @@ from semantic_browser.engine import SemanticBrowser
 from semantic_browser.snapshot.engine import SnapshotEngine
 from semantic_browser.browser.controller import BrowserConfig, BrowserController
 from semantic_browser.browser.pool import ControllerPool
+from semantic_browser.daemon.snapshots import SnapshotStore
 from semantic_browser.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
@@ -337,7 +338,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -374,6 +375,10 @@ class TransparentBrowserDaemon:
         self._allow_data_scheme: bool = allow_data_scheme
         # T59: SSE pressure events — 上次发布的压力等级 (None=未发布, 'normal'/'soft'/'high'/'critical')
         self._pressure_level: str | None = None
+        # T61: storage_state 自动快照 (fable §5.4)
+        self.snapshot_store = SnapshotStore(snapshots_root, snapshots_db)
+        self._sweep_interval_s = sweep_interval_s
+        self._sweep_task: asyncio.Task | None = None
 
     def serve_forever(self) -> None:
         daemon = self
@@ -381,6 +386,8 @@ class TransparentBrowserDaemon:
         logger.warning("Transparent Browser daemon listening on http://%s:%d", self.host, self.port)
         # T60: 启 watchdog 心跳 (在 asyncio loop 上跑; 5s 一跳)
         self._start_watchdog()
+        # T61: 启 storage_state 快照 sweeper (60s 扫 dirty)
+        self._start_snapshot_sweeper()
         try:
             self.httpd.serve_forever()
         finally:
@@ -463,6 +470,13 @@ class TransparentBrowserDaemon:
             except Exception:
                 pass
             self._watchdog_task = None
+        # T61: 停 snapshot sweeper
+        if self._sweep_task is not None:
+            try:
+                self._sweep_task.cancel()
+            except Exception:
+                pass
+            self._sweep_task = None
         if self.httpd is not None:
             try:
                 self.httpd.shutdown()
@@ -473,6 +487,11 @@ class TransparentBrowserDaemon:
             self.owner.close()
         except Exception:
             logger.exception("Error closing browser owner")
+        # T61: 关闭 SnapshotStore (关 sqlite)
+        try:
+            self.snapshot_store.close()
+        except Exception:
+            pass
         # 删 PID 文件 (我们自己起的 daemon 才有)
         pid_file = _pid_path(self.port)
         try:
@@ -499,6 +518,54 @@ class TransparentBrowserDaemon:
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
         "/admin/degrade", "/admin/restore",
     })
+
+    def _start_snapshot_sweeper(self) -> None:
+        """T61: 后台 sweeper — 定时扫 dirty session, 抓 storage_state 快照.
+
+        频率 (默认 60s) 满足 §5.4 RPO 上界. Sweep 走 daemon 自己的 event loop,
+        调 SnapshotStore.take_snapshot (await controller._context.storage_state()).
+        失败不重试, 只记 metrics + 发 system.snapshot.failed 到 bus.
+        """
+        if self._sweep_interval_s <= 0:
+            return
+        loop = self.owner.loop
+
+        async def _tick():
+            while True:
+                try:
+                    await self._sweep_snapshots_once()
+                except Exception:
+                    logger.exception("snapshot sweeper tick failed")
+                await asyncio.sleep(self._sweep_interval_s)
+
+        self._sweep_task = loop.create_task(_tick())
+
+    async def _sweep_snapshots_once(self) -> None:
+        """T61: 一次 sweep tick — 遍历所有 dirty session, 抓快照 + GC."""
+        dirty = self.snapshot_store.dirty_sessions()
+        if not dirty:
+            return
+        for sid in dirty:
+            try:
+                ctrl = await self.owner.aget_controller(sid)
+                snap_id = await self.snapshot_store.take_snapshot(
+                    sid, ctrl, trigger="auto_sweep",
+                )
+                if snap_id:
+                    self.event_bus.publish(
+                        "session.storage_state.saved",
+                        {"session_id": sid, "snapshot_id": snap_id, "trigger": "auto_sweep",
+                         "ts": time.time()},
+                    )
+                    # GC 旧快照 (留 3 份)
+                    self.snapshot_store.gc_old_snapshots(sid)
+            except Exception as e:
+                logger.warning("sweep: snapshot failed for %s: %s", sid, e)
+                self.event_bus.publish(
+                    "session.storage_state.failed",
+                    {"session_id": sid, "reason": f"{type(e).__name__}: {e}",
+                     "ts": time.time()},
+                )
 
     def _auto_degrade(self) -> None:
         """T56: 基于容量自动升降级 — 不经 Prometheus 回路 (fable §5.7).
@@ -1275,6 +1342,10 @@ class TransparentBrowserDaemon:
             raise SSRFBlockedError(f"open() blocked: {e}") from None
         ctrl = await self.owner.aget_controller(session)
         page = await ctrl.open(checked_url)
+        # T61: navigate 成功 → 标记 session dirty (sweep 会抓快照)
+        # session=None → default session (跟 controller pool 行为一致)
+        effective_session = session or _AsyncOwner.DEFAULT_SESSION
+        self.snapshot_store.mark_dirty(effective_session)
         snap = await SnapshotEngine(page).capture(base_url=checked_url)
         from semantic_browser.classifier.heuristic import PageClassifier
         cls = PageClassifier().classify(snap)

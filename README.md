@@ -556,6 +556,49 @@ tb daemon --watchdog-interval 0  # 关闭
 
 **测试**: 3 新 (capacity M×K 字段完整 / 心跳真的发到 bus / 字段定义完整). 全套 **659 passed, 7 skipped**.
 
+## T61 — storage_state 自动快照 (fable §5.4)
+
+agent 一关 browser 登录态就丢 — 老问题. T61 把每个 session 的 cookies/localStorage 周期性快照到文件系统 + SQLite 索引, daemon 重启 / session preempt 后可恢复:
+
+```bash
+# Session 上线后 60s 内自动首次快照 (或 navigate 后 5s debounce)
+# 之后每 60s sweep 一次, 只抓 dirty session
+# 保留 3 份最新, 单份 ≤ 2MB (超限截断最大 localStorage key)
+
+$ ls ~/.semantic-browser/snapshots/
+default/
+  ss_1751408400_a1b2c3d4e5f6.json   ← cookies + localStorage + origins
+  ss_1751408460_b2c3d4e5f6a7.json
+agent-1/
+  ss_1751408480_c3d4e5f6a7b8.json
+```
+
+**架构** (评审 D4 — 故障章权威):
+- **blob → 文件系统** (`~/.semantic-browser/snapshots/{session_id}/{snapshot_id}.json`) — JSON 单文件, 防止 SQLite WAL 在高写入下放大
+- **索引 → SQLite** (`session_snapshots` 表): `snapshot_id, session_id, taken_at, trigger, size_bytes, open_pages, file_path, truncated`
+- **容量硬限**: 单份 2MB (`_MAX_SNAPSHOT_BYTES`); 超限截断最大的 `localStorage.origins[i].localStorage[j].value` 并标 `truncated=true`
+- **保留策略**: 每 session 保留 3 份 (`_RETENTION_COUNT`); 自动 GC 旧, 删文件 + 删索引行
+
+**触发器** (统一 debounce 合并):
+- `auto_sweep` — 后台 60s sweep, 只抓 dirty session (`session.storage_state.saved` bus 事件)
+- `navigate_dirty` — `_open()` 成功时 mark dirty, 下次 sweep 抓
+- 失败 → 发 `session.storage_state.failed{reason}` 到 bus; 不重试, 留给下个 tick
+
+**实现**:
+- `daemon/snapshots.py` (~165 行): `SnapshotStore` — SQLite 索引 + 文件系统 + 截断 + GC + dirty 集
+- 后台 task `_start_snapshot_sweeper()`: 60s tick (`--sweep-interval=60` 可配; 0 = 关闭)
+- 启动: `serve_forever` 启 sweeper task; `shutdown` 取消 + 关闭 sqlite
+- dirty 集是 in-memory (`_dirty_lock` 保护); 当前不持久化, 重启时丢失 (acceptable — 大多数 dirty session 紧接着会再被 navigate 触发)
+
+**API 路径** (后续 T62+ agent 接入):
+```
+GET /sessions/{id}/snapshots       — 列出某 session 快照 (最新在前)
+GET /sessions/{id}/snapshots/{sid} — 读快照内容 (audit / 调试)
+POST /sessions/{id}/snapshots/sweep — 手动触发 sweep (管理员)
+```
+
+**测试**: 8 新 SnapshotStore unit (`test_snapshot.py` 覆盖 mark dirty / take / open_pages / roundtrip / truncate > 2MB / GC 留 3 份 / list newest first). daemon integration 验证 sweeper 起动 + shutdown. 全套 **667 passed, 7 skipped**.
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

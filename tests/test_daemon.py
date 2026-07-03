@@ -2747,3 +2747,185 @@ class TestT65p6TenantAgentIdentification:
         # default session 归 anonymous
         assert tenants.get("anonymous") == 1
 
+
+class TestT65p7LeaseFence:
+    """T65.7: 多 agent 共享 daemon — lease/fence 所有权原语.
+
+    设计要点:
+    - 每个 session 至多一个 active lease (DB UNIQUE INDEX 保证)
+    - fence_token per-session 单调, 旧 holder 僵复活后写被拒
+    - 同 agent 重复 acquire 走重入 (不创新 lease, 不 bump fence)
+    - 不同 agent acquire 占用中 session → BUSY 409
+    - 高优先级 (priority < cur.priority) + preempt=true → 抢占旧 lease
+    - release 后 fence bump, 旧 token 立刻失效
+    """
+
+    def test_acquire_returns_active_lease_with_fence_token_1(self, daemon):
+        """首次 acquire 返 ACTIVE lease + fence_token≥1 (per-session 单调)."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-1"})
+        r = _http("POST", f"{daemon}/sessions/lease-1/lease",
+                  {"agent_id": "agent-A", "tenant_id": "acme", "ttl_s": 60})
+        assert r.get("ok"), r
+        lease = r["data"]["lease"]
+        assert lease["state"] == "ACTIVE"
+        assert lease["session_id"] == "lease-1"
+        assert lease["agent_id"] == "agent-A"
+        assert lease["tenant_id"] == "acme"
+        # fence 单调递增 — DB 持久, 跨 daemon 重启跨测试都保留, 所以只断言 >= 1
+        assert lease["fence_token"] >= 1
+        # ULID 26 字符
+        assert len(lease["lease_id"]) == 26
+
+    def test_same_agent_reacquire_returns_same_lease_no_fence_bump(self, daemon):
+        """同 agent 重复 acquire → 重入, 返同 lease, fence_token 不变."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-re"})
+        r1 = _http("POST", f"{daemon}/sessions/lease-re/lease",
+                   {"agent_id": "agent-A", "tenant_id": "t"})
+        r2 = _http("POST", f"{daemon}/sessions/lease-re/lease",
+                   {"agent_id": "agent-A", "tenant_id": "t"})
+        assert r1.get("ok") and r2.get("ok")
+        assert r1["data"]["lease"]["lease_id"] == r2["data"]["lease"]["lease_id"]
+        assert r1["data"]["lease"]["fence_token"] == r2["data"]["lease"]["fence_token"]
+
+    def test_renew_with_correct_fence_extends_lease(self, daemon):
+        """renew 用对 fence_token → ok, expires_at_ms 推后."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-renew"})
+        r = _http("POST", f"{daemon}/sessions/lease-renew/lease",
+                  {"agent_id": "agent-A", "ttl_s": 30})
+        lease = r["data"]["lease"]
+        old_exp = lease["expires_at_ms"]
+
+        r2 = _http("POST", f"{daemon}/sessions/lease-renew/lease/{lease['lease_id']}/renew",
+                   {"fence_token": lease["fence_token"]})
+        assert r2.get("ok"), r2
+        assert r2["data"]["lease"]["expires_at_ms"] > old_exp, "renew 后 expires 应推后"
+        assert r2["data"]["lease"]["state"] == "ACTIVE"
+
+    def test_renew_with_wrong_fence_returns_fence_mismatch(self, daemon):
+        """renew 用错 fence_token → 409 FENCE_MISMATCH."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-bad-fence"})
+        r = _http("POST", f"{daemon}/sessions/lease-bad-fence/lease",
+                  {"agent_id": "agent-A"})
+        lease = r["data"]["lease"]
+
+        r2 = _http("POST", f"{daemon}/sessions/lease-bad-fence/lease/{lease['lease_id']}/renew",
+                   {"fence_token": 999})
+        assert not r2.get("ok")
+        assert r2["error"]["code"] == "FENCE_MISMATCH"
+
+    def test_release_with_correct_fence_marks_released(self, daemon):
+        """release 用对 fence_token → ok + state=RELEASED, get 后 active=null."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-rel"})
+        r = _http("POST", f"{daemon}/sessions/lease-rel/lease", {"agent_id": "a"})
+        lease = r["data"]["lease"]
+
+        r2 = _http("DELETE", f"{daemon}/sessions/lease-rel/lease/{lease['lease_id']}",
+                   {"fence_token": lease["fence_token"]})
+        assert r2.get("ok"), r2
+        assert r2["data"]["state"] == "RELEASED"
+
+        # get 应看到 null
+        r3 = _http("GET", f"{daemon}/sessions/lease-rel/lease")
+        assert r3.get("ok")
+        assert r3["data"]["lease"] is None
+
+    def test_release_bumps_fence_token_on_reacquire(self, daemon):
+        """release 后 fence bump → 下次 acquire 拿到更高 fence."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-bump"})
+        r1 = _http("POST", f"{daemon}/sessions/lease-bump/lease", {"agent_id": "a"})
+        ft1 = r1["data"]["lease"]["fence_token"]
+        lid1 = r1["data"]["lease"]["lease_id"]
+        _http("DELETE", f"{daemon}/sessions/lease-bump/lease/{lid1}",
+              {"fence_token": ft1})
+
+        r2 = _http("POST", f"{daemon}/sessions/lease-bump/lease", {"agent_id": "a"})
+        ft2 = r2["data"]["lease"]["fence_token"]
+        assert ft2 > ft1, f"re-acquire fence ({ft2}) 应 > 之前 ({ft1})"
+
+    def test_old_fence_token_invalid_after_reacquire(self, daemon):
+        """re-acquire 后用旧 fence_token renew → 409 FENCE_MISMATCH."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-stale"})
+        r1 = _http("POST", f"{daemon}/sessions/lease-stale/lease", {"agent_id": "a"})
+        ft_old = r1["data"]["lease"]["fence_token"]
+        lid_old = r1["data"]["lease"]["lease_id"]
+        _http("DELETE", f"{daemon}/sessions/lease-stale/lease/{lid_old}",
+              {"fence_token": ft_old})
+
+        r2 = _http("POST", f"{daemon}/sessions/lease-stale/lease", {"agent_id": "a"})
+        lid_new = r2["data"]["lease"]["lease_id"]
+        # 拿旧 fence_token renew 新 lease_id (lease_id 不同也走 LEASE_INVALID/FENCE_MISMATCH)
+        r3 = _http("POST", f"{daemon}/sessions/lease-stale/lease/{lid_new}/renew",
+                   {"fence_token": ft_old})
+        assert not r3.get("ok")
+        assert r3["error"]["code"] in ("FENCE_MISMATCH", "LEASE_INVALID"), r3
+
+    def test_different_agent_acquire_returns_busy(self, daemon):
+        """不同 agent acquire 已占用的 session → 409 BUSY."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-busy"})
+        _http("POST", f"{daemon}/sessions/lease-busy/lease", {"agent_id": "agent-A"})
+
+        r = _http("POST", f"{daemon}/sessions/lease-busy/lease",
+                  {"agent_id": "agent-B"})
+        assert not r.get("ok")
+        assert r["error"]["code"] == "BUSY", r
+        # holder 信息在 error.holder 里 — 谁占着
+        assert "holder" in r["error"]
+        assert r["error"]["holder"]["agent_id"] == "agent-A"
+
+    def test_preempt_with_higher_priority_succeeds(self, daemon):
+        """低 priority (数字小=高) + preempt=true → 抢占."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-pre"})
+        _http("POST", f"{daemon}/sessions/lease-pre/lease",
+              {"agent_id": "agent-A", "priority": 5})
+
+        r = _http("POST", f"{daemon}/sessions/lease-pre/lease",
+                  {"agent_id": "agent-B", "priority": 0, "preempt": True})
+        assert r.get("ok"), r
+        lease = r["data"]["lease"]
+        assert lease["agent_id"] == "agent-B"
+        assert lease["priority"] == 0
+        # preempted 字段记录被抢占的旧 lease
+        assert "preempted" in r["data"]
+        assert r["data"]["preempted"]["agent_id"] == "agent-A"
+        # 抢占应 bump fence
+        assert lease["fence_token"] >= 2
+
+    def test_preempt_with_lower_priority_rejected(self, daemon):
+        """高 priority 数字 (低优先) 抢占 → 409 BUSY_LOWER_PRIORITY."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-lowprio"})
+        _http("POST", f"{daemon}/sessions/lease-lowprio/lease",
+              {"agent_id": "agent-A", "priority": 1})
+
+        r = _http("POST", f"{daemon}/sessions/lease-lowprio/lease",
+                  {"agent_id": "agent-B", "priority": 5, "preempt": True})
+        assert not r.get("ok")
+        assert r["error"]["code"] == "BUSY_LOWER_PRIORITY"
+
+    def test_lease_get_returns_active_or_null(self, daemon):
+        """GET /sessions/{name}/lease 反映当前 active lease, 无 lease 时 null."""
+        _http("POST", f"{daemon}/sessions", {"name": "lease-state"})
+        r1 = _http("GET", f"{daemon}/sessions/lease-state/lease")
+        assert r1["data"]["lease"] is None
+
+        _http("POST", f"{daemon}/sessions/lease-state/lease", {"agent_id": "a"})
+        r2 = _http("GET", f"{daemon}/sessions/lease-state/lease")
+        assert r2["data"]["lease"] is not None
+        assert r2["data"]["lease"]["state"] == "ACTIVE"
+
+    def test_lease_routes_coexist_with_session_delete(self, daemon):
+        """route ordering: /sessions/{name}/lease/{id} DELETE 不被吞成 session delete."""
+        _http("POST", f"{daemon}/sessions", {"name": "route-test"})
+        r = _http("POST", f"{daemon}/sessions/route-test/lease", {"agent_id": "a"})
+        lid = r["data"]["lease"]["lease_id"]
+        ft = r["data"]["lease"]["fence_token"]
+
+        # DELETE lease 路径应只删 lease, 不删 session
+        r2 = _http("DELETE", f"{daemon}/sessions/route-test/lease/{lid}",
+                   {"fence_token": ft})
+        assert r2.get("ok"), r2
+        assert r2["data"]["state"] == "RELEASED"
+
+        # session 还在
+        r3 = _http("GET", f"{daemon}/sessions")
+        assert "route-test" in r3["data"]["sessions"]
+

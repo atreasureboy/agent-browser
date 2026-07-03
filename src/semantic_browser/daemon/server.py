@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -307,6 +308,12 @@ _STATUS_BY_CODE: dict[str, int] = {
     "DAEMON_DRAINING": 503,
     # T65.2: ?strict=true 模式下 LLM 失败返 503 (retryable) — 默认 silent fallback 维持
     "LLM_UNAVAILABLE": 503,
+    # T65.7: Lease/Fence — BUSY 409 (有 holder 在用), FENCE_MISMATCH 409 (旧 token)
+    "BUSY": 409,
+    "BUSY_LOWER_PRIORITY": 409,
+    "FENCE_MISMATCH": 409,
+    "LEASE_INVALID": 404,
+    "LEASE_LOST": 409,
     "INTERNAL": 500,
 }
 
@@ -317,6 +324,18 @@ class _SessionError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class _LeaseError(Exception):
+    """T65.7: Lease 操作失败的业务异常 — 带 code + optional holder info."""
+
+    def __init__(self, code: str, message: str, *,
+                 holder: dict[str, Any] | None = None,
+                 status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.holder = holder
+        self.status_code = status_code  # 显式 status override; None 时从 _STATUS_BY_CODE 取
 
 
 class _LLMUnavailableError(Exception):
@@ -457,7 +476,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0, leases_db: str | None = None, lease_heartbeat_ttl_s: float = 15.0) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -467,6 +486,10 @@ class TransparentBrowserDaemon:
         # T55: 持久化 Event Bus — SSE Last-Event-ID 续传 + 跨 SSE 状态共享
         self.event_bus = EventBus(event_bus_path)
         self.owner.run_coro(self.event_bus.start())
+        # T65.7: Lease/Fence — 多 agent 共享 daemon 所有权原语 (设计 §2)
+        from semantic_browser.daemon.lease import LeaseManager
+        self.lease_manager = LeaseManager(leases_db, heartbeat_ttl_s=lease_heartbeat_ttl_s)
+        self.lease_manager.start()
         self.httpd: ThreadingHTTPServer | None = None
         self._shutting_down = False
         # T51: op 跟踪 — 浏览器锁在 owner.op_lock 上
@@ -698,6 +721,11 @@ class TransparentBrowserDaemon:
         # T61: 关闭 SnapshotStore (关 sqlite)
         try:
             self.snapshot_store.close()
+        except Exception:
+            pass
+        # T65.7: 关闭 LeaseManager (停 reaper + 关 sqlite)
+        try:
+            self.lease_manager.close()
         except Exception:
             pass
         # 删 PID 文件 (我们自己起的 daemon 才有)
@@ -974,7 +1002,8 @@ class TransparentBrowserDaemon:
             self._enforce_degradation(method, path)
             # T62: drain 阻挡 — 在拿 op_lock 前就拒 (在飞的让它跑完, 新的一律拒)
             self._enforce_drain(method, path)
-            body = self._read_json(req) if method == "POST" else {}
+            # T65.7: POST + DELETE 都可能带 body (lease release / preempt 等)
+            body = self._read_json(req) if method in ("POST", "DELETE") else {}
             if needs_lock:
                 lock_wait_start = _time.time()
                 with _acquire_op_lock_or_503(self.owner):
@@ -1018,6 +1047,18 @@ class TransparentBrowserDaemon:
                 final_status = _STATUS_BY_CODE.get(e.code, 500)
                 final_code = e.code
                 self._send(req, final_status, err(e.code, str(e), retryable=False))
+                return
+            # T65.7: Lease/Fence 错误 — 带 holder info 让 client 看到是谁占着
+            if isinstance(e, _LeaseError):
+                final_status = e.status_code or _STATUS_BY_CODE.get(e.code, 500)
+                final_code = e.code
+                err_body: dict[str, Any] = {
+                    "code": e.code, "message": str(e), "retryable": False,
+                }
+                if e.holder:
+                    err_body["holder"] = e.holder
+                self._send(req, final_status, {"ok": False, "data": None,
+                                               "error": err_body})
                 return
             # T65.2: ?strict=true 模式下 LLM 失败 — 503 + Retry-After 让 agent
             # 知道是临时性故障, 可以 defer / 切到本地启发式
@@ -1082,14 +1123,29 @@ class TransparentBrowserDaemon:
                 }, elapsed)
 
     def _read_json(self, req: BaseHTTPRequestHandler) -> dict[str, Any]:
+        """读 POST body — 兼容 JSON 和 form-urlencoded.
+
+        T48/T65.7: 多数端点 (e.g. /sessions, /open) 走 JSON; 但 T65.7 lease 的
+        fence_token 也常走 query string (?fence_token=5). 这里先试 JSON,
+        失败再试 form-urlencoded, 都没有返 {}.
+        """
         length = int(req.headers.get("content-length", "0") or "0")
         if length == 0:
             return {}
         raw = req.rfile.read(length).decode("utf-8")
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("JSON body must be an object")
-        return data
+        # Try JSON first
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Fallback: form-urlencoded (e.g. fence_token=5)
+        try:
+            parsed = parse_qs(raw, keep_blank_values=True)
+            return {k: v[-1] for k, v in parsed.items()}
+        except Exception:
+            return {}
 
     def _send(self, req: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1327,6 +1383,18 @@ class TransparentBrowserDaemon:
                 "tenant_id": tenant_id, "agent_id": agent_id,
                 "active": self.owner.list_sessions(),
             }
+        # T65.7: Lease/Fence HTTP 入口 — /sessions/{name}/lease + /renew + DELETE
+        # 多 agent 共享 daemon 时, 获取 lease = 拿所有权, 写 op 必须带 lease_id + fence_token.
+        # 注意: 必须在 DELETE /sessions/{name} 之前匹配, 否则会被吞.
+        if method == "POST" and re.match(r"^/sessions/[^/]+/lease$", path):
+            return self._handle_lease_acquire(path, args)
+        if method == "POST" and re.match(r"^/sessions/[^/]+/lease/[^/]+/renew$", path):
+            return self._handle_lease_renew(path, args)
+        if method == "DELETE" and re.match(r"^/sessions/[^/]+/lease/[^/]+$", path):
+            return self._handle_lease_release(path, args)
+        # T65.7: 读 lease 状态 — /sessions/{name}/lease (GET)
+        if method == "GET" and re.match(r"^/sessions/[^/]+/lease$", path):
+            return self._handle_lease_get(path, args)
         if method == "DELETE" and path.startswith("/sessions/"):
             name = path[len("/sessions/"):]
             if not name:
@@ -1755,6 +1823,102 @@ class TransparentBrowserDaemon:
                 notes_list = [dict(r) for r in rows]
             return {"count": len(notes_list), "notes": notes_list}
         raise ValueError(f"unknown endpoint: {method} {path}")
+
+    # ── T65.7: Lease/Fence HTTP handlers ──────────────────────────
+
+    def _handle_lease_acquire(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """POST /sessions/{name}/lease — 获取/抢占 lease.
+
+        Body (form-encoded):
+          agent_id: str (必填)
+          tenant_id: str (默认 'anonymous')
+          priority: int (默认 1; 数字越小越高, 0=critical)
+          preempt: 'true'/'false' (默认 false)
+          ttl_s: float (默认 daemon 配置)
+        """
+        m = re.match(r"^/sessions/([^/]+)/lease$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        agent_id = args.get("agent_id") or ""
+        if not agent_id:
+            raise _LeaseError("MISSING_PARAM", "agent_id required")
+        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+        try:
+            priority = int(args.get("priority", "1"))
+        except ValueError:
+            priority = 1
+        preempt = str(args.get("preempt", "")).lower() in ("1", "true", "yes")
+        ttl_s: float | None = None
+        if args.get("ttl_s"):
+            try:
+                ttl_s = float(args["ttl_s"])
+            except ValueError:
+                pass
+
+        result = self.lease_manager.acquire(
+            session_id=session_name, agent_id=agent_id, tenant_id=tenant_id,
+            priority=priority, preempt=preempt, ttl_s=ttl_s,
+        )
+        if not result.ok:
+            # 409 Conflict — 当前 holder 在 lease 字段
+            raise _LeaseError(result.error or "UNKNOWN", f"acquire failed: {result.error}",
+                              holder=result.lease.to_dict() if result.lease else None,
+                              status_code=409)
+        out: dict[str, Any] = {"lease": result.lease.to_dict()}
+        if result.preempted:
+            out["preempted"] = result.preempted.to_dict()
+        # 同时记 session metadata (T65.6 一致性)
+        meta = self.owner.get_session_meta(session_name) or {}
+        if not meta or meta.get("tenant_id") == _AsyncOwner.DEFAULT_TENANT:
+            self.owner.set_session_meta(session_name, tenant_id=tenant_id, agent_id=agent_id)
+        return out
+
+    def _handle_lease_renew(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """POST /sessions/{name}/lease/{lease_id}/renew — 心跳续约."""
+        m = re.match(r"^/sessions/([^/]+)/lease/([^/]+)/renew$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        lease_id = m.group(2)
+        fence_token_str = args.get("fence_token", "0")
+        try:
+            fence_token = int(fence_token_str)
+        except ValueError:
+            raise _LeaseError("MISSING_PARAM", "fence_token required (int)")
+        ok, reason = self.lease_manager.heartbeat(lease_id, fence_token)
+        if not ok:
+            raise _LeaseError(reason, f"heartbeat failed: {reason}", status_code=409)
+        cur = self.lease_manager.get_lease(lease_id)
+        return {"lease": cur.to_dict() if cur else None}
+
+    def _handle_lease_release(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """DELETE /sessions/{name}/lease/{lease_id} — 主动释放."""
+        m = re.match(r"^/sessions/([^/]+)/lease/([^/]+)$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        lease_id = m.group(2)
+        fence_token_str = args.get("fence_token", "0")
+        try:
+            fence_token = int(fence_token_str)
+        except ValueError:
+            raise _LeaseError("MISSING_PARAM", "fence_token required (int)")
+        reason = args.get("reason") or "released"
+        ok, r = self.lease_manager.release(lease_id, fence_token, reason=reason)
+        if not ok:
+            raise _LeaseError(r, f"release failed: {r}", status_code=409)
+        return {"lease_id": lease_id, "state": "RELEASED", "reason": reason}
+
+    def _handle_lease_get(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """GET /sessions/{name}/lease — 看当前 active lease."""
+        m = re.match(r"^/sessions/([^/]+)/lease$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        cur = self.lease_manager.get_active_for_session(session_name)
+        return {
+            "session_id": session_name,
+            "lease": cur.to_dict() if cur else None,
+        }
 
     async def _state(self, session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)
@@ -2780,6 +2944,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="T65.1: snapshot sweeper + idle recycle 周期秒 (0=关闭)")
     parser.add_argument("--session-idle-timeout", type=float, default=300.0,
                         help="T65.1: session idle 自动回收秒数 (0=关闭, 默认 5min)")
+    parser.add_argument("--lease-heartbeat-ttl-s", type=float, default=15.0,
+                        help="T65.7: lease 默认 TTL (s), 客户端 1/3 TTL 续约一次")
     parser.add_argument("--drain-timeout", type=float, default=30.0,
                         help="T62: SIGTERM 后等在飞 op 完成的最长秒数 (fable §5.8)")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -2805,6 +2971,7 @@ def main(argv: list[str] | None = None) -> None:
         watchdog_interval_s=args.watchdog_interval,
         sweep_interval_s=args.sweep_interval,
         session_idle_timeout_s=args.session_idle_timeout,
+        lease_heartbeat_ttl_s=args.lease_heartbeat_ttl_s,
         drain_timeout_s=args.drain_timeout,
     )
 

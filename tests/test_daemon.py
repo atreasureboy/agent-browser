@@ -2518,10 +2518,11 @@ def daemon_bad_llm():
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-    try:
-        os.unlink(log_path)
-    except OSError:
-        pass
+    # DEBUG: 暂不清理 log
+    # try:
+    #     os.unlink(log_path)
+    # except OSError:
+    #     pass
 
 
 class TestT65p2StrictLLM:
@@ -2574,5 +2575,91 @@ class TestT65p2StrictLLM:
         assert r.get("ok"), f"non-strict LLM 失败应 silent fallback, got {r}"
         assert r["data"]["type_source"] in ("heuristic", "cached"), (
             f"silent fallback 应返 heuristic/cached, got {r['data'].get('type_source')}"
+        )
+
+
+@pytest.fixture
+def daemon_idle_recycle():
+    """T65.1: 启 daemon 时设 --session-idle-timeout=2 + --sweep-interval=1,
+    让 idle recycle 在测试时间内 (<5s) 触发."""
+    port = _free_port()
+    log_path = f"/tmp/tb-daemon-test-idle-{port}.log"
+    env = os.environ.copy()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port),
+         "--allow-data-scheme", "--sweep-interval", "1",
+         "--session-idle-timeout", "2"],
+        stdout=open(log_path, "wb"),
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    base = f"http://127.0.0.1:{port}"
+    # 等 daemon 就绪
+    for _ in range(60):
+        try:
+            r = _http("GET", f"{base}/health")
+            if r.get("ok") and r.get("data", {}).get("status") == "ok":
+                break
+        except (URLError, ConnectionRefusedError, OSError):
+            time.sleep(0.5)
+    else:
+        proc.kill()
+        pytest.fail(f"daemon_idle_recycle did not start; see {log_path}")
+
+    yield base
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+class TestT65p1SessionIdleRecycle:
+    """T65.1: 闲置超过 session_idle_timeout 的非 default session 自动 close +
+    从 /sessions 列表移除 + 发 session.expired 到 EventBus."""
+
+    def test_idle_session_recycled_after_timeout(self, daemon_idle_recycle):
+        """创建 session → 等超过 idle timeout → 验证 session 自动消失."""
+        # 1. 创建新 session
+        r = _http("POST", f"{daemon_idle_recycle}/sessions",
+                  {"name": "idle-test-1"})
+        assert r.get("ok"), f"创建 session 应成功: {r}"
+        # 2. 验证 session 在列表里
+        r = _http("GET", f"{daemon_idle_recycle}/sessions")
+        assert "idle-test-1" in r["data"]["sessions"], (
+            f"刚创建的 session 应在列表, got {r['data']['sessions']}"
+        )
+        # 3. 等 idle timeout + sweep tick (2s + 1s + 一点 buffer)
+        time.sleep(4)
+        # 4. session 应已被回收
+        r = _http("GET", f"{daemon_idle_recycle}/sessions")
+        assert "idle-test-1" not in r["data"]["sessions"], (
+            f"idle session 应被回收, got {r['data']['sessions']}"
+        )
+
+    def test_default_session_never_recycled(self, daemon_idle_recycle):
+        """default session 永不被 idle 回收 (跟 release_session 一致)."""
+        # 不创建额外 session, 只等 idle 周期
+        time.sleep(4)
+        r = _http("GET", f"{daemon_idle_recycle}/sessions")
+        assert "default" in r["data"]["sessions"], (
+            f"default session 永不应被 idle 回收, got {r['data']['sessions']}"
+        )
+
+    def test_active_session_not_recycled(self, daemon_idle_recycle):
+        """持续操作的 session 不应被 idle 回收."""
+        r = _http("POST", f"{daemon_idle_recycle}/sessions",
+                  {"name": "active-test"})
+        assert r.get("ok")
+        # 每 1s touch 一次, 总共 4s — 不应被回收 (touch 间隔 < idle timeout 2s).
+        # 用 ?session=active-test 触发 aget_controller 更新 last_used.
+        for _ in range(4):
+            time.sleep(1)
+            _http("GET", f"{daemon_idle_recycle}/state?session=active-test")
+        # 验证 session 还在
+        r = _http("GET", f"{daemon_idle_recycle}/sessions")
+        assert "active-test" in r["data"]["sessions"], (
+            f"持续 touch 的 session 不应被回收, got {r['data']['sessions']}"
         )
 

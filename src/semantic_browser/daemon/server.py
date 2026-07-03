@@ -80,7 +80,8 @@ class _AsyncOwner:
         def __init__(self, controller: BrowserController) -> None:
             self.controller = controller
 
-    def __init__(self, headless: bool = True, storage_state_path: str | None = None) -> None:
+    def __init__(self, headless: bool = True, storage_state_path: str | None = None,
+                 k_contexts: int = 16) -> None:
         import threading as _threading
         self.loop = asyncio.new_event_loop()
         self.config = BrowserConfig(
@@ -88,14 +89,18 @@ class _AsyncOwner:
             storage_state_path=os.path.expanduser(storage_state_path) if storage_state_path else None,
         )
         # T54: 共享 chromium 进程 + 多 BrowserContext
-        self.pool = ControllerPool(self.config, max_contexts=20)
+        # T65.5: 用 daemon 的 k_contexts (默认 16) — 之前硬编码 20 是 K=20 时代的遗留.
+        self.pool = ControllerPool(self.config, max_contexts=k_contexts)
         self.thread = threading.Thread(target=self._run_loop, name="tb-daemon-loop", daemon=True)
         self.thread.start()
         # T51: 浏览器操作串行化锁 (放在 owner 上, _acquire_op_lock_or_503 直接拿)
         self.op_lock = _threading.Lock()
+        # T65.1: per-session last_used 跟踪 — idle recycle 用
+        self._session_last_used: dict[str, float] = {}
         self.run(self.pool.start())
         # 预创建 default session — 保留 .browser 兼容旧代码
         default_ctrl = self.run(self.pool.acquire(self.DEFAULT_SESSION))
+        self._session_last_used[self.DEFAULT_SESSION] = time.time()  # T65.1
         self.browser = self._BrowserShim(default_ctrl)
 
     def _run_loop(self) -> None:
@@ -118,14 +123,33 @@ class _AsyncOwner:
 
         注意: 已经在 event loop 上的 coroutine 不能调这个, 会 deadlock.
         那种情况直接 await self.pool.acquire(name).
+        T65.1: touch session (更新 last_used_at) 用于 idle 回收.
         """
         name = name or self.DEFAULT_SESSION
-        return self.run(self.pool.acquire(name))
+        ctrl = self.run(self.pool.acquire(name))
+        self._session_last_used[name] = time.time()
+        return ctrl
 
     async def aget_controller(self, name: str | None = None) -> BrowserController:
-        """T54: async 版本 — 给已经在 event loop 上的 coroutine 用 (不会 deadlock)."""
+        """T54: async 版本 — 给已经在 event loop 上的 coroutine 用 (不会 deadlock).
+        T65.1: touch session."""
         name = name or self.DEFAULT_SESSION
-        return await self.pool.acquire(name)
+        ctrl = await self.pool.acquire(name)
+        self._session_last_used[name] = time.time()
+        return ctrl
+
+    def get_idle_sessions(self, idle_timeout_s: float) -> list[str]:
+        """T65.1: 返回所有 idle 超过 idle_timeout_s 秒的 session 列表
+        (排除 default session — 不能被回收)."""
+        now = time.time()
+        return [
+            n for n, ts in self._session_last_used.items()
+            if n != self.DEFAULT_SESSION and (now - ts) >= idle_timeout_s
+        ]
+
+    def touch_session(self, name: str) -> None:
+        """T65.1: 显式 touch — 路由 handler 在每个 op 开始/结束时调, 不依赖 aget."""
+        self._session_last_used[name] = time.time()
 
     def run_coro(self, coro):
         """T55: 在 daemon event loop 上跑一个 coroutine (从 daemon 主线程调用)."""
@@ -137,7 +161,13 @@ class _AsyncOwner:
         return self.pool.list_active()
 
     def release_session(self, name: str) -> bool:
-        """T54: 关闭并移除指定 session. 返回是否真释放了一个."""
+        """T54: 关闭并移除指定 session. 返回是否真释放了一个.
+        T65.1: 同时清掉 _session_last_used 跟踪.
+
+        给 HTTP handler (跨线程) 用 — 内部调 self.run() 把协程扔到 loop 线程.
+        T65.1 修: 不能在 event loop 线程上直接调这个, 会 deadlock (loop 等
+        fut.result, fut 等 loop 处理). 在 loop 线程上请用 arelease_session().
+        """
         if name == self.DEFAULT_SESSION:
             return False  # default 不能释放
 
@@ -146,7 +176,24 @@ class _AsyncOwner:
                 return self.pool._controllers.pop(name, None) is not None
 
         try:
-            return self.run(_release())
+            ok = self.run(_release())
+            if ok:
+                self._session_last_used.pop(name, None)
+            return ok
+        except Exception:
+            return False
+
+    async def arelease_session(self, name: str) -> bool:
+        """T65.1: async 版 release — 给已经在 event loop 上的代码用
+        (e.g. _sweep_idle_sessions). 不会 deadlock."""
+        if name == self.DEFAULT_SESSION:
+            return False
+        try:
+            async with self.pool._lock:
+                ok = self.pool._controllers.pop(name, None) is not None
+            if ok:
+                self._session_last_used.pop(name, None)
+            return ok
         except Exception:
             return False
 
@@ -375,12 +422,13 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, drain_timeout_s: float = 30.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0) -> None:
         import time as _time
         self.host = host
         self.port = port
         self.started_at = _time.time()
-        self.owner = _AsyncOwner(headless=headless, storage_state_path=storage_state_path)
+        self.owner = _AsyncOwner(headless=headless, storage_state_path=storage_state_path,
+                              k_contexts=k_contexts)
         # T55: 持久化 Event Bus — SSE Last-Event-ID 续传 + 跨 SSE 状态共享
         self.event_bus = EventBus(event_bus_path)
         self.owner.run_coro(self.event_bus.start())
@@ -416,6 +464,14 @@ class TransparentBrowserDaemon:
         self.snapshot_store = SnapshotStore(snapshots_root, snapshots_db)
         self._sweep_interval_s = sweep_interval_s
         self._sweep_task: asyncio.Task | None = None
+        # T65.1: session idle 自动回收 — 闲置超过 N 秒的 session 自动 close + 移除.
+        # CLI --session-idle-timeout 优先; 否则读 env DAEMON_SESSION_IDLE_TIMEOUT_S;
+        # 默认 300s 适合长 agent 会话. None 表示走 env/default.
+        self._session_idle_timeout_s: float = (
+            session_idle_timeout_s
+            if session_idle_timeout_s is not None
+            else float(os.environ.get("DAEMON_SESSION_IDLE_TIMEOUT_S", "300"))
+        )
         # T62: graceful drain (fable §5.8)
         # SIGTERM/SIGINT 触发 _draining 标记, 拒新 op, 等在飞完成, 然后真退出.
         self._draining: bool = False
@@ -454,6 +510,11 @@ class TransparentBrowserDaemon:
           - 检查 op_lock 是否被卡 (>30s 没释放 → 发 browser.lock_stuck 警告)
           - 检查 owner 是否还活着 (browser 进程是否在)
           - 发 system.heartbeat 到 bus (暴露给 /events 订阅者, 监控可视化)
+
+        T65.1 修: loop 在 owner 线程跑, _start_watchdog 是 HTTP server 线程调的,
+        不能 loop.create_task() (跨线程 silently 被 loop 忽略). 必须
+        asyncio.run_coroutine_threadsafe() 调度, 返 concurrent.futures.Future
+        (cancel() 一样用).
         """
         if self._watchdog_interval_s <= 0:
             return
@@ -467,7 +528,7 @@ class TransparentBrowserDaemon:
                     logger.exception("watchdog tick failed")
                 await asyncio.sleep(self._watchdog_interval_s)
 
-        self._watchdog_task = loop.create_task(_tick())
+        self._watchdog_task = asyncio.run_coroutine_threadsafe(_tick(), loop)
 
     async def _watchdog_once(self) -> None:
         """一次 tick — 发心跳 + 检测 op_lock 卡死."""
@@ -661,6 +722,8 @@ class TransparentBrowserDaemon:
         频率 (默认 60s) 满足 §5.4 RPO 上界. Sweep 走 daemon 自己的 event loop,
         调 SnapshotStore.take_snapshot (await controller._context.storage_state()).
         失败不重试, 只记 metrics + 发 system.snapshot.failed 到 bus.
+
+        T65.1 修: 跟 _start_watchdog 同样的跨线程坑 — 必须 run_coroutine_threadsafe.
         """
         if self._sweep_interval_s <= 0:
             return
@@ -668,13 +731,20 @@ class TransparentBrowserDaemon:
 
         async def _tick():
             while True:
+                logger.info("sweep tick: starting (interval=%.1fs)", self._sweep_interval_s)
                 try:
                     await self._sweep_snapshots_once()
                 except Exception:
                     logger.exception("snapshot sweeper tick failed")
+                # T65.1: 同一 tick 里也跑 idle 回收 — 不用再开后台 task
+                try:
+                    await self._sweep_idle_sessions()
+                except Exception:
+                    logger.exception("idle sweeper tick failed")
+                logger.info("sweep tick: done")
                 await asyncio.sleep(self._sweep_interval_s)
 
-        self._sweep_task = loop.create_task(_tick())
+        self._sweep_task = asyncio.run_coroutine_threadsafe(_tick(), loop)
 
     async def _sweep_snapshots_once(self) -> None:
         """T61: 一次 sweep tick — 遍历所有 dirty session, 抓快照 + GC."""
@@ -702,6 +772,48 @@ class TransparentBrowserDaemon:
                     {"session_id": sid, "reason": f"{type(e).__name__}: {e}",
                      "ts": time.time()},
                 )
+
+    def _sweep_idle_sessions(self) -> None:
+        """T65.1: 一次 idle 回收 tick — 遍历所有 idle 超时的非 default session,
+        调 release_session + 发 session.expired 到 EventBus.
+
+        复用 snapshot sweeper 周期 (默认 60s) — 单独开 task 会增加无谓的 wakeup,
+        且 idle 回收秒级精度无意义. 默认 300s timeout → 实际感知延迟 ≤ 360s.
+
+        设计取舍: 不调 snapshot_store 抓 idle session 的 storage_state — 闲置的
+        session 通常 agent 已结束工作, 强抓意义不大, 释放 BrowserContext 即可.
+        agent 真要持久化应在 op 结束时显式 /admin/snapshot.
+
+        T65.1 修: 必须 await owner.arelease_session (在 event loop 线程上),
+        不能调 sync 的 release_session (内部 self.run → fut.result 死锁).
+        因此整个方法变 async — 由 _tick() await.
+        """
+        if self._session_idle_timeout_s <= 0:
+            return
+        idle = self.owner.get_idle_sessions(self._session_idle_timeout_s)
+        logger.info("idle recycle check: timeout=%.0fs, last_used=%s, idle=%s",
+                    self._session_idle_timeout_s,
+                    {n: int(time.time() - t) for n, t in self.owner._session_last_used.items()},
+                    idle)
+        return self._do_idle_recycle(idle)
+
+    async def _do_idle_recycle(self, idle: list[str]) -> None:
+        for sid in idle:
+            try:
+                ok = await self.owner.arelease_session(sid)
+                logger.info("idle recycle: arelease_session(%s) returned %s",
+                            sid, ok)
+                if ok:
+                    logger.info("idle recycle: released session %s (idle >= %.0fs)",
+                                sid, self._session_idle_timeout_s)
+                    self.event_bus.publish(
+                        "session.expired",
+                        {"session_id": sid, "reason": "idle_timeout",
+                         "timeout_s": self._session_idle_timeout_s,
+                         "ts": time.time()},
+                    )
+            except Exception as e:
+                logger.warning("idle recycle failed for %s: %s", sid, e)
 
     def _auto_degrade(self) -> None:
         """T56: 基于容量自动升降级 — 不经 Prometheus 回路 (fable §5.7).
@@ -2579,6 +2691,10 @@ def main(argv: list[str] | None = None) -> None:
                         help="T65.5: K — 每实例 BrowserContext 上限 (fable §1.2 hard=16)")
     parser.add_argument("--watchdog-interval", type=float, default=5.0,
                         help="T60: 心跳 watchdog tick 间隔秒 (0=关闭)")
+    parser.add_argument("--sweep-interval", type=float, default=60.0,
+                        help="T65.1: snapshot sweeper + idle recycle 周期秒 (0=关闭)")
+    parser.add_argument("--session-idle-timeout", type=float, default=300.0,
+                        help="T65.1: session idle 自动回收秒数 (0=关闭, 默认 5min)")
     parser.add_argument("--drain-timeout", type=float, default=30.0,
                         help="T62: SIGTERM 后等在飞 op 完成的最长秒数 (fable §5.8)")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -2602,6 +2718,8 @@ def main(argv: list[str] | None = None) -> None:
         allow_data_scheme=args.allow_data_scheme,
         m_browsers=args.m_browsers, k_contexts=args.k_contexts,
         watchdog_interval_s=args.watchdog_interval,
+        sweep_interval_s=args.sweep_interval,
+        session_idle_timeout_s=args.session_idle_timeout,
         drain_timeout_s=args.drain_timeout,
     )
 

@@ -2,6 +2,25 @@
 
 格式: T 编号 + 中文短标题 + 子项 bullet + commit hash; 时间倒序 (新→旧). 不是 Keep a Changelog.
 
+## T66.7 — Audit coverage expansion (C1 + C2 + C4 + C7)
+
+**Headline**: T66.6 修完 audit event 的 tenant_id 后, 继续审计发现核心所有权原语和 session 生命周期还有 4 类盲区 — 多 agent 共享 daemon 时 ops 缺可观测性.
+
+**新增事件 (C1)**:
+- `session.lease.acquired` — POST /sessions/{name}/lease. payload: `lease_id`/`fence_token`/`agent_id`/`preempted_lease_id`/`priority`. dedup 按 lease_id.
+- `session.lease.released` — DELETE /sessions/{name}/lease/{id}. payload: `lease_id`/`fence_token`/`reason`. dedup 按 lease_id.
+- `session.handoff.offered` — POST /sessions/{name}/handoff. payload: `from_agent`/`to_agent`/`offer_token`/`deadline_ms`/`ttl_s`. 跟 `session.handed_off` (accept 端) 配对. **额外**: 跟 T66.6.2 一致, handoff_offer 现在用 `cur.tenant_id` 不用 body.
+
+**Tenant_id 补齐 (C2)**: 新增 `_publish_with_session_tenant` helper — 自动从 `lease_manager.sessions_index` (持久化, 跨重启) 读 tenant_id, fallback in-memory meta. 统一给 `session.storage_state.saved`/`failed`, `session.expired` 用. 修复: 这些事件之前 scope 字段写 'session' 但 tenant_id 字段没设, 订阅者按 tenant 过滤不到.
+
+**Session lifecycle (C4)**: 2 个新事件 — `session.created` (POST /sessions) + `session.deleted` (DELETE /sessions/{name}). tenant_id 优先 sessions_index, fallback in-memory.
+
+**State save audit (C7)**: `_save_state` 加 `state.exported` 事件 (trigger=`user_explicit`, 跟 `session.storage_state.exported` 区分). **意外修了 latent bug**: `_save_state` 自 T8 起调 `self.owner.browser.save_storage_state` — `_BrowserShim` 只暴露 `.controller`, 该方法在 controller 上. 改成 `controller.save_storage_state`. 该 bug 让 /state/save 自 T8 起在 daemon 路径下一直 500.
+
+**测试**: 8 个新测试 (`TestT66p7*`) — lease acquire/release/handoff-offered 各 1, session-scoped 1, session.created/deleted/state.exported 各 1. **总测试数 180 passed** (172 旧 + 8 新, 零回归).
+
+**Breaking changes**: 无. 全是增量 audit events — 老订阅者不受影响.
+
 ## T66.6 — Audit/Metadata 一致性修复 (B1 + B2 + B3)
 
 **Headline**: Scope A 上线后 agent 体验测试发现 3 个真实缺陷 (audit event 错 tenant / metadata 重启丢失 / handoff 写 anonymous). 核心所有权原语 (lease/fence) 本身 OK, 错的是审计 + 元数据层.

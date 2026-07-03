@@ -856,19 +856,24 @@ class TransparentBrowserDaemon:
                     sid, ctrl, trigger="auto_sweep",
                 )
                 if snap_id:
-                    self.event_bus.publish(
+                    # T66.7.2 (C2): session-scoped 事件加 tenant_id —
+                    # ops / 多 agent 共享时按 tenant 过滤事件流. 优先
+                    # sessions_index (持久化, 跨重启), fallback in-memory.
+                    self._publish_with_session_tenant(
                         "session.storage_state.saved",
-                        {"session_id": sid, "snapshot_id": snap_id, "trigger": "auto_sweep",
-                         "ts": time.time()},
+                        {"session_id": sid, "snapshot_id": snap_id,
+                         "trigger": "auto_sweep", "ts": time.time()},
+                        session_id=sid,
                     )
                     # GC 旧快照 (留 3 份)
                     self.snapshot_store.gc_old_snapshots(sid)
             except Exception as e:
                 logger.warning("sweep: snapshot failed for %s: %s", sid, e)
-                self.event_bus.publish(
+                self._publish_with_session_tenant(
                     "session.storage_state.failed",
                     {"session_id": sid, "reason": f"{type(e).__name__}: {e}",
                      "ts": time.time()},
+                    session_id=sid,
                 )
 
     def _sweep_idle_sessions(self) -> None:
@@ -904,11 +909,15 @@ class TransparentBrowserDaemon:
                 if ok:
                     logger.info("idle recycle: released session %s (idle >= %.0fs)",
                                 sid, self._session_idle_timeout_s)
-                    self.event_bus.publish(
+                    # T66.7.2 (C2): session.expired 也加 tenant_id — ops 看
+                    # "哪个 tenant 的 session 被回收" 必须能 filter. sweep 路径
+                    # 跟 session.storage_state.saved 一样用 _publish_with_session_tenant.
+                    self._publish_with_session_tenant(
                         "session.expired",
                         {"session_id": sid, "reason": "idle_timeout",
                          "timeout_s": self._session_idle_timeout_s,
                          "ts": time.time()},
+                        session_id=sid,
                     )
             except Exception as e:
                 logger.warning("idle recycle failed for %s: %s", sid, e)
@@ -937,6 +946,37 @@ class TransparentBrowserDaemon:
             logger.warning("DegradationController: auto-bumped to L2 (capacity_ratio=%.2f)", ratio)
             self._emit_pressure_event("critical", reason="auto_capacity", capacity_ratio=ratio)
         # 不再自动降 — admin/restore 显式降到 L0
+
+    def _publish_with_session_tenant(self, topic: str, payload: dict[str, Any],
+                                      *, session_id: str) -> None:
+        """T66.7.2 (C2): 发 session-scoped 事件时自动带 tenant_id.
+
+        优先 lease_manager.sessions_index (持久化, 跨重启保留), fallback 到
+        in-memory meta. 最后兜底 DEFAULT_TENANT. dedup_key 自动加 tenant 前缀,
+        防跨 tenant 串 dedup. producer_id 用 sessions_index 的 agent_id (若有).
+
+        调用方不要自己拼 tenant_id, 用这个 helper 统一来源 — 跟 T66.6.3 B1 fix
+        一致 (lease 路径直接从 lease 表读, 不用 body).
+        """
+        idx = self.lease_manager.get_session_meta(session_id)
+        if idx is not None:
+            tenant_id, agent_id = idx
+        else:
+            meta = self.owner.get_session_meta(session_id) or {}
+            tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
+            agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
+        try:
+            self.event_bus.publish(
+                topic,
+                payload,
+                scope="session", scope_id=session_id,
+                tenant_id=tenant_id,
+                producer_kind="system", producer_id=agent_id,
+                persistent=True,
+            )
+        except Exception:
+            logger.exception("publish %s for session %s failed (non-fatal)",
+                             topic, session_id)
 
     def _emit_pressure_event(self, level: str, *, reason: str,
                             capacity_ratio: float | None = None) -> None:
@@ -1439,6 +1479,21 @@ class TransparentBrowserDaemon:
                 self.owner.set_session_meta(name, tenant_id=tenant_id, agent_id=agent_id)
             except Exception as e:
                 raise _SessionError("SESSION_CREATE_FAILED", f"{type(e).__name__}: {e}") from None
+            # T66.7.3 (C4): session 创建也发审计 — ops 重建 session 历史需要.
+            # dedup 按 session_name (同名重建是不同事件, 但生产里名字唯一 OK).
+            try:
+                self.event_bus.publish(
+                    "session.created",
+                    {"session_id": name, "tenant_id": tenant_id,
+                     "agent_id": agent_id, "ts": time.time()},
+                    scope="session", scope_id=name,
+                    tenant_id=tenant_id,
+                    producer_kind="agent", producer_id=agent_id,
+                    dedup_key=f"session_created:{name}",
+                    persistent=True,
+                )
+            except Exception:
+                logger.exception("session create: failed to publish event")
             return {
                 "name": name, "created": True,
                 "tenant_id": tenant_id, "agent_id": agent_id,
@@ -1475,9 +1530,33 @@ class TransparentBrowserDaemon:
                 raise _SessionError("MISSING_PARAM", "session name required after /sessions/")
             if name == self.owner.DEFAULT_SESSION:
                 raise _SessionError("CANNOT_DELETE_DEFAULT", "cannot delete default session")
+            # T66.7.3 (C4): release 之前拿 metadata — 删除后 sessions_index 行
+            # 还在 (DELETE session 不清 sessions_index, 那是 lease 的事), 但
+            # in-memory meta 会被清掉. 优先用 sessions_index 的 tenant_id.
+            idx = self.lease_manager.get_session_meta(name)
+            if idx is not None:
+                tenant_id, agent_id = idx
+            else:
+                meta = self.owner.get_session_meta(name) or {}
+                tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
+                agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
             released = self.owner.release_session(name)
             if not released:
                 raise _SessionError("SESSION_NOT_FOUND", f"session {name!r} not found")
+            # T66.7.3 (C4): session 删除也发审计.
+            try:
+                self.event_bus.publish(
+                    "session.deleted",
+                    {"session_id": name, "tenant_id": tenant_id,
+                     "agent_id": agent_id, "ts": time.time()},
+                    scope="session", scope_id=name,
+                    tenant_id=tenant_id,
+                    producer_kind="agent", producer_id=agent_id,
+                    dedup_key=f"session_deleted:{name}",
+                    persistent=True,
+                )
+            except Exception:
+                logger.exception("session delete: failed to publish event")
             return {"name": name, "released": True, "active": self.owner.list_sessions()}
         if method == "POST" and path == "/open":
             return self.owner.run(self._open(
@@ -1946,6 +2025,28 @@ class TransparentBrowserDaemon:
         meta = self.owner.get_session_meta(session_name) or {}
         if not meta or meta.get("tenant_id") == _AsyncOwner.DEFAULT_TENANT:
             self.owner.set_session_meta(session_name, tenant_id=tenant_id, agent_id=agent_id)
+        # T66.7.1 (C1): 核心 lease 获取应发审计事件 — 多 agent 共享 daemon
+        # 时 ops/agent 想知道 "谁在何时拿到了所有权". dedup 按 lease_id — 同一
+        # lease_id 重 acquire (PREEMPTED 路径) 是新事件 (租户不同时间点).
+        try:
+            self.event_bus.publish(
+                "session.lease.acquired",
+                {"session_id": session_name,
+                 "lease_id": result.lease.lease_id,
+                 "fence_token": result.lease.fence_token,
+                 "agent_id": agent_id,
+                 "preempted_lease_id": (
+                     result.preempted.lease_id if result.preempted else None),
+                 "priority": priority,
+                 "ts": time.time()},
+                scope="session", scope_id=session_name,
+                tenant_id=tenant_id,
+                producer_kind="agent", producer_id=agent_id,
+                dedup_key=f"lease_acquired:{result.lease.lease_id}",
+                persistent=True,
+            )
+        except Exception:
+            logger.exception("lease acquire: failed to publish event")
         return out
 
     def _handle_lease_renew(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1970,6 +2071,7 @@ class TransparentBrowserDaemon:
         m = re.match(r"^/sessions/([^/]+)/lease/([^/]+)$", path)
         if not m:
             raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
         lease_id = m.group(2)
         fence_token_str = args.get("fence_token", "0")
         try:
@@ -1980,6 +2082,26 @@ class TransparentBrowserDaemon:
         ok, r = self.lease_manager.release(lease_id, fence_token, reason=reason)
         if not ok:
             raise _LeaseError(r, f"release failed: {r}", status_code=409)
+        # T66.7.1 (C1): 主动释放也要审计 — ops 看 "谁在何时放弃所有权".
+        # tenant_id 从 lease 表读 (权威, 不是 body). release 路径 lease 还在表里.
+        cur = self.lease_manager.get_lease(lease_id)
+        try:
+            self.event_bus.publish(
+                "session.lease.released",
+                {"session_id": session_name,
+                 "lease_id": lease_id,
+                 "fence_token": fence_token,
+                 "reason": reason,
+                 "ts": time.time()},
+                scope="session", scope_id=session_name,
+                tenant_id=(cur.tenant_id if cur else _AsyncOwner.DEFAULT_TENANT),
+                producer_kind="agent",
+                producer_id=(cur.agent_id if cur else "anonymous"),
+                dedup_key=f"lease_released:{lease_id}",
+                persistent=True,
+            )
+        except Exception:
+            logger.exception("lease release: failed to publish event")
         return {"lease_id": lease_id, "state": "RELEASED", "reason": reason}
 
     def _handle_lease_get(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -2093,7 +2215,6 @@ class TransparentBrowserDaemon:
         to_agent = args.get("agent_id") or ""
         if not to_agent:
             raise _LeaseError("MISSING_PARAM", "agent_id required (the recipient)")
-        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
         ttl_s = 30.0
         if args.get("ttl_s"):
             try:
@@ -2106,6 +2227,10 @@ class TransparentBrowserDaemon:
             raise _LeaseError("LEASE_INVALID",
                               f"no active lease for session {session_name!r}",
                               status_code=404)
+        # T66.7.1 (C1): tenant_id 用原 lease 的 (跟 T66.6.2 accept 路径一致),
+        # body 漏传也不退化成 'anonymous'. body 仍可显式覆盖 (e.g. tenant 重命名),
+        # 跟 acquire 路径行为对称.
+        tenant_id = args.get("tenant_id") or cur.tenant_id
         ok, offer_token, err, deadline_ms = self.lease_manager.offer(
             session_id=session_name, from_agent=cur.agent_id, to_agent=to_agent,
             tenant_id=tenant_id, ttl_s=ttl_s,
@@ -2115,6 +2240,26 @@ class TransparentBrowserDaemon:
             raise _LeaseError(err or "UNKNOWN",
                               f"handoff offer failed: {err}",
                               holder=cur.to_dict(), status_code=status)
+        # T66.7.1 (C1): offer 也发审计 — 跟 session.handed_off (accept 端) 配对.
+        # dedup 按 offer_token, 即使重新发 offer 也是不同事件 (token 是新的).
+        try:
+            self.event_bus.publish(
+                "session.handoff.offered",
+                {"session_id": session_name,
+                 "from_agent": cur.agent_id,
+                 "to_agent": to_agent,
+                 "offer_token": offer_token,
+                 "deadline_ms": deadline_ms,
+                 "ttl_s": ttl_s,
+                 "ts": time.time()},
+                scope="session", scope_id=session_name,
+                tenant_id=tenant_id,
+                producer_kind="agent", producer_id=cur.agent_id,
+                dedup_key=f"handoff_offered:{offer_token}",
+                persistent=True,
+            )
+        except Exception:
+            logger.exception("handoff offer: failed to publish event")
         return {
             "offer_token": offer_token,
             "expires_at_ms": deadline_ms,
@@ -2722,7 +2867,40 @@ class TransparentBrowserDaemon:
         return sidecar
 
     async def _save_state(self, path: str | None) -> dict[str, Any]:
-        saved = await self.owner.browser.save_storage_state(path)
+        # T66.7.3 (C7): 显式 /state/save (vs auto_sweep) 也发审计 — 用户驱动
+        # 的 storage state 保存是高价值事件, ops 想知道 "谁何时显式备份了".
+        # 注意 _save_state 没接 session 参数 (用 default session, 跟 _open 一致).
+        # BUG-FIX: 之前调 self.owner.browser.save_storage_state — _BrowserShim
+        # 只暴露 .controller, 该方法在 controller 上. 自 T8 起的 latent bug,
+        # T66.7.3 触发 audit event 才暴露.
+        saved = await self.owner.browser.controller.save_storage_state(path)
+        default_sid = _AsyncOwner.DEFAULT_SESSION
+        idx = self.lease_manager.get_session_meta(default_sid)
+        if idx is not None:
+            tenant_id, agent_id = idx
+        else:
+            meta = self.owner.get_session_meta(default_sid) or {}
+            tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
+            agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
+        try:
+            import hashlib as _hl
+            sz = 0
+            try:
+                sz = os.path.getsize(saved) if saved and os.path.exists(saved) else 0
+            except OSError:
+                pass
+            self.event_bus.publish(
+                "state.exported",
+                {"session_id": default_sid, "path": saved, "size_bytes": sz,
+                 "trigger": "user_explicit", "ts": time.time()},
+                scope="session", scope_id=default_sid,
+                tenant_id=tenant_id,
+                producer_kind="agent", producer_id=agent_id,
+                dedup_key=f"state_exported:{default_sid}:{int(time.time())}",
+                persistent=True,
+            )
+        except Exception:
+            logger.exception("save_state: failed to publish event")
         return {"path": saved}
 
     async def _tab_new(self, url: str) -> dict[str, Any]:

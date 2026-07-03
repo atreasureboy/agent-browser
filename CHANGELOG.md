@@ -2,6 +2,25 @@
 
 格式: T 编号 + 中文短标题 + 子项 bullet + commit hash; 时间倒序 (新→旧). 不是 Keep a Changelog.
 
+## T66 — v1 namespace 第二波 (Scope A: session lifecycle + admin)
+
+**Headline**: T66 调研涉及 5 个子系统 (lifecycle / blackboard / artifacts / LLM proxy / admin), 全套 5-7 天. 用户决策 Scope A 只做 session lifecycle + admin (1-1.5 天, 零新模块); blackboard / artifacts / LLM proxy / observers / admin reconcile 推迟到 T67+.
+
+**Session lifecycle**:
+- **T66.1 — Reattach (POST /sessions/{id}/reattach)**: daemon 重启 / 实例 crash 后, 旧 agent 用 `lease_id` + `fence_token` 恢复所有权. state ∈ ACTIVE/GRACE/RECOVERING 允许, RELEASED/EXPIRED → 410 LEASE_LOST, fence 不匹配 → 409 FENCE_MISMATCH. age > 300s → `advice="re_verify_auth"`. 每次 emit `session.restored` 审计事件 (dedup 幂等). 设计取舍: reattach **不 bump fence** — agent 真活着的话 bump 反而拒它后续写.
+- **T66.2 — Handoff (POST /sessions/{id}/handoff + /accept)**: lease 状态机加 `OFFERED` 子状态 — A agent 主动让渡给 B: `offer` → 30s 内 `accept` → 原子换持有 + fence bump. reaper 扫过期 offer → 回 ACTIVE (A 继续持有, 不 bump fence). 错误码: BUSY 409 / OFFER_NOT_FOUND 410 / FENCE_MISMATCH 409 / OFFER_EXPIRED 410.
+- **T66.3 — Storage state read (GET /sessions/{id}/storage_state)**: 读 `SnapshotStore.latest_snapshot()`, 不存在 → 404 SNAPSHOT_NOT_FOUND. 每次导出 emit `session.storage_state.exported` 审计事件 (dedup 按 content sha256 幂等).
+
+**Admin**:
+- **T66.4 — Drain cancel (POST /admin/drain/cancel)**: 撤销 drain 标志让 daemon 恢复接流量 (误触 / 提前中止排水时用). L4 状态时仍能 cancel (在 `_DEGRADED_ALLOWED` 白名单里). 每次 cancel emit `daemon.drain.cancelled` 事件.
+- **T66.5 — Probes (/healthz vs /readyz 拆分)**: k8s 编排需要区分「进程在跑」(/healthz liveness, 永远 200) 和「能接流量」(/readyz readiness, drain/L4 时 503 + Retry-After: 30). `/health` 老路径保留 backward-compat 200 ok/draining + 完整 context.
+
+**v1 namespace 扩展**: /v1/ 路径下加 `/v1/readyz` + `/v1/sessions/{id}/reattach` + `/v1/sessions/{id}/handoff[/accept]` + `/v1/sessions/{id}/storage_state` 5 个新端点 alias.
+
+**测试**: 15 个新测试 (`TestT66p1*` ~ `TestT66p5*`), 总测试数 **164 passed** (零回归).
+
+**Breaking changes**: T65.9 之前 /v1/healthz 等价 /health — T66.5 后 /v1/healthz 是 liveness probe (payload 简化为 `{alive, pid, uptime}`), /health 才是 full context. **测试断言从相等改语义拆分**. 老 dogfooding 直接调 /health 的代码不受影响.
+
 ## T65 — 多 agent 共享 daemon runtime (M=6/K=16 + tenant/agent + lease/fence + 持久 EventBus)
 
 **Headline**: daemon 从「单进程 1×20 capacity 的单机工具」升级到「M×K=96 容量 + 多租户隔离 + lease/fence 防 GC 抢锁 + 持久事件总线」的生产级多 agent runtime.

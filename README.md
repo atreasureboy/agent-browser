@@ -694,7 +694,12 @@ agent 既能用 daemon HTTP 端点也能用 MCP 工具, 两套 API 风格不同 
 | 安全 (T40-T44) | `GET /security-headers`, `GET /dns-records`, ... | `sb_security_headers`, `sb_dns_records`, ... | kebab ↔ snake 别名 |
 | Sessions | `GET /sessions[?detail=1]`, `POST /sessions`, `DELETE /sessions/{name}` | `sb_sessions_list/create/delete` | daemon 走 HTTP, MCP 走 daemon proxy; T65.6 起带 `tenant_id`/`agent_id` 元数据; 5 分钟 idle 自动回收 (T65.1) |
 | Lease (T65.7) | `POST /sessions/{name}/lease`, `POST .../renew`, `DELETE .../lease/{id}`, `GET .../lease` | (只有 daemon) | 多 agent 共享 daemon 的所有权原语; `fence_token` 防旧 holder 复活写 |
-| v1 namespace (T65.9) | `/v1/healthz`, `/v1/capacity`, `/v1/events`, `/v1/sessions`, `/v1/sessions/{id}/lease/...` | (MCP 走老路径) | 多 agent 推荐走 `/v1/*`; 老 dogfooding 路径零回归 |
+| Reattach (T66.1) | `POST /sessions/{name}/reattach` | (只有 daemon) | daemon 重启后用 `lease_id` + `fence_token` 恢复所有权 |
+| Handoff (T66.2) | `POST /sessions/{name}/handoff`, `POST .../handoff/accept` | (只有 daemon) | 当前 holder A 主动让渡给 B (`offer_token` 30s 内 accept, 否则回 ACTIVE) |
+| Storage state (T66.3) | `GET /sessions/{name}/storage_state` | (只有 daemon) | 读最新 storage_state 快照 (T61 sweeper 写入); 每次导出 emit 审计事件 |
+| Drain cancel (T66.4) | `POST /admin/drain/cancel` | (只有 daemon) | 撤销 drain 标志, 让 daemon 恢复接流量 |
+| Probes (T66.5) | `GET /healthz` (liveness, 永远 200) / `GET /readyz` (readiness, drain/L4 时 503) | (只有 daemon) | k8s 编排: liveness ≠ readiness, drain 期间 liveness 仍 200 |
+| v1 namespace (T65.9 + T66) | `/v1/healthz`, `/v1/readyz`, `/v1/capacity`, `/v1/events`, `/v1/sessions`, `/v1/sessions/{id}/lease/...`, `/v1/sessions/{id}/reattach`, `/v1/sessions/{id}/handoff[/accept]`, `/v1/sessions/{id}/storage_state` | (MCP 走老路径) | 多 agent 推荐走 `/v1/*`; 老 dogfooding 路径零回归 |
 | 降级 | `POST /admin/degrade`, `POST /admin/restore`, `POST /admin/drain` | (只有 daemon) | 显式运维操作 |
 | 监控 | `GET /health`, `GET /capacity`, `GET /queue`, `GET /metrics`, `GET /events` | `sb_health`, `sb_capacity`, `sb_queue`, (无 /events) | SSE 端点只有 daemon 有 |
 | Agent | `POST /agent/run`, `POST /agent/run/stream` | `sb_agent_run`, `sb_agent_plan` | stream 端点 SSE |
@@ -805,6 +810,79 @@ curl -X DELETE localhost:8765/sessions/foo/lease/01J... -d '{"fence_token":1}'
 ### 测试
 
 T65 系列共 41 个新测试 (`TestT65p1*` ~ `TestT65p9*`), 全过; 总测试数 **149 passed** (零回归).
+
+## T66 — v1 namespace 第二波 (Scope A: session lifecycle + admin)
+
+设计权威: [`agent-browser-daemon-architecture.md`](agent-browser-daemon-architecture.md) §2.2 / §3.4 / §5.4 / §5.8 / §6.
+
+T66 调研涉及 5 个子系统 (lifecycle / blackboard / artifacts / LLM proxy / admin), 全套 5-7 天. **Scope A 只做 session lifecycle + admin** (1-1.5 天, 零新模块); blackboard / artifacts / LLM proxy / observers / admin reconcile 推迟到 T67+.
+
+### T66.1 — Reattach (POST /sessions/{id}/reattach)
+
+daemon 重启 / 实例 crash 后, 旧 agent 用 `lease_id` + `fence_token` 恢复所有权 (§5.4). state ∈ ACTIVE/GRACE/RECOVERING 允许; RELEASED/EXPIRED → 410 LEASE_LOST; fence 不匹配 → 409 FENCE_MISMATCH.
+
+```bash
+# daemon 重启后
+curl -X POST localhost:8765/v1/sessions/foo/reattach \
+  -d '{"lease_id":"01J...","fence_token":1,"agent_id":"a","tenant_id":"t"}'
+# → {"recovered":true,"lease":{...},"age_ms":N,"advice":"re_verify_auth"}
+```
+
+`age > 300s` → 响应带 `advice="re_verify_auth"` (登录态可能过期). 每次 reattach emit `session.restored` 审计事件 (dedup 按 `lease_id:fence_token` 幂等).
+
+**设计取舍**: reattach 时 **不 bump fence** — agent 真活着的话 bump 反而拒它后续写. 只有 lease 真死了 (GRACE/RECOVERING) 才在 accept 路径 bump.
+
+### T66.2 — Handoff (POST /sessions/{id}/handoff + /accept)
+
+A agent 完成一段任务后把 session 所有权主动让渡给 B (§3.4). 状态机加 `OFFERED` 子状态:
+
+```
+ACTIVE ── offer ─→ OFFERED ── accept ─→ RELEASED(old) + ACTIVE(new) [fence++]
+                  ↑  ↓
+                  │  └ deadline 30s 过期 → ACTIVE (A 继续持有, 不 bump fence)
+                  │ OFFERED 期间 A read-only, 防止交接窗口乱写
+```
+
+```bash
+# A offer
+curl -X POST localhost:8765/v1/sessions/foo/handoff -d '{"agent_id":"B","tenant_id":"t"}'
+# → {"offer_token":"01J...","expires_at_ms":...,"offered_to":"B"}
+
+# B accept (30s 内)
+curl -X POST localhost:8765/v1/sessions/foo/handoff/accept \
+  -d '{"offer_token":"01J...","agent_id":"B","tenant_id":"t"}'
+# → {"lease":{...,"agent_id":"B","fence_token":2},"acquired_from":"01J..."}
+```
+
+原子性: `offer` / `accept_handoff` 都走 `self._lock` + 单 sqlite connection — 跟 T65.7 抢占一样强串行. 错误码: BUSY 409 / OFFER_NOT_FOUND 410 / FENCE_MISMATCH 409.
+
+### T66.3 — Storage state read (GET /sessions/{id}/storage_state)
+
+agent 想 checkpoint 当前 session 状态以便日后 restore (§7.8 审计事件). 读 `SnapshotStore.latest_snapshot()`, 不存在 → 404 SNAPSHOT_NOT_FOUND. 每次导出 emit `session.storage_state.exported` 审计事件 (dedup 按 content sha256 幂等).
+
+```bash
+curl localhost:8765/v1/sessions/foo/storage_state
+# → {"snapshot_id":"...","taken_at":...,"size_bytes":N,"content":{cookies:...,origins:...}}
+```
+
+### T66.4 — Drain cancel (POST /admin/drain/cancel)
+
+误触 `/admin/drain` 后, 撤销排水让 daemon 恢复接流量 (§5.8). 一行改动: `self._draining = False` + 发 `daemon.drain.cancelled` 事件. L4 状态时仍能 cancel (在 `_DEGRADED_ALLOWED` 白名单里).
+
+### T66.5 — Probes (/healthz vs /readyz 拆分)
+
+k8s/容器编排需要区分「进程在跑」(/healthz, liveness) 和「能接流量」(/readyz, readiness) (§6):
+
+- `/healthz` — 只验 `process alive` + PID; **永远 200** (除非进程挂了, 这时由 k8s 重启)
+- `/readyz` — 返 `ready: true|false`, 不满足任一条 → 503 + `Retry-After: 30`:
+  - `not self._draining` 
+  - `self._degradation_level < 4` (L4 = 拒所有除 health 之外)
+  - `self.owner.pool is not None` (T60 watchdog 已 init)
+- `/health` (老路径) — 保持原 behavior (200 ok/draining + 完整 context), backward-compat
+
+### 测试
+
+T66 Scope A 共 15 个新测试 (`TestT66p1*` ~ `TestT66p5*`), 全过; 总测试数 **164 passed** (零回归).
 
 ## T58 — SSRF guardrail (fable §7.1)
 

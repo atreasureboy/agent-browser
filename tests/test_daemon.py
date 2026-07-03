@@ -2128,3 +2128,229 @@ class TestT63p1CLIAndEndpointPolish:
         assert isinstance(d["sessions"], list)
         if d["sessions"]:
             assert isinstance(d["sessions"][0], str)
+
+
+class TestT63p2LLMAugmentAndPolish:
+    """T63.2: 修复 dogfooding 反馈 2/3/10.
+
+    - 修复 2: /open 默认 summary 现在带 heading + top_headings + meta + counts,
+      agent 第一次开页就能判断页面概况, 不用追调 /snapshot
+    - 修复 3: 启发式 + LLM-augment 三段式分类, 缓存按 URL 复用.
+      无 OPENAI_API_KEY → silent 启发式 (原行为). 有 key → cache miss LLM
+      augment; cache hit 秒返 "cached"
+    - 修复 10: /security-headers 加 score_grade letter (A-F), 跟 score_points
+      比例对齐
+    """
+
+    _HTML_LANDING = (
+        "<html><head>"
+        "<meta name='description' content='A demo landing page'>"
+        "<meta name='lang' content='zh-CN'>"  # 注意: meta 用 attribute, 不是 <meta http-equiv=lang>
+        "</head><body>"
+        "<h1>Example Domain</h1>"
+        "<h2>Section A</h2>"
+        "<p>Welcome to example. This is the first paragraph.</p>"
+        "<p>Second paragraph with more detail.</p>"
+        "<p>Third paragraph wrapping up the page.</p>"
+        "<a href='/foo' id='a1'>Link one</a>"
+        "<a href='/bar' id='a2'>Link two</a>"
+        "</body></html>"
+    )
+
+    def test_security_headers_includes_grade_letter(self):
+        """修复 10: /security-headers 应有 score_grade A-F. 直接调 controller
+        static helper (不走 daemon HTTP) 测 grade 映射逻辑, 无外网依赖."""
+        from semantic_browser.browser.controller import BrowserController
+        # 阈值: ≥80% A, ≥60% B, ≥40% C, ≥20% D, 否则 F
+        # max=9 (csp=2 + hsts=1 + xfo=1 + xcto=1 + referrer=1 + coop-or-coep=1
+        #        + httpOnly=1 + secure=1)
+        # 0/9=0%   → F
+        # 1/9=11%  → F
+        # 2/9=22%  → D
+        # 3/9=33%  → D
+        # 4/9=44%  → C
+        # 5/9=55%  → C
+        # 6/9=66%  → B
+        # 7/9=77%  → B
+        # 8/9=88%  → A
+        # 9/9=100% → A
+        assert BrowserController._grade_for_score(0) == "F"
+        assert BrowserController._grade_for_score(1) == "F"
+        assert BrowserController._grade_for_score(2) == "D"
+        assert BrowserController._grade_for_score(3) == "D"
+        assert BrowserController._grade_for_score(4) == "C"
+        assert BrowserController._grade_for_score(5) == "C"
+        assert BrowserController._grade_for_score(6) == "B"
+        assert BrowserController._grade_for_score(7) == "B"
+        assert BrowserController._grade_for_score(8) == "A"
+        assert BrowserController._grade_for_score(9) == "A"
+
+    def test_security_headers_score_compute(self):
+        """修复 10: 各 header 累计分跟 _grade_for_score 对齐 — 0/9=空, 9/9=全."""
+        from semantic_browser.browser.controller import BrowserController
+        # 空 → 0 分 → F
+        score_empty = BrowserController._compute_security_score({
+            "csp": None, "hsts": None, "x_frame_options": None,
+            "x_content_type_options": None, "referrer_policy": None,
+            "coop": None, "coep": None, "set_cookie_parsed": [],
+        })
+        assert score_empty == 0
+        assert BrowserController._grade_for_score(score_empty) == "F"
+        # 全 → 9 分 (csp=2 + 6×1 + httpOnly + secure) → A
+        score_full = BrowserController._compute_security_score({
+            "csp": "default-src 'self'", "hsts": {"max_age": 100},
+            "x_frame_options": "DENY", "x_content_type_options": "nosniff",
+            "referrer_policy": "no-referrer", "coop": "same-origin",
+            "coep": "require-corp",
+            "set_cookie_parsed": [{"httpOnly": True, "secure": True}],
+        })
+        # csp=2 + hsts=1 + xfo=1 + xcto=1 + referrer=1 + coop-or-coep=1 +
+        # httpOnly=1 + secure=1 = 9
+        assert score_full == 9
+        assert BrowserController._grade_for_score(score_full) == "A"
+
+    def test_security_headers_endpoint_returns_grade(self, daemon):
+        """修复 10: 通过 daemon /security-headers 真 HTTP 路径验证 score_grade
+        字段存在于 response. 真访问 example.com 拿真 headers.
+        (失败 → skip 跟 T63 测试一致)"""
+        from semantic_browser.browser.controller import BrowserController
+        r = _http("GET", f"{daemon}/security-headers?url=https://example.com/")
+        if not r.get("ok"):
+            pytest.skip(f"security-headers 失败: {r.get('error')}")
+        d = r["data"]
+        # T63 numeric 字段还在 (回归)
+        assert "score_points" in d
+        assert "score_max" in d
+        # T63.2 修正: score_max=9 (T63 笔误 8)
+        assert d["score_max"] == 9
+        # T63.2 新增 letter
+        assert "score_grade" in d
+        assert d["score_grade"] in ("A", "B", "C", "D", "F")
+        # letter 应跟 points 比例一致
+        expected = BrowserController._grade_for_score(d["score_points"])
+        assert d["score_grade"] == expected, (
+            f"score_grade={d['score_grade']} 应跟 score_points={d['score_points']} 一致, "
+            f"expected={expected}"
+        )
+
+    def test_open_summary_includes_page_meta_and_counts(self, daemon):
+        """修复 2: /open summary 应带 heading + top_headings + meta + counts.
+        这些都是 snapshot 已有值, 0 额外 I/O. agent 第一次 open 后能立刻
+        知道页面大致内容."""
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        d = r["data"]
+        # heading (h1 text)
+        assert "heading" in d, f"/open 应含 heading, got keys={list(d.keys())}"
+        assert d["heading"] == "Example Domain", (
+            f"heading 应是 h1 文本 'Example Domain', got {d['heading']!r}"
+        )
+        # top_headings — 多级标题
+        assert "top_headings" in d
+        assert any("[h1]" in h for h in d["top_headings"]), (
+            f"top_headings 应含 [h1], got {d['top_headings']!r}"
+        )
+        assert any("[h2]" in h for h in d["top_headings"])
+        # meta — description/lang
+        assert "meta" in d
+        meta = d["meta"]
+        # 至少 description 在 (lang 不一定能从 data URL 解出)
+        assert "description" in meta, (
+            f"meta 应含 description (我们 set 了 <meta name='description'>), got {meta}"
+        )
+        # counts
+        assert "counts" in d
+        c = d["counts"]
+        assert c["links"] >= 2, f"应有 >=2 links, got {c}"
+        assert c["text_blocks"] >= 5, f"应有 >=5 文本块 (1 h1+1 h2+3 p), got {c}"
+
+    def test_open_classify_without_api_key_uses_heuristic(self, daemon):
+        """修复 3: 无 OPENAI_API_KEY → type_source='heuristic', 行为同 T63 前,
+        不破任何已有测试."""
+        # 测试 daemon fixture 通常没 OPENAI_API_KEY env — 确认 fallback
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        # 显式删 env, 排除本进程已注入可能
+        old_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            r = _http("POST", f"{daemon}/open", {"url": url})
+        finally:
+            if old_key is not None:
+                os.environ["OPENAI_API_KEY"] = old_key
+        d = r["data"]
+        assert "type" in d
+        assert "type_source" in d
+        assert d["type_source"] == "heuristic", (
+            f"无 OPENAI_API_KEY 应走启发式, got {d['type_source']!r}"
+        )
+        assert "type_confidence" in d
+        assert isinstance(d["type_confidence"], (int, float))
+
+    def test_open_classify_cache_reuses_same_url(self, daemon):
+        """修复 3: 同 URL 第二次 /open → type_source='cached', 0 LLM 调用.
+        模拟 LLM-augment 缓存语义 (无真 LLM 也验证 cache write/read 路径)."""
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        # 第一次: heuristic
+        r1 = _http("POST", f"{daemon}/open", {"url": url})
+        assert r1["data"]["type_source"] == "heuristic"
+        # 第二次同 URL: 应 cached (heuristic 写入 _classify_cache, 不管后续 LLM)
+        r2 = _http("POST", f"{daemon}/open", {"url": url})
+        assert r2["data"]["type_source"] == "cached", (
+            f"同 URL 二次 open 应从缓存取, got {r2['data']['type_source']!r}"
+        )
+        # type 必须一致
+        assert r1["data"]["type"] == r2["data"]["type"]
+
+    def test_state_reuses_open_classification_cache(self, daemon):
+        """修复 3: /open 写缓存, /state 直接吃, 不重跑分类.
+        保证 /open 后立即 /state 的常见 agent 模式低延迟."""
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        r1 = _http("POST", f"{daemon}/open", {"url": url})
+        page_type = r1["data"]["type"]
+        # 立即 /state
+        r2 = _http("GET", f"{daemon}/state")
+        assert r2["data"]["type"] == page_type, (
+            f"/state 应复用 /open 的分类, /open={page_type!r}, /state={r2['data']['type']!r}"
+        )
+
+    def test_classify_cache_distinct_urls(self, daemon):
+        """修复 3: 不同 URL 各自独立分类 (cache key 是 URL, 不是 session)."""
+        url_a = "data:text/html,<title>A</title><h1>Title A</h1><p>para 1</p><p>para 2</p><p>para 3</p>"
+        url_b = "data:text/html,<title>B</title><h1>Title B</h1><p>para 1</p><p>para 2</p><p>para 3</p>"
+        ra = _http("POST", f"{daemon}/open", {"url": url_a})
+        rb = _http("POST", f"{daemon}/open", {"url": url_b})
+        assert ra["data"]["type_source"] == "heuristic"
+        assert rb["data"]["type_source"] == "heuristic"
+        # 再开 A → 这次应 cached, B 还没 cached → heuristic
+        ra2 = _http("POST", f"{daemon}/open", {"url": url_a})
+        assert ra2["data"]["type_source"] == "cached", (
+            f"A 第 2 次应 cached, got {ra2['data']['type_source']!r}"
+        )
+
+    def test_classify_cache_lru_eviction(self, daemon):
+        """修复 3: _classify_cache 超 max 时 FIFO evicts 最早插入的. 模拟
+        256 URL 后再开新 URL, 老 URL 不在缓存 (这是 real-agent 长会话期才有
+        的场景, 单测缩 max 替成 4 测逻辑)."""
+        daemon_obj = _http("GET", f"{daemon}/capacity")  # 触发 daemon fixture
+        # 真实 cap 是 256, 直接用 daemon._classify_cache 操作更直观
+        # 注入 short cap 测 eviction
+        from semantic_browser.daemon.server import TransparentBrowserDaemon
+        # daemon fixture 实例不直接暴露 — 走 http 不易测 cache cap. 改测
+        # _cache_put 直接逻辑.
+        # 用临时 daemon 实例测
+        fake = TransparentBrowserDaemon.__new__(TransparentBrowserDaemon)
+        fake._classify_cache = {}
+        fake._classify_cache_max = 3
+        from semantic_browser.daemon.server import TransparentBrowserDaemon as T
+        # 直接用同一 module 函数
+        import semantic_browser.daemon.server as srv
+        fake._classify_cache = {}
+        fake._classify_cache_max = 3
+        for i in range(5):
+            srv.TransparentBrowserDaemon._cache_put(fake, f"url-{i}", {"page_type": "x"})
+        # 超 max 后 size 稳定在 cap
+        assert len(fake._classify_cache) <= 3, (
+            f"cache 应不超 cap (3), got {len(fake._classify_cache)} entries"
+        )
+        # 最新插入的在 (url-4)
+        assert "url-4" in fake._classify_cache
+

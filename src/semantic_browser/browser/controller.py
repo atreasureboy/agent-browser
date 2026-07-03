@@ -1375,18 +1375,7 @@ class BrowserController:
         }
 
         # 简易评分 (安全头覆盖度)
-        score = 0
-        if out["csp"]:               score += 2
-        if out["hsts"]:              score += 1
-        if out["x_frame_options"]:   score += 1
-        if out["x_content_type_options"]: score += 1
-        if out["referrer_policy"]:   score += 1
-        if out["coop"] or out["coep"]: score += 1
-        if out["set_cookie_parsed"]:
-            for sc_entry in out["set_cookie_parsed"]:
-                if sc_entry.get("httpOnly"): score += 1
-                if sc_entry.get("secure"): score += 1
-                break  # 只看第一个 cookie 的 flags, 避免重复计
+        score = BrowserController._compute_security_score(out)
         if score >= 6:
             out["score"] = "OK"
         elif score >= 3:
@@ -1397,8 +1386,53 @@ class BrowserController:
         # 不明, agent 推理很难写阈值. 加 score_points / score_max 让 agent
         # 用 numeric 决策 (e.g. "score_points >= 4 才认为安全").
         out["score_points"] = score
-        out["score_max"] = 8  # 实际打分项数 (含 cookie httpOnly/secure 算 1+1)
+        # T63.2: 修正 max — csp=2 + 6×1 (hsts/xfo/xcto/referrer/coop-or-coep) +
+        # 2×1 (httpOnly/secure on first cookie) = 9, 不是 8. T63 注释笔误.
+        out["score_max"] = 9
+        # T63.2 (#10 修): letter grade A-F — 比 string "OK/weak/missing" 更直观,
+        # agent 写阈值也方便 (e.g. "score_grade in {A,B}" 才信任). 阈值按 score_max
+        # 比例: ≥80% A, ≥60% B, ≥40% C, ≥20% D, 否则 F.
+        out["score_grade"] = BrowserController._grade_for_score(score)
         return out
+
+    @staticmethod
+    def _grade_for_score(score: int) -> str:
+        """T63.2: T40f 安全头 score_points → A-F letter grade (单位测友好)."""
+        score_pct = score / 9.0
+        if score_pct >= 0.8:
+            return "A"
+        if score_pct >= 0.6:
+            return "B"
+        if score_pct >= 0.4:
+            return "C"
+        if score_pct >= 0.2:
+            return "D"
+        return "F"
+
+    @staticmethod
+    def _compute_security_score(parsed: dict[str, Any]) -> int:
+        """T63.2: T40f 安全头累计分 (单位测友好). parsed 含 csp/hsts/x_frame_options
+        /x_content_type_options/referrer_policy/coop/coep/set_cookie_parsed."""
+        score = 0
+        if parsed.get("csp"):
+            score += 2
+        if parsed.get("hsts"):
+            score += 1
+        if parsed.get("x_frame_options"):
+            score += 1
+        if parsed.get("x_content_type_options"):
+            score += 1
+        if parsed.get("referrer_policy"):
+            score += 1
+        if parsed.get("coop") or parsed.get("coep"):
+            score += 1
+        for sc_entry in parsed.get("set_cookie_parsed") or []:
+            if sc_entry.get("httpOnly"):
+                score += 1
+            if sc_entry.get("secure"):
+                score += 1
+            break
+        return score
 
     # ── T40b: Hidden paths probe ─────────────────────────────
 

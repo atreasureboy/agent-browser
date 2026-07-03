@@ -399,6 +399,13 @@ class TransparentBrowserDaemon:
         self._drain_started_at: float | None = None
         self._drain_timeout_s: float = drain_timeout_s
         self._drain_event = threading.Event()  # 用于跨线程等 op_lock 释放
+        # T63.2 (#3 修): LLM-augment 页面分类 — 启发式置信度低时 (e.g. example.com 这种
+        # 简单 landing page) 跑 LLM 二次判断. lazy init, OPENAI_API_KEY 缺失时为 None,
+        # 不影响现有启发式-only 路径. URL → 分类结果 缓存 (256 LRU) 避免重复 LLM call.
+        self._llm_classifier: Any = None
+        self._llm_classifier_lock = threading.Lock()
+        self._classify_cache: dict[str, dict[str, Any]] = {}
+        self._classify_cache_max = 256
 
     def serve_forever(self) -> None:
         daemon = self
@@ -1486,18 +1493,23 @@ class TransparentBrowserDaemon:
         ctrl = await self.owner.aget_controller(session)
         url = await ctrl.get_url()
         title = await ctrl.get_title()
-        # 跟 _open 一致 — heuristic PageClassifier 给 page_type, agent 决策
-        # 不用再发一次 /snapshot 才知道当前 page 类型.
+        # T63.2 (#3 修): 优先吃 /open 已分类结果, 0 额外 I/O. /open 后立即 /state
+        # 是常见模式 (agent 想知道分类确认). 无缓存 (e.g. daemon 重启) → 走
+        # 启发式 fast-path (不调 LLM, /state 是高频 polling 端点, 必须轻量).
         try:
-            page = ctrl.current_page
-            if page is not None:
-                from semantic_browser.snapshot.engine import SnapshotEngine
-                from semantic_browser.classifier.heuristic import PageClassifier
-                snap = await SnapshotEngine(page).capture(base_url=url)
-                cls = PageClassifier().classify(snap)
-                page_type = cls.page_type
+            cached = self._classify_cache.get(url)
+            if cached:
+                page_type = cached["page_type"]
             else:
-                page_type = None
+                page = ctrl.current_page
+                if page is not None:
+                    from semantic_browser.snapshot.engine import SnapshotEngine
+                    from semantic_browser.classifier.heuristic import PageClassifier
+                    snap = await SnapshotEngine(page).capture(base_url=url)
+                    cls = PageClassifier().classify(snap)
+                    page_type = cls.page_type
+                else:
+                    page_type = None
         except Exception:
             page_type = None
         return {"url": url, "title": title, "type": page_type}
@@ -1520,9 +1532,37 @@ class TransparentBrowserDaemon:
         effective_session = session or _AsyncOwner.DEFAULT_SESSION
         self.snapshot_store.mark_dirty(effective_session)
         snap = await SnapshotEngine(page).capture(base_url=checked_url)
-        from semantic_browser.classifier.heuristic import PageClassifier
-        cls = PageClassifier().classify(snap)
-        result: dict[str, Any] = {"url": snap.url, "title": snap.title, "type": cls.page_type}
+        # T63.2 (#3 修): 启发式 → 缓存 → LLM-augment 三段式分类.
+        # 1. 启发式先跑 (0 LLM 调用, < 1ms)
+        # 2. URL 已有缓存 → 直接复用
+        # 3. 启发式置信度 < 0.5 且 OPENAI_API_KEY 配了 → LLM 二次判断
+        #    失败/超时 → silent 回启发式
+        cls_result, src = await self._classify_with_cache(snap)
+        result: dict[str, Any] = {
+            "url": snap.url, "title": snap.title,
+            "type": cls_result["page_type"],
+            "type_confidence": cls_result.get("confidence"),
+            "type_source": src,  # "heuristic" | "cached" | "llm"
+        }
+        # T63.2 (#2 修): 默认 summary 模式比 _open 之前更丰富 — agent 第一次
+        # open 后能立刻知道 "这个页面是干嘛的", 不用再调 /snapshot. 体积仍小
+        # (kb 级), 全字段都是 snapshot 已有值, 0 额外 I/O.
+        headings = [b for b in snap.text_blocks if b.tag in ("h1", "h2", "h3")]
+        result["heading"] = headings[0].text if headings and headings[0].tag == "h1" else None
+        result["top_headings"] = [
+            f"[{b.tag}] {b.text[:80]}" for b in headings[:5]
+        ]
+        result["meta"] = {
+            k: snap.meta.get(k, "") for k in ("description", "lang", "charset")
+            if snap.meta.get(k)
+        }
+        result["counts"] = {
+            "text_blocks": len(snap.text_blocks),
+            "links": len(snap.links),
+            "controls": len(snap.controls),
+            "forms": len(snap.forms),
+            "scripts": len(snap.scripts),
+        }
         if detail == "full":
             # 完整 snapshot — agent 想拿 text_blocks/aria/scripts 等重的字段
             # 都直接给, 不要再调 /snapshot
@@ -1547,6 +1587,70 @@ class TransparentBrowserDaemon:
             result["refs"] = refs
             result["ref_count"] = len(refs)
         return result
+
+    def _get_llm_classifier(self) -> Any:
+        """T63.2: lazy init LLMEnhancedClassifier — 仅在 OPENAI_API_KEY 配了才创建.
+        没配 → 返回 None, _classify_with_cache 走纯启发式路径, 0 LLM 调用."""
+        # 早期 fast-path: 没 KEY 直接 None, 不拿锁
+        if not os.environ.get("OPENAI_API_KEY"):
+            return None
+        # 已有 → 复用
+        if self._llm_classifier is not None:
+            cached_key = os.environ.get("OPENAI_API_KEY", "")
+            # KEY 中途变了 → 重置 (测试场景下可能改 env)
+            if getattr(self._llm_classifier, "_last_api_key", None) != cached_key:
+                self._llm_classifier = None
+            else:
+                return self._llm_classifier
+        with self._llm_classifier_lock:
+            if self._llm_classifier is not None:
+                return self._llm_classifier
+            from semantic_browser.classifier.llm_enhanced import LLMEnhancedClassifier
+            clf = LLMEnhancedClassifier(threshold=0.5)
+            clf._last_api_key = os.environ.get("OPENAI_API_KEY", "")  # type: ignore[attr-defined]
+            self._llm_classifier = clf
+            return clf
+
+    async def _classify_with_cache(self, snap: Any) -> tuple[dict[str, Any], str]:
+        """T63.2: 三段式分类 — 启发式必跑, 命中缓存返 'cached',
+        低置信度 + LLM 可用时跑 LLM, 失败/超时 silent 回启发式.
+
+        返回 (ClassificationResult.to_dict 风格 dict, source_label).
+        """
+        from semantic_browser.classifier.heuristic import PageClassifier
+        # 1. 缓存命中 → 直接返 (按 URL 维度, agent 二次访问同 URL 秒返)
+        cache_key = snap.url
+        if cache_key in self._classify_cache:
+            return self._classify_cache[cache_key], "cached"
+        # 2. 启发式 (同步, < 1ms)
+        heur = PageClassifier().classify(snap)
+        heur_dict = heur.to_dict()
+        # 高置信度 / LLM 不可用 → 直接用启发式结果
+        clf = self._get_llm_classifier()
+        if clf is None or heur.confidence >= 0.5:
+            self._cache_put(cache_key, heur_dict)
+            return heur_dict, "heuristic"
+        # 3. LLM augment
+        try:
+            llm_res = await clf.classify(snap)
+            llm_dict = llm_res.to_dict()
+            self._cache_put(cache_key, llm_dict)
+            return llm_dict, "llm"
+        except Exception as e:  # noqa: BLE001 — silent degrade
+            logger.warning("LLM classify failed for %s: %s", snap.url, e)
+            self._cache_put(cache_key, heur_dict)
+            return heur_dict, "heuristic"
+
+    def _cache_put(self, key: str, value: dict[str, Any]) -> None:
+        """T63.2: LRU-ish 缓存 put — 超出 max 时清最早插入 (dict popitem
+        在 3.7+ 是 FIFO 插入序). 实际 eviction 不严格, 只在超 cap 一步删一条,
+        agent 长会话期内 cache 命中率高 (重复 /open 同一站 是常态)."""
+        if len(self._classify_cache) >= self._classify_cache_max:
+            try:
+                self._classify_cache.popitem()  # FIFO eviction
+            except KeyError:
+                pass
+        self._classify_cache[key] = value
 
     async def _snapshot(self, detail_level: str = "normal", session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)

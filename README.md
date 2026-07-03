@@ -642,14 +642,25 @@ $ curl -X POST http://127.0.0.1:8765/admin/drain
 
 ## T63 — Dogfooding UX 修复 (agent 实测反馈)
 
-T62 上线后我作为 agent 真把 daemon 当工具用了一遍 (开 wikipedia 搜 "semantic browser" + 看安全 headers), 暴露了 4 条新手 agent 撞上的摩擦点. T63 全改了:
+T62 上线后我作为 agent 真把 daemon 当工具用了一遍 (开 wikipedia 搜 "semantic browser" + 看安全 headers), 暴露了 10 条新手 agent 撞上的摩擦点. T63 / T63.1 / T63.2 三批全修了:
 
+**T63 (4 条):**
 - **`/state` 加 `type`** — agent 决策循环不用再调 `/snapshot` 拿当前 page 类型
 - **`/open` 一站式给 refs** — 默认返 `{refs: [{ref, kind, text, href}], ref_count}`; agent 第一次 open 后能立刻 click, 不必先调 `/snapshot` 拿 ref 列表. `?detail=full` 时返完整 snapshot (`text_blocks/scripts/raw_aria` 全)
-- **`/security-headers` 加 numeric score** — 旧的 `score: "OK/weak/missing"` 含义不明; 加 `score_points` (int 实际得分) + `score_max` (满分 8) 让 agent 用 numeric 写阈值
-- **`tb daemon stop` 等时长对齐 drain_timeout** — 原来 hard-code 3s, 没 in-flight 时 `owner.close()` 关 browser 实例要 10s+ 不够. 改成 `--drain-timeout` 参数 (默认 30s, 跟 daemon 的 `--drain-timeout` 一致)
+- **`/security-headers` 加 numeric score** — 旧的 `score: "OK/weak/missing"` 含义不明; 加 `score_points` (int) + `score_max` (满分 9, T63.2 笔误校正) 让 agent 用 numeric 写阈值
+- **`tb daemon stop` 等时长对齐 drain_timeout** — 原来 hard-code 3s, 没 in-flight 时 `owner.close()` 关 browser 实例要 10s+ 不够. 改成 `--drain-timeout` 参数 (默认 30s)
 
-dogfooding 还剩几条 polish (T63.1): `tb daemon start` 加 `--allow-data-scheme` CLI flag (跟 daemon 的 flag 对齐) + `/capacity` 去重冗余字段 (`browsers_count/M` `last_heartbeat_ts/heartbeat_age_s`) + `/sessions?detail=1` 返每 session 当前 url/title (省 N+1 次 `/state?session=NAME`).
+**T63.1 (3 条 polish):**
+- `tb daemon start` 加 `--allow-data-scheme` CLI flag (跟 daemon flag 对齐)
+- `/capacity` 去重冗余字段 — 删 `browsers_count` (==M), `last_heartbeat_ts`/`heartbeat_age_s` 合并成 `watchdog_heartbeat_age_s`
+- `/sessions?detail=1` 返每 session 当前 url+title, agent 不用 N+1 次 `/state?session=NAME`
+
+**T63.2 (3 条 — 修了剩下全部 dogfooding 反馈):**
+- **`/open` summary 更丰富** (修 2): 默认返 `heading` (h1 text) + `top_headings` ([h1]/[h2]/...) + `meta` (description/lang) + `counts` (text_blocks/links/controls/forms/scripts). 0 额外 I/O, 都是 snapshot 已有值. agent 第一次开页就能判断页面大致内容
+- **`/open` 三段式分类 + 缓存** (修 3): 启发式 → URL 缓存 → LLM-augment. simple landing page (e.g. example.com) 启发式常判 `unknown`, 配 `OPENAI_API_KEY` 后 LLM 二次判断兜底. 同 URL 二次 `/open` 秒返 `type_source="cached"` 复用分类结果, 0 LLM 重调. **没配 key → silent 走启发式**, 不破原行为
+- **`/security-headers` 加 letter grade** (修 10): 老 `score: "OK/weak/missing"` string 含义不清. 加 `score_grade` A-F (≥80%=A, ≥60%=B, ≥40%=C, ≥20%=D, 否则 F), agent 写阈值 `score_grade in {A,B}` 直白
+
+`_classify_with_cache` 缓存 (URL → {page_type, confidence}) 256 LRU. `/state` 也吃缓存, `/open` → `/state` 常见模式无重复 LLM.
 
 ### 端点映射: daemon vs MCP
 
@@ -674,7 +685,7 @@ curl -N http://127.0.0.1:8765/events
 # data: {"topic": "daemon.degraded", "data": {"level": 2, ...}, "ts": ...}
 ```
 
-测试 16 个 (T63 + T63.1) `TestT63*` 全过; 总测试 743 passed.
+测试 25 个 (T63 + T63.1 + T63.2) `TestT63*` 全过; 总测试 776 passed.
 
 ## T58 — SSRF guardrail (fable §7.1)
 

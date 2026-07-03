@@ -692,7 +692,9 @@ agent 既能用 daemon HTTP 端点也能用 MCP 工具, 两套 API 风格不同 
 | 浏览 | `POST /open`, `POST /click`, `POST /type`, ... | `sb_browse`, `sb_click`, `sb_type`, ... | 写 op 用 POST + JSON body |
 | 读 op | `GET /snapshot`, `GET /read`, `GET /state` | `sb_snapshot`, `sb_history`, ... | 读 op 用 GET + query string |
 | 安全 (T40-T44) | `GET /security-headers`, `GET /dns-records`, ... | `sb_security_headers`, `sb_dns_records`, ... | kebab ↔ snake 别名 |
-| Sessions | `GET /sessions[?detail=1]`, `POST /sessions`, `DELETE /sessions/{name}` | `sb_sessions_list/create/delete` | daemon 走 HTTP, MCP 走 daemon proxy |
+| Sessions | `GET /sessions[?detail=1]`, `POST /sessions`, `DELETE /sessions/{name}` | `sb_sessions_list/create/delete` | daemon 走 HTTP, MCP 走 daemon proxy; T65.6 起带 `tenant_id`/`agent_id` 元数据; 5 分钟 idle 自动回收 (T65.1) |
+| Lease (T65.7) | `POST /sessions/{name}/lease`, `POST .../renew`, `DELETE .../lease/{id}`, `GET .../lease` | (只有 daemon) | 多 agent 共享 daemon 的所有权原语; `fence_token` 防旧 holder 复活写 |
+| v1 namespace (T65.9) | `/v1/healthz`, `/v1/capacity`, `/v1/events`, `/v1/sessions`, `/v1/sessions/{id}/lease/...` | (MCP 走老路径) | 多 agent 推荐走 `/v1/*`; 老 dogfooding 路径零回归 |
 | 降级 | `POST /admin/degrade`, `POST /admin/restore`, `POST /admin/drain` | (只有 daemon) | 显式运维操作 |
 | 监控 | `GET /health`, `GET /capacity`, `GET /queue`, `GET /metrics`, `GET /events` | `sb_health`, `sb_capacity`, `sb_queue`, (无 /events) | SSE 端点只有 daemon 有 |
 | Agent | `POST /agent/run`, `POST /agent/run/stream` | `sb_agent_run`, `sb_agent_plan` | stream 端点 SSE |
@@ -732,6 +734,77 @@ curl -N http://127.0.0.1:8765/events
 - topics: 逗号分隔多个 pattern, 支持 `system.*` 通配符; `*` 全部
 
 测试 25 个 (T63 + T63.1 + T63.2) `TestT63*` + 5 个 T64 全过; 总测试 781 passed.
+
+## T65 — 多 agent 共享 daemon runtime
+
+设计权威: [`agent-browser-daemon-architecture.md`](agent-browser-daemon-architecture.md) §1.2 / §2 / §3.1 — 这一系列把 daemon 从「单进程 1×20 capacity 的单机工具」升级到「M×K=96 容量 + 多租户隔离 + lease/fence 防 GC 抢锁 + 持久事件总线」的生产级多 agent runtime.
+
+### T65.1 — Session idle 自动回收
+
+`POST /sessions` 创建的 session 不再永远活着 — `_start_snapshot_sweeper` 60s tick 加 idle 分支: 闲置超 `_session_idle_timeout_s` (默认 300s, 环境变量 `DAEMON_SESSION_IDLE_TIMEOUT_S` 覆盖) → 关闭 BrowserContext + 从 sessions dict 移除 + emit `session.expired`. 活跃 session 通过 `GET /state?session=...` 维持 last_used_at 心跳, 误杀率接近 0.
+
+### T65.2 — `/open` LLM 双路径 fallback
+
+LLM 增强分类 (`?classify=force`) 失败时, 默认 silent fallback 到 heuristic + 计数; `?strict=true` 显式返 `LLM_UNAVAILABLE` 错误码 (HTTP 503, retryable=true), agent 知道该退避重试还是降级到 heuristic.
+
+### T65.3 — SSE 客户端示例
+
+仓库 `examples/` 加两个参考客户端 (Python `httpx` + TypeScript native fetch), 都演示 topic 过滤 + Last-Event-ID 断线续传 + 优雅退出. README 上面 SSE 实时事件一节已链接.
+
+### T65.4 — CI workflow (`.github/workflows/`)
+
+- `test.yml` — Python 3.11 + 3.12 矩阵, `pip install -e .`, Playwright Chromium, `pytest -q`
+- `smoke.yml` — daemon 子进程跑端到端 `/health` + `/capacity` + `/open` + `/events` + `/sessions` CRUD
+
+### T65.5 — 容量升级到 M=6/K=16
+
+按设计 §1.2 容量公式 (`M_BASE_MB=250 + M_CTX_MB=15 + M_PAGES=1.5`) 算的容量墙; `__init__` 默认 `m_browsers=6, k_contexts=16` (从 1×20 升), `_compute_mem_budget()` 暴露 `mem_per_browser_estimate_mb` / `mem_total_estimate_mb` / `mem_high_watermark` 三个字段到 `/capacity`.
+
+### T65.6 — Tenant + Agent 标识
+
+每个 session 现在带 `tenant_id` + `agent_id` 元数据 (默认 `anonymous`/`anonymous`, 兼容老调用). `GET /sessions` 支持 `?tenant_id=` 过滤, `/capacity` 加 `tenants` 分布.
+
+### T65.7 — Lease + Fence 所有权原语
+
+多 agent 共享 daemon 时, 写 op 必须有「当前谁拥有这 session」的明确信号:
+
+```bash
+# acquire
+curl -X POST localhost:8765/sessions/foo/lease -d '{"agent_id":"a","tenant_id":"acme","ttl_s":60}'
+# → {"lease": {"lease_id": "01J...", "fence_token": 1, "state": "ACTIVE", ...}}
+# renew (每 5s)
+curl -X POST localhost:8765/sessions/foo/lease/01J.../renew -d '{"fence_token":1}'
+# release
+curl -X DELETE localhost:8765/sessions/foo/lease/01J... -d '{"fence_token":1}'
+```
+
+设计要点:
+- 一 session 至多一个 active lease (SQLite `UNIQUE INDEX` + `state IN (ACTIVE,GRACE,RECOVERING)` 强制)
+- `fence_token` per-session 单调 — 旧 holder 僵复活后写被拒 (409 FENCE_MISMATCH)
+- 状态机: `ACTIVE → GRACE → EXPIRED → RELEASED`; 抢占走 `PREEMPTED` (立即释放槽位)
+- reaper 后台线程每 2s 扫过期 + bump fence
+- ULID (26 字符 time-ordered, `daemon/ulid.py`) 替代 UUID 短 12 字符
+
+**踩过的坑 (代码注释里有详细)**:
+- DELETE 路径没读 body → `fence_token` 永远 0 → 全 FENCE_MISMATCH; 改成 POST+DELETE 都读 body
+- lease DELETE 被 generic session DELETE 吞 → route order 提到前面
+- `UNIQUE INDEX` 含 `PREEMPTED` → 抢占时插入新 lease 撞约束; 移出 active set
+
+### T65.8 — 持久 EventBus schema 扩展
+
+按设计 §3.1 给 `events` 表加列: `scope` / `scope_id` / `tenant_id` / `producer_kind` / `producer_id` / `provenance` / `dedup_key` / `persistent` / `payload_json` / `expires_at`. `dedup_key` UNIQUE 索引 + `INSERT OR IGNORE` 兜底去重 (D18). `replay()` 加 `tenant_id` 过滤 + `persistent_only`. SSE `/events` 加 `?tenant_id=` 查询参数.
+
+向后兼容: 老 `publish()` 调用零改动, 新参数都 optional 默认值. event_id 升 ULID.
+
+### T65.9 — `/v1/*` namespace 共存
+
+多 agent 推荐走 `/v1/*`, 老 dogfooding 路径 (`/open`, `/click`, ...) 零回归. v1 第一波核心 8 路由: `/v1/healthz` + `/v1/capacity` + `/v1/events` + `/v1/sessions` CRUD + `/v1/sessions/{id}/lease` CRUD.
+
+策略: `BaseHTTPRequestHandler` 没 sub-app 概念, 在 `_handle` 入口检测 `/v1/` 前缀重写 path 到原 handler. 推迟到 T66: `handoff` / `observers` / `blackboard` / `artifacts` / `llm-proxy` / `usage` / `budget` / `admin` — 全套 v1 第二波.
+
+### 测试
+
+T65 系列共 41 个新测试 (`TestT65p1*` ~ `TestT65p9*`), 全过; 总测试数 **149 passed** (零回归).
 
 ## T58 — SSRF guardrail (fable §7.1)
 

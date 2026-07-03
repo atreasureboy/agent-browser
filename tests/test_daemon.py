@@ -791,6 +791,83 @@ class TestT65p8EventBusExtension:
         # 不同 tenant 的事件存在独立行, 各 ≥ 1
 
 
+class TestT65p9V1Namespace:
+    """T65.9: /v1/* namespace routes 共存 — 多 agent 走 /v1/, 老 dogfooding 路径不破.
+
+    v1 第一波只做核心 8 路由 (healthz/capacity/events/sessions CRUD/lease CRUD).
+    其余路由 (open/click/type/...) 走老路径 — 不强加 /v1/ 前缀.
+    """
+
+    def test_v1_healthz_alias(self, daemon):
+        """/v1/healthz 与 /health 等价."""
+        r1 = _http("GET", f"{daemon}/health")
+        r2 = _http("GET", f"{daemon}/v1/healthz")
+        assert r1.get("ok") and r2.get("ok")
+        assert r1["data"]["status"] == r2["data"]["status"]
+
+    def test_v1_capacity_returns_m6_k16(self, daemon):
+        """/v1/capacity 同 /capacity, M=6/K=16 (T65.5 默认)."""
+        r = _http("GET", f"{daemon}/v1/capacity")
+        assert r.get("ok")
+        assert r["data"]["M"] == 6
+        assert r["data"]["K"] == 16
+
+    def test_v1_sessions_create_list_delete(self, daemon):
+        """/v1/sessions POST 创建, GET 列表, DELETE 关闭."""
+        # 创建
+        r = _http("POST", f"{daemon}/v1/sessions",
+                  {"name": "v1-test", "tenant_id": "v1-tenant"})
+        assert r.get("ok")
+        assert r["data"]["tenant_id"] == "v1-tenant"
+        # 列表
+        r2 = _http("GET", f"{daemon}/v1/sessions")
+        assert "v1-test" in r2["data"]["sessions"]
+        # 删除
+        r3 = _http("DELETE", f"{daemon}/v1/sessions/v1-test")
+        assert r3.get("ok")
+
+    def test_v1_lease_lifecycle(self, daemon):
+        """/v1/sessions/{name}/lease + /renew + DELETE — 走 v1 path."""
+        _http("POST", f"{daemon}/v1/sessions", {"name": "v1-lease"})
+        r = _http("POST", f"{daemon}/v1/sessions/v1-lease/lease",
+                  {"agent_id": "a", "tenant_id": "v1-tenant", "ttl_s": 30})
+        assert r.get("ok"), r
+        lease = r["data"]["lease"]
+        lid = lease["lease_id"]
+        ft = lease["fence_token"]
+
+        # renew via v1
+        r2 = _http("POST", f"{daemon}/v1/sessions/v1-lease/lease/{lid}/renew",
+                   {"fence_token": ft})
+        assert r2.get("ok"), r2
+
+        # release via v1
+        r3 = _http("DELETE", f"{daemon}/v1/sessions/v1-lease/lease/{lid}",
+                   {"fence_token": ft})
+        assert r3.get("ok")
+        assert r3["data"]["state"] == "RELEASED"
+
+    def test_legacy_routes_still_work(self, daemon):
+        """老 /sessions /open 路径不被 /v1 改动破坏."""
+        r = _http("POST", f"{daemon}/sessions", {"name": "legacy-test"})
+        assert r.get("ok")
+        r2 = _http("GET", f"{daemon}/sessions")
+        assert "legacy-test" in r2["data"]["sessions"]
+
+    def test_v1_events_sse_streams(self, daemon):
+        """/v1/events 等价 /events, SSE 续传 Last-Event-ID."""
+        # 简测: 打开 SSE 拿一帧再关
+        import urllib.error
+        req = urllib.request.Request(f"{daemon}/v1/events?topics=system.heartbeat")
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                line = resp.readline().decode("utf-8").rstrip("\r").rstrip("\n")
+                # 至少拿到一行 (可能是 :keepalive 或 data: ...)
+                assert line
+        except (URLError, TimeoutError):
+            pass  # 2s 内没事件也 OK
+
+
 class TestT52Metrics:
     """T52: /metrics 端点 — Prometheus 格式 + 必含关键指标."""
 

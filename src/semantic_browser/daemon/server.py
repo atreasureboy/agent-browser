@@ -990,6 +990,27 @@ class TransparentBrowserDaemon:
         import time as _time
         parsed = urlparse(req.path)
         path = parsed.path.rstrip("/") or "/"
+        # T65.9: /v1/* namespace 共存 — 多 agent 走 /v1/, 老 dogfooding 走不带前缀.
+        # v1 第一波只覆盖核心 8 个: healthz / capacity / events / sessions CRUD /
+        # lease acquire+renew+release+get. 其余路由回退到不带 v1 的原始 handler.
+        if path.startswith("/v1/"):
+            v1_path = path[3:]  # strip "/v1" → 跟原 path 等价
+            v1_routes = {
+                "/healthz", "/capacity", "/events",
+                "/sessions",  # POST 创建 + GET 列表
+            }
+            # /v1/sessions/{id}/... (GET 详情 + DELETE + lease CRUD)
+            if v1_path == "/healthz":
+                path = "/health"
+            elif v1_path == "/capacity":
+                path = "/capacity"
+            elif v1_path == "/events":
+                path = "/events"
+            elif v1_path == "/sessions":
+                path = "/sessions"
+            elif v1_path.startswith("/sessions/"):
+                # 保留 lease 路径模式
+                path = v1_path
         query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
         needs_lock = path not in self._NO_LOCK_PATHS
         started_at = _time.time()

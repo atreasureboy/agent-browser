@@ -263,7 +263,9 @@ def daemon_status(ctx, port, quiet):
 
 @daemon.command("stop")
 @click.option("--port", type=int, default=8765, show_default=True)
-def daemon_stop(port):
+@click.option("--drain-timeout", type=int, default=30, show_default=True,
+              help="T62: 等 daemon 走完 drain 的最大秒数 — 跟 daemon --drain-timeout 一致.")
+def daemon_stop(port, drain_timeout):
     """Stop a background daemon by port (uses PID file)."""
     pid_file = Path.home() / ".semantic-browser" / f"daemon-{port}.pid"
     if not pid_file.exists():
@@ -276,8 +278,12 @@ def daemon_stop(port):
         raise click.ClickException(f"pid {pid} not running (stale PID file removed)")
     except PermissionError:
         raise click.ClickException(f"pid {pid} not owned by current user")
-    # 等进程退出 (SIGTERM 不一定触发 server finally; 我们自己清理 PID 文件)
-    for _ in range(30):
+    # T62: 等进程退出 (SIGTERM 触发 _finish_shutdown_after_drain — 等在飞 op
+    # 完成或 drain_timeout 兜底). 之前 3s 太短: 即便没 in-flight, 后台 thread
+    # 走 owner.close() 也可能几秒 (browsers 关闭, snapshot 写盘). 改用
+    # --drain-timeout 跟 daemon 一致 — 默认 30s, 没 in-flight 时通常秒退.
+    deadline = time.time() + drain_timeout
+    while time.time() < deadline:
         time.sleep(0.1)
         try:
             os.kill(pid, 0)
@@ -285,13 +291,12 @@ def daemon_stop(port):
             pid_file.unlink(missing_ok=True)
             click.echo(f"stopped: daemon on port {port} (pid {pid})")
             return
-    click.echo(f"sent SIGTERM to pid {pid}; process still alive, may need kill -9")
-    # 进程还活着; 强制清理 PID 文件, 让用户能重新 start
+    click.echo(f"sent SIGTERM to pid {pid}; still alive after {drain_timeout}s drain timeout")
     pid_file.unlink(missing_ok=True)
     # B25: SIGTERM 没生效时必须返回非零退出码, 脚本 (`tb stop && start`) 不能
     # 误以为成功 — 让脚本显式处理失败。stderr 提示用户 kill -9 兜底。
     click.echo(
-        f"⚠️  SIGTERM sent to pid {pid} but process still alive after 3s; "
+        f"⚠️  SIGTERM sent to pid {pid} but process still alive after {drain_timeout}s; "
         f"manually run `kill -9 {pid}`",
         err=True,
     )

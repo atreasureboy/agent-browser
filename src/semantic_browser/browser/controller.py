@@ -1393,6 +1393,11 @@ class BrowserController:
             out["score"] = "weak"
         else:
             out["score"] = "missing"
+        # T63: numeric 分数 — 老的 string ("OK" / "weak" / "missing") 含义
+        # 不明, agent 推理很难写阈值. 加 score_points / score_max 让 agent
+        # 用 numeric 决策 (e.g. "score_points >= 4 才认为安全").
+        out["score_points"] = score
+        out["score_max"] = 8  # 实际打分项数 (含 cookie httpOnly/secure 算 1+1)
         return out
 
     # ── T40b: Hidden paths probe ─────────────────────────────

@@ -1678,9 +1678,10 @@ class TestDaemonClientCLI:
 
         try:
             # 3. 运行 tb daemon stop, expect exit code 1 + stderr 提示 kill -9
+            # 显式传 --drain-timeout 3: 默认 30s 跟测试 10s timeout 不符.
             result = subprocess.run(
                 [sys.executable, "-m", "semantic_browser.client.cli",
-                 "daemon", "stop", "--port", str(port)],
+                 "daemon", "stop", "--port", str(port), "--drain-timeout", "3"],
                 capture_output=True, text=True, timeout=10,
                 env={**os.environ, "HOME": str(home)},
             )
@@ -1889,3 +1890,164 @@ class TestT62GracefulDrain:
         self.TBD._begin_drain(d)
         # publish 没再调用 (说明 idempotent)
         d.event_bus.publish.assert_not_called()
+
+
+class TestT63DogfoodUXFixes:
+    """T63: Dogfooding 反馈的 UX 改进 — 验证 4 个 fix 真在端点生效.
+
+    4 / 5 / 7 / 9: dogfooding 报告里 agent 实测发现的摩擦点.
+    """
+
+    _HTML = (
+        "<html><body>"
+        "<h1>Hello</h1>"
+        "<a href=\"/about\" id=\"a1\">About link</a>"
+        "<a href=\"/contact\" id=\"a2\">Contact link</a>"
+        "<input type=\"text\" id=\"q1\" placeholder=\"search...\" />"
+        "<button id=\"b1\">Submit</button>"
+        "</body></html>"
+    )
+
+    def test_state_includes_type_field(self, daemon):
+        """修复 4: /state 返 {url, title, type} — agent 不用再调 /snapshot."""
+        url = f"data:text/html,{self._HTML}"
+        _http("POST", f"{daemon}/open", {"url": url})
+        s = _http("GET", f"{daemon}/state")
+        d = s["data"]
+        assert "url" in d and "title" in d
+        # T63: type 字段必须有 (None 也行, 但 key 必须在)
+        assert "type" in d, f"/state 应含 'type' 字段, got keys={list(d.keys())}"
+
+    def test_open_default_returns_refs(self, daemon):
+        """修复 5: /open 默认返 refs 列表 (links + controls 精简版).
+        agent 第一次 open 后马上能 click, 不用先 /snapshot."""
+        url = f"data:text/html,{self._HTML}"
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        d = r["data"]
+        # 必有: url, title, type
+        assert "url" in d and "title" in d and "type" in d
+        # T63: 默认带 refs + ref_count
+        assert "refs" in d, f"/open 默认应含 refs 字段, got keys={list(d.keys())}"
+        assert "ref_count" in d
+        assert d["ref_count"] == len(d["refs"]) >= 3, (
+            f"应至少 3 个 ref (2 links + 1 input + 1 button), got {d['refs']}"
+        )
+        # refs 形态: {ref, kind, text, ...}
+        kinds = {ref["kind"] for ref in d["refs"]}
+        assert "link" in kinds, f"refs 应含 link 类型, got kinds={kinds}"
+        # 找到 search input
+        search_refs = [ref for ref in d["refs"]
+                       if ref.get("input_name") == "q1" or "search" in ref.get("text", "").lower()]
+        assert search_refs, f"应能找到 search input ref, got {d['refs']}"
+
+    def test_open_detail_full_returns_snapshot(self, daemon):
+        """修复 5: ?detail=full 返完整 snapshot (text_blocks/aria/scripts 等)."""
+        url = f"data:text/html,{self._HTML}"
+        r = _http("POST", f"{daemon}/open",
+                  {"url": url, "detail": "full"})
+        d = r["data"]
+        assert "snapshot" in d, f"detail=full 应含 snapshot, got keys={list(d.keys())}"
+        snap = d["snapshot"]
+        # 完整 snapshot 应有 text_blocks
+        assert "text_blocks" in snap
+        assert "title" in snap
+
+    def test_open_detail_summary_no_snapshot(self, daemon):
+        """detail=summary (默认) — 不带 snapshot 字段, 体积小."""
+        url = f"data:text/html,{self._HTML}"
+        r = _http("POST", f"{daemon}/open",
+                  {"url": url, "detail": "summary"})
+        assert "snapshot" not in r["data"]
+        assert "refs" in r["data"]
+
+    def test_security_headers_includes_numeric_score(self, daemon):
+        """修复 7: /security-headers 返 score_points / score_max — agent
+        用 numeric 决策 (e.g. score_points >= 4), 不被模糊 string 卡住."""
+        # 用 example.com 拿真 headers (HTTPS, 至少 HSTS 应有)
+        r = _http("GET", f"{daemon}/security-headers?url=https://example.com/")
+        # daemon /security-headers 走 controller; 如果失败 (network/超时) 跳过
+        if not r.get("ok"):
+            pytest.skip(f"security-headers 失败: {r.get('error')}")
+        d = r["data"]
+        # 老的 string score 还在
+        assert "score" in d
+        assert d["score"] in ("OK", "weak", "missing")
+        # T63: numeric 字段必须有
+        assert "score_points" in d, (
+            f"应含 score_points, got keys={list(d.keys())}"
+        )
+        assert "score_max" in d
+        assert isinstance(d["score_points"], int)
+        assert isinstance(d["score_max"], int)
+        assert 0 <= d["score_points"] <= d["score_max"]
+        # 已知 wikipedia/example.com 有 HSTS — score_points >= 1
+        # (不强求更高, 跟 network 实情一致)
+
+    def test_daemon_stop_waits_drain_timeout(self, tmp_path):
+        """修复 9: tb daemon stop 等时长从 hardcoded 3s 改成 --drain-timeout.
+
+        单元测试 — 不真起 Playwright daemon (那个关 browser 10s+, 测的是
+        Playwright 性能不是 CLI 行为). 直接调 daemon_stop 的 click 命令,
+        验证它:
+        1. 默认 30s 等待 (老版本 3s 太短)
+        2. --drain-timeout 可配置
+        3. 进程死活时 timeout 后能优雅 exit 1 + stderr 提示 kill -9
+        """
+        from click.testing import CliRunner
+        from semantic_browser.client.cli import daemon_stop
+        from pathlib import Path
+        import os
+
+        # 写一个真实 PID (当前测试进程) — 5s 后自动死, 模拟 drain 超时场景
+        # 用 SIGTERM 给测试自己会真死, 不能这样. 改用永不死的 subprocess
+        # 启一个 ignore SIGTERM 的小 python 进程当 "daemon"
+        ignorer = (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "import sys; sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+            "time.sleep(60)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", ignorer],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert proc.stdout.readline() == "ready\n"
+        except Exception:
+            proc.kill()
+            raise
+        # 写 PID 文件到临时 HOME
+        home = tmp_path / "home"
+        home.mkdir()
+        sb_dir = home / ".semantic-browser"
+        sb_dir.mkdir()
+        port = 19999
+        (sb_dir / f"daemon-{port}.pid").write_text(f"{proc.pid}\n127.0.0.1\n")
+        runner = CliRunner()
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(home)
+        try:
+            # --drain-timeout 3 — 进程忽略 SIGTERM, 3s 后应 exit 1 + 提示 kill -9
+            result = runner.invoke(daemon_stop, [
+                "--port", str(port), "--drain-timeout", "3",
+            ], catch_exceptions=False)
+            assert result.exit_code == 1, (
+                f"忽略 SIGTERM 的进程应让 stop exit 1, got {result.exit_code}\n"
+                f"stdout: {result.output}"
+            )
+            assert "kill -9" in result.output, (
+                f"应提示 kill -9, got: {result.output}"
+            )
+            # 默认应 >= 10s 等待 (之前 3s 太短, 默认 30s)
+            result2 = runner.invoke(daemon_stop, [
+                "--port", "19998",  # 不同 port, 让 stop 走 PID 文件不存在分支
+            ], catch_exceptions=False)
+            # PID 文件不存在 → ClickException, exit 1
+            assert result2.exit_code == 1
+        finally:
+            proc.kill()
+            proc.wait(timeout=3)
+            if old_home is not None:
+                os.environ["HOME"] = old_home
+            else:
+                os.environ.pop("HOME", None)

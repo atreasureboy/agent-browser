@@ -1047,7 +1047,10 @@ class TransparentBrowserDaemon:
                 raise _SessionError("SESSION_NOT_FOUND", f"session {name!r} not found")
             return {"name": name, "released": True, "active": self.owner.list_sessions()}
         if method == "POST" and path == "/open":
-            return self.owner.run(self._open(args["url"], args.get("session")))
+            return self.owner.run(self._open(
+                args["url"], args.get("session"),
+                detail=args.get("detail", "summary"),
+            ))
         if method == "GET" and path == "/snapshot":
             return self.owner.run(self._snapshot(
                 detail_level=args.get("detail_level", "normal"),
@@ -1462,9 +1465,26 @@ class TransparentBrowserDaemon:
 
     async def _state(self, session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)
-        return {"url": await ctrl.get_url(), "title": await ctrl.get_title()}
+        url = await ctrl.get_url()
+        title = await ctrl.get_title()
+        # 跟 _open 一致 — heuristic PageClassifier 给 page_type, agent 决策
+        # 不用再发一次 /snapshot 才知道当前 page 类型.
+        try:
+            page = ctrl.current_page
+            if page is not None:
+                from semantic_browser.snapshot.engine import SnapshotEngine
+                from semantic_browser.classifier.heuristic import PageClassifier
+                snap = await SnapshotEngine(page).capture(base_url=url)
+                cls = PageClassifier().classify(snap)
+                page_type = cls.page_type
+            else:
+                page_type = None
+        except Exception:
+            page_type = None
+        return {"url": url, "title": title, "type": page_type}
 
-    async def _open(self, url: str, session: str | None = None) -> dict[str, Any]:
+    async def _open(self, url: str, session: str | None = None,
+                    *, detail: str = "summary") -> dict[str, Any]:
         from semantic_browser.safety.ssrf import check_url as _ssrf_check, SSRFBlockedError
         # T58: SSRF guardrail (fable §7.1) — default-deny 私网/loopback/meta
         try:
@@ -1483,7 +1503,31 @@ class TransparentBrowserDaemon:
         snap = await SnapshotEngine(page).capture(base_url=checked_url)
         from semantic_browser.classifier.heuristic import PageClassifier
         cls = PageClassifier().classify(snap)
-        return {"url": snap.url, "title": snap.title, "type": cls.page_type}
+        result: dict[str, Any] = {"url": snap.url, "title": snap.title, "type": cls.page_type}
+        if detail == "full":
+            # 完整 snapshot — agent 想拿 text_blocks/aria/scripts 等重的字段
+            # 都直接给, 不要再调 /snapshot
+            result["snapshot"] = snap.to_dict()
+        else:
+            # 默认 summary — 顺便把 clickable refs 一起给, 节省一次
+            # roundtrip (agent 开完页马上能 click, 不用先 /snapshot).
+            # 字段精简: ref + text + (href|kind), 不带 outer_html/aria 这种重的
+            refs: list[dict[str, Any]] = []
+            for link in snap.links:
+                if link.ref:
+                    refs.append({
+                        "ref": link.ref, "kind": "link",
+                        "text": link.text, "href": link.href,
+                    })
+            for ctrl_info in snap.controls:
+                if ctrl_info.ref:
+                    refs.append({
+                        "ref": ctrl_info.ref, "kind": ctrl_info.kind,
+                        "text": ctrl_info.label, "input_name": ctrl_info.input_name,
+                    })
+            result["refs"] = refs
+            result["ref_count"] = len(refs)
+        return result
 
     async def _snapshot(self, detail_level: str = "normal", session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)

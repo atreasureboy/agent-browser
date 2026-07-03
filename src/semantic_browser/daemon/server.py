@@ -158,6 +158,18 @@ class _AsyncOwner:
 _OP_LOCK_TIMEOUT_S = 30.0  # 等锁超过 30s → 503 错; 长任务应主动拆小
 
 
+# T65.5: 容量公式常量 (设计文档 §1.2) — 64GB 单机推荐 M=6 / K=16.
+# 公式: mem_per_browser = BASE + K × (CTX + P̄ × PAGE)
+#       mem_total = M × mem_per_browser + DAEMON + OS_RESERVE
+# K=16 是 hard limit (评审 D7) — 早期草稿 K=20 已作废.
+_M_BASE_MB = 250      # Chromium browser+GPU+utility 基底 (headless-new 实测 180-280MB)
+_M_CTX_MB = 15        # 空 BrowserContext (cookie jar / cache 索引 / storage 分区)
+_M_PAGE_MB = 120      # 每活跃 page 的 renderer (现代 SPA RSS 中位 90-150MB, 保守中值)
+_M_PAGES_AVG = 1.5    # 每 context 平均活跃 page 数 (主页面 + 偶发 popup)
+_M_DAEMON_MB = 300    # daemon 进程自身 (Python + FastAPI + Playwright client)
+_M_OS_RESERVE_MB = 2048  # OS + 文件缓存 + 突发预留 (Linux 64GB 机通常 idle 1.5-2GB)
+
+
 class _DaemonBusy(Exception):
     """T51: 另一个 op 还占用浏览器 — 等锁超时."""
 
@@ -363,7 +375,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 1, k_contexts: int = 20, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, drain_timeout_s: float = 30.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, drain_timeout_s: float = 30.0) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -625,6 +637,23 @@ class TransparentBrowserDaemon:
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
         "/admin/drain", "/admin/degrade", "/admin/restore",
     })
+
+    def _compute_mem_budget(self) -> tuple[int, int, int]:
+        """T65.5: 内存预算 (设计文档 §1.2 公式).
+        mem_per_browser = BASE + K × (CTX + P̄ × PAGE)
+        mem_total       = M × mem_per_browser + DAEMON + OS_RESERVE
+        mem_high_watermark = mem_total × 0.80  (评审 D6: 80% 触发准入队列快速失败)
+
+        返回 (mem_per_browser_mb, mem_total_mb, mem_high_watermark_mb).
+        在 16vCPU/64GB 单机上 M=6/K=16 默认 → per_browser ≈ 3.4GB,
+        total ≈ 22.5GB, high_watermark ≈ 18GB — 留 ~2.8× 余量给峰值/膨胀.
+        """
+        M = self._capacity_m_browsers
+        K = self._capacity_max_contexts
+        mem_per_browser = _M_BASE_MB + K * (_M_CTX_MB + _M_PAGES_AVG * _M_PAGE_MB)
+        mem_total = M * mem_per_browser + _M_DAEMON_MB + _M_OS_RESERVE_MB
+        mem_high = int(mem_total * 0.80)
+        return int(mem_per_browser), int(mem_total), mem_high
 
     def _start_snapshot_sweeper(self) -> None:
         """T61: 后台 sweeper — 定时扫 dirty session, 抓 storage_state 快照.
@@ -999,10 +1028,9 @@ class TransparentBrowserDaemon:
             M = self._capacity_m_browsers
             K = self._capacity_max_contexts
             slots_total = M * K
-            # 内存估算 (fable §1.2): BASE=250 + K_active*(CTX=15 + P̄*PAGE=120) ≈ 3.4GB @K=16
-            # T60 简化: 每 browser 估 ~3.4GB; mem_total = M × mem_per_browser + 2.3GB 底座
-            mem_per_browser_mb = 250 + K * (15 + int(1.5 * 120))
-            mem_total_mb = M * mem_per_browser_mb + 2300
+            # T65.5: 内存预算走设计文档 §1.2 公式 — 用常量替代硬编码数字, 让
+            # 评审 D7 (K=16) + D11 (16GB 小机 M=4/K=8) 调整时一处改动即可.
+            mem_per_browser_mb, mem_total_mb, mem_high_watermark_mb = self._compute_mem_budget()
             return {
                 "sessions_active": len(sessions),
                 "sessions_max": K,
@@ -1020,6 +1048,8 @@ class TransparentBrowserDaemon:
                 # 跟 heartbeat_age_s 二选一 (留 age 字段, agent 不需绝对时间戳).
                 "mem_per_browser_estimate_mb": mem_per_browser_mb,
                 "mem_total_estimate_mb": mem_total_mb,
+                # T65.5: 高水位线 — 超过后触发准入队列快速失败 (评审 D6)
+                "mem_high_watermark_mb": mem_high_watermark_mb,
                 "watchdog_heartbeat_age_s": round(time.time() - self._last_heartbeat_ts, 1)
                     if self._last_heartbeat_ts else None,
                 # T64: LLM 分类计数器 + 缓存命中率 — 运维判断 LLM 是否健康.
@@ -2540,12 +2570,13 @@ def main(argv: list[str] | None = None) -> None:
     # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
     parser.add_argument("--allow-data-scheme", action="store_true",
                         help="T58: allow data: URLs (testing only, NEVER in production)")
-    # T60: M×K 容量参数 (fable §1.2); 当前实现共享单 chromium, M 仅作
-    # /capacity 字段暴露; K 真正传给 ControllerPool (已硬编码在 _AsyncOwner).
-    parser.add_argument("--m-browsers", type=int, default=1,
-                        help="T60: M — browser 实例数 (默认 1, 共享 chromium)")
-    parser.add_argument("--k-contexts", type=int, default=20,
-                        help="T60: K — 每实例 BrowserContext 上限 (fable §1.2 默认 16)")
+    # T65.5: M×K 容量参数 (fable §1.2); 默认 6/16 是 16vCPU/64GB 推荐值
+    # (评审 D7). 当前实现共享单 chromium, M 仅作 /capacity 字段暴露;
+    # K 真正传给 ControllerPool (已硬编码在 _AsyncOwner).
+    parser.add_argument("--m-browsers", type=int, default=6,
+                        help="T65.5: M — browser 实例数 (fable §1.2 推荐 6, 64GB)")
+    parser.add_argument("--k-contexts", type=int, default=16,
+                        help="T65.5: K — 每实例 BrowserContext 上限 (fable §1.2 hard=16)")
     parser.add_argument("--watchdog-interval", type=float, default=5.0,
                         help="T60: 心跳 watchdog tick 间隔秒 (0=关闭)")
     parser.add_argument("--drain-timeout", type=float, default=30.0,

@@ -1122,7 +1122,7 @@ class TestT56Degradation:
         assert d["degradation_label"] == "L0_healthy"
         # default session 算一个
         assert d["sessions_active"] >= 1
-        assert d["sessions_max"] == 20  # max_contexts 默认值
+        assert d["sessions_max"] == 16  # T65.5: max_contexts 默认 16 (设计文档 §1.2 D7)
 
     def test_l1_rejects_new_session(self, daemon):
         """L1 应拒 POST /sessions (CAPACITY_DEGRADED), 不影响读端点."""
@@ -1565,23 +1565,28 @@ class TestT60WatchdogMxK:
     def test_capacity_includes_mk_fields(self, daemon):
         """/capacity 应暴露 M / K / slots_total / mem_* / heartbeat 信息.
         T63.1: 去掉冗余 — 不再有 browsers_count (==M) / last_heartbeat_ts
-        (==watchdog_heartbeat_age_s)."""
+        (==watchdog_heartbeat_age_s).
+        T65.5: 默认改成 M=6 / K=16 (设计文档 §1.2 推荐值, 评审 D7)."""
         r = _http("GET", f"{daemon}/capacity")
         assert r["ok"] is True
         data = r["data"]
         # M×K + 内存字段都在
         for f in ("M", "K", "slots_total",
                   "mem_per_browser_estimate_mb", "mem_total_estimate_mb",
+                  "mem_high_watermark_mb",  # T65.5 新增
                   "watchdog_heartbeat_age_s"):
             assert f in data, f"missing field {f}"
-        # 默认值 (fixture 默认 m=1, k=20, watchdog=5s)
-        assert data["M"] == 1
-        assert data["K"] == 20
-        assert data["slots_total"] == 20
-        # mem_per_browser formula: 250 + 20 * (15 + 180) = 250 + 3900 = 4150
-        assert data["mem_per_browser_estimate_mb"] == 4150
-        # mem_total = 1 * 4150 + 2300 = 6450
-        assert data["mem_total_estimate_mb"] == 6450
+        # T65.5 默认值 (fixture 默认 m=6, k=16, watchdog=5s)
+        assert data["M"] == 6
+        assert data["K"] == 16
+        assert data["slots_total"] == 96
+        # T65.5 公式: mem_per_browser = 250 + 16 * (15 + 1.5*120)
+        #                          = 250 + 16 * 195 = 250 + 3120 = 3370
+        assert data["mem_per_browser_estimate_mb"] == 3370
+        # mem_total = 6 * 3370 + 300 + 2048 = 22568
+        assert data["mem_total_estimate_mb"] == 22568
+        # 高水位 = mem_total × 0.80 ≈ 18054
+        assert data["mem_high_watermark_mb"] == 18054
 
     def test_heartbeat_event_published_to_bus(self, daemon):
         """watchdog 每 5s 发 system.heartbeat 到 bus; /events 订阅应能收到."""

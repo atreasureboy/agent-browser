@@ -2245,6 +2245,10 @@ class TestT63p2LLMAugmentAndPolish:
         assert d["heading"] == "Example Domain", (
             f"heading 应是 h1 文本 'Example Domain', got {d['heading']!r}"
         )
+        # T64: heading_source 表明 fallback 路径
+        assert d.get("heading_source") == "h1", (
+            f"有 h1 时 heading_source 应='h1', got {d.get('heading_source')!r}"
+        )
         # top_headings — 多级标题
         assert "top_headings" in d
         assert any("[h1]" in h for h in d["top_headings"]), (
@@ -2263,6 +2267,21 @@ class TestT63p2LLMAugmentAndPolish:
         c = d["counts"]
         assert c["links"] >= 2, f"应有 >=2 links, got {c}"
         assert c["text_blocks"] >= 5, f"应有 >=5 文本块 (1 h1+1 h2+3 p), got {c}"
+
+    def test_open_heading_fallback_to_title_when_no_h1(self, daemon):
+        """T64: dogfooding 报告 2 修 — 页面无 h1 (e.g. 搜索结果页) 时 heading
+        应回退到 title, 不返 None. 让 agent 永远拿到非空主标题."""
+        # 无 h1 的页面 — 只有 h2
+        url = "data:text/html,<title>Search results for foo</title><h2>Result 1</h2><p>body</p>"
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        d = r["data"]
+        assert "heading" in d
+        assert d["heading"] == "Search results for foo", (
+            f"无 h1 应 fallback 到 title, got {d['heading']!r}"
+        )
+        assert d.get("heading_source") == "title", (
+            f"heading_source 应='title', got {d.get('heading_source')!r}"
+        )
 
     def test_open_classify_without_api_key_uses_heuristic(self, daemon):
         """修复 3: 无 OPENAI_API_KEY → type_source='heuristic', 行为同 T63 前,

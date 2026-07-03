@@ -1548,7 +1548,18 @@ class TransparentBrowserDaemon:
         # open 后能立刻知道 "这个页面是干嘛的", 不用再调 /snapshot. 体积仍小
         # (kb 级), 全字段都是 snapshot 已有值, 0 额外 I/O.
         headings = [b for b in snap.text_blocks if b.tag in ("h1", "h2", "h3")]
-        result["heading"] = headings[0].text if headings and headings[0].tag == "h1" else None
+        h1 = next((b for b in headings if b.tag == "h1"), None)
+        if h1:
+            result["heading"] = h1.text
+            result["heading_source"] = "h1"
+        elif snap.title:
+            # T64: 页面无 h1 (e.g. 搜索结果页 / listing) — 退到 title 当 heading
+            # 让 agent 永远拿到非空主标题, 不必 fallback None
+            result["heading"] = snap.title
+            result["heading_source"] = "title"
+        else:
+            result["heading"] = None
+            result["heading_source"] = None
         result["top_headings"] = [
             f"[{b.tag}] {b.text[:80]}" for b in headings[:5]
         ]

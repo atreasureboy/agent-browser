@@ -640,6 +640,42 @@ $ curl -X POST http://127.0.0.1:8765/admin/drain
 
 全套 **678 passed, 7 skipped** （+11 vs T61 套件）。
 
+## T63 — Dogfooding UX 修复 (agent 实测反馈)
+
+T62 上线后我作为 agent 真把 daemon 当工具用了一遍 (开 wikipedia 搜 "semantic browser" + 看安全 headers), 暴露了 4 条新手 agent 撞上的摩擦点. T63 全改了:
+
+- **`/state` 加 `type`** — agent 决策循环不用再调 `/snapshot` 拿当前 page 类型
+- **`/open` 一站式给 refs** — 默认返 `{refs: [{ref, kind, text, href}], ref_count}`; agent 第一次 open 后能立刻 click, 不必先调 `/snapshot` 拿 ref 列表. `?detail=full` 时返完整 snapshot (`text_blocks/scripts/raw_aria` 全)
+- **`/security-headers` 加 numeric score** — 旧的 `score: "OK/weak/missing"` 含义不明; 加 `score_points` (int 实际得分) + `score_max` (满分 8) 让 agent 用 numeric 写阈值
+- **`tb daemon stop` 等时长对齐 drain_timeout** — 原来 hard-code 3s, 没 in-flight 时 `owner.close()` 关 browser 实例要 10s+ 不够. 改成 `--drain-timeout` 参数 (默认 30s, 跟 daemon 的 `--drain-timeout` 一致)
+
+dogfooding 还剩几条 polish (T63.1): `tb daemon start` 加 `--allow-data-scheme` CLI flag (跟 daemon 的 flag 对齐) + `/capacity` 去重冗余字段 (`browsers_count/M` `last_heartbeat_ts/heartbeat_age_s`) + `/sessions?detail=1` 返每 session 当前 url/title (省 N+1 次 `/state?session=NAME`).
+
+### 端点映射: daemon vs MCP
+
+agent 既能用 daemon HTTP 端点也能用 MCP 工具, 两套 API 风格不同 (daemon kebab-case + GET/POST, MCP snake_case + JSON-RPC):
+
+| 用途 | daemon 端点 | MCP 工具 | 说明 |
+|------|------------|---------|------|
+| 浏览 | `POST /open`, `POST /click`, `POST /type`, ... | `sb_browse`, `sb_click`, `sb_type`, ... | 写 op 用 POST + JSON body |
+| 读 op | `GET /snapshot`, `GET /read`, `GET /state` | `sb_snapshot`, `sb_history`, ... | 读 op 用 GET + query string |
+| 安全 (T40-T44) | `GET /security-headers`, `GET /dns-records`, ... | `sb_security_headers`, `sb_dns_records`, ... | kebab ↔ snake 别名 |
+| Sessions | `GET /sessions[?detail=1]`, `POST /sessions`, `DELETE /sessions/{name}` | `sb_sessions_list/create/delete` | daemon 走 HTTP, MCP 走 daemon proxy |
+| 降级 | `POST /admin/degrade`, `POST /admin/restore`, `POST /admin/drain` | (只有 daemon) | 显式运维操作 |
+| 监控 | `GET /health`, `GET /capacity`, `GET /queue`, `GET /metrics`, `GET /events` | `sb_health`, `sb_capacity`, `sb_queue`, (无 /events) | SSE 端点只有 daemon 有 |
+| Agent | `POST /agent/run`, `POST /agent/run/stream` | `sb_agent_run`, `sb_agent_plan` | stream 端点 SSE |
+
+### SSE 实时事件 (T59)
+
+agent 想看实时降级/压力事件, 不必轮询 `/capacity` — daemon 暴露 `GET /events` SSE 流, 推送 `system.pressure` + `daemon.degraded` + `daemon.draining` 等. MCP 没有这个端点, agent 用 daemon HTTP 直连.
+
+```bash
+curl -N http://127.0.0.1:8765/events
+# data: {"topic": "daemon.degraded", "data": {"level": 2, ...}, "ts": ...}
+```
+
+测试 16 个 (T63 + T63.1) `TestT63*` 全过; 总测试 743 passed.
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

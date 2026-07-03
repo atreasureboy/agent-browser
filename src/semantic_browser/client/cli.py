@@ -138,7 +138,13 @@ def daemon():
 @click.option("--background", is_flag=True, help="start in background")
 @click.option("--force", is_flag=True,
               help="Kill existing daemon on the same port before starting")
-def daemon_start(port, host, headed, state, background, force):
+@click.option("--allow-data-scheme", is_flag=True,
+              help="T58: 允许 data: URL (default SSRF guardrail 拒掉; "
+                   "测试本地 fixture 页用).")
+@click.option("--drain-timeout", type=int, default=30, show_default=True,
+              help="T62: SIGTERM 后等 in-flight op 完成的最大秒数.")
+def daemon_start(port, host, headed, state, background, force,
+                 allow_data_scheme, drain_timeout):
     """Start the local browser daemon.
 
     \b
@@ -205,11 +211,15 @@ def daemon_start(port, host, headed, state, background, force):
             f"port {port} already in use on {host} (not us); pick another --port"
         )
 
-    cmd = [sys.executable, "-m", "semantic_browser.daemon.server", "--host", host, "--port", str(port)]
+    cmd = [sys.executable, "-m", "semantic_browser.daemon.server",
+           "--host", host, "--port", str(port),
+           "--drain-timeout", str(drain_timeout)]
     if headed:
         cmd.append("--headed")
     if state:
         cmd.extend(["--state", state])
+    if allow_data_scheme:
+        cmd.append("--allow-data-scheme")
     if background:
         log = Path.home() / ".semantic-browser" / "daemon.log"
         log.parent.mkdir(parents=True, exist_ok=True)

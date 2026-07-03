@@ -975,16 +975,18 @@ class TransparentBrowserDaemon:
                 "degradation_level": self._degradation_level,
                 "degradation_label": ["L0_healthy", "L1_reject_new", "L2_preempt_low", "L3_readonly", "L4_full"][self._degradation_level],
                 "pressure_level": self._pressure_level or "normal",
-                # T60: M×K 容量字段 (fable §1.2)
+                # T60: M×K 容量字段 (fable §1.2) — M 是 browser 实例数,
+                # K 是 per-browser 上限 session 数, slots_total = M*K.
+                # agent 用 slots_total / capacity_ratio 算"还能开几个 session".
                 "M": M,
                 "K": K,
                 "slots_total": slots_total,
-                "browsers_count": self._healthy_browsers,
+                # T63.1: 去掉冗余 — browsers_count 跟 M 重复, last_heartbeat_ts
+                # 跟 heartbeat_age_s 二选一 (留 age 字段, agent 不需绝对时间戳).
                 "mem_per_browser_estimate_mb": mem_per_browser_mb,
                 "mem_total_estimate_mb": mem_total_mb,
-                # T60: 上次 watchdog 心跳 (None=没跑过)
-                "last_heartbeat_ts": self._last_heartbeat_ts,
-                "heartbeat_age_s": round(time.time() - self._last_heartbeat_ts, 1) if self._last_heartbeat_ts else None,
+                "watchdog_heartbeat_age_s": round(time.time() - self._last_heartbeat_ts, 1)
+                    if self._last_heartbeat_ts else None,
             }
         # T59: /events — SSE stream of all EventBus events (持久 + live)
         if method == "GET" and path == "/events":
@@ -1028,6 +1030,23 @@ class TransparentBrowserDaemon:
         # T54: session CRUD — list / create / delete
         if method == "GET" and path == "/sessions":
             sessions = self.owner.list_sessions()
+            # T63.1: ?detail=1 时每 session 返 url+title — agent 想看 N 个
+            # session 各自当前在哪个页, 不必 N+1 次 /state?session=NAME.
+            # 失败 (controller 死了/lazy 没 init) 时 url/title 留 None, 不抛.
+            detail = str(args.get("detail", "")).lower() in ("1", "true", "yes")
+            if detail:
+                items = []
+                for s in sessions:
+                    entry: dict[str, Any] = {"name": s}
+                    try:
+                        ctrl = self.owner.run(self.owner.aget_controller(s))
+                        entry["url"] = self.owner.run(ctrl.get_url())
+                        entry["title"] = self.owner.run(ctrl.get_title())
+                    except Exception:
+                        entry["url"] = None
+                        entry["title"] = None
+                    items.append(entry)
+                return {"sessions": items, "active_count": len(items), "detail": True}
             return {"sessions": sessions, "active_count": len(sessions)}
         if method == "POST" and path == "/sessions":
             name = args.get("name") or f"agent-{len(self.owner.list_sessions()) + 1}"

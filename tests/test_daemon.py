@@ -1563,14 +1563,16 @@ class TestT60WatchdogMxK:
     """T60: Browser watchdog + M×K capacity (fable §5.5/§1.2)."""
 
     def test_capacity_includes_mk_fields(self, daemon):
-        """/capacity 应暴露 M / K / slots_total / mem_* / browsers_count / heartbeat 信息."""
+        """/capacity 应暴露 M / K / slots_total / mem_* / heartbeat 信息.
+        T63.1: 去掉冗余 — 不再有 browsers_count (==M) / last_heartbeat_ts
+        (==watchdog_heartbeat_age_s)."""
         r = _http("GET", f"{daemon}/capacity")
         assert r["ok"] is True
         data = r["data"]
-        # M×K 字段都在
-        for f in ("M", "K", "slots_total", "browsers_count",
+        # M×K + 内存字段都在
+        for f in ("M", "K", "slots_total",
                   "mem_per_browser_estimate_mb", "mem_total_estimate_mb",
-                  "last_heartbeat_ts", "heartbeat_age_s"):
+                  "watchdog_heartbeat_age_s"):
             assert f in data, f"missing field {f}"
         # 默认值 (fixture 默认 m=1, k=20, watchdog=5s)
         assert data["M"] == 1
@@ -1580,8 +1582,6 @@ class TestT60WatchdogMxK:
         assert data["mem_per_browser_estimate_mb"] == 4150
         # mem_total = 1 * 4150 + 2300 = 6450
         assert data["mem_total_estimate_mb"] == 6450
-        # browsers_count 默认 1
-        assert data["browsers_count"] == 1
 
     def test_heartbeat_event_published_to_bus(self, daemon):
         """watchdog 每 5s 发 system.heartbeat 到 bus; /events 订阅应能收到."""
@@ -1618,7 +1618,9 @@ class TestT60WatchdogMxK:
                 break
 
     def test_heartbeat_field_present_in_capacity(self, daemon):
-        """/capacity 应包含 last_heartbeat_ts + heartbeat_age_s 字段 (§5.5 健康监测).
+        """/capacity 应包含 watchdog_heartbeat_age_s 字段 (§5.5 健康监测).
+        T63.1: 旧字段 last_heartbeat_ts + heartbeat_age_s 合并成单字段
+        watchdog_heartbeat_age_s (避免绝对时间戳 + 年龄重复表达).
 
         此测试不强制断言值非 None — 因为 daemon 启动后是否已 tick 取决于
         时序. heartbeat 实际触发的能力由 test_heartbeat_event_published_to_bus 验证.
@@ -1627,11 +1629,13 @@ class TestT60WatchdogMxK:
         assert r["ok"] is True
         data = r["data"]
         # 字段必在 (即使值为 None; 表示 daemon 还没 tick 过)
-        assert "last_heartbeat_ts" in data
-        assert "heartbeat_age_s" in data
+        assert "watchdog_heartbeat_age_s" in data
         # 类型: None 或数字
-        assert data["last_heartbeat_ts"] is None or isinstance(data["last_heartbeat_ts"], (int, float))
-        assert data["heartbeat_age_s"] is None or isinstance(data["heartbeat_age_s"], (int, float))
+        assert (data["watchdog_heartbeat_age_s"] is None
+                or isinstance(data["watchdog_heartbeat_age_s"], (int, float)))
+        # 老字段应不在
+        assert "last_heartbeat_ts" not in data
+        assert "heartbeat_age_s" not in data
 
 
 class TestDaemonClientCLI:
@@ -2051,3 +2055,76 @@ class TestT63DogfoodUXFixes:
                 os.environ["HOME"] = old_home
             else:
                 os.environ.pop("HOME", None)
+
+
+class TestT63p1CLIAndEndpointPolish:
+    """T63.1: dogfooding polish — CLI flag + /capacity 去重 + /sessions?detail=1.
+
+    - 修复 1: tb daemon start --allow-data-scheme (跟 daemon 的 flag 对齐)
+    - 修复 6: /capacity 去重 browsers_count (==M) / last_heartbeat_ts (==age)
+    - 修复 8: /sessions?detail=1 返每 session 当前 url/title, agent 不用 N+1
+    """
+
+    def test_daemon_start_help_lists_allow_data_scheme(self):
+        """修复 1: tb daemon start --help 应暴露 --allow-data-scheme."""
+        from click.testing import CliRunner
+        from semantic_browser.client.cli import daemon_start
+        runner = CliRunner()
+        result = runner.invoke(daemon_start, ["--help"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert "--allow-data-scheme" in result.output
+        # drain-timeout 也应在 help 里 (之前命令行没有, fix 9 加的)
+        assert "--drain-timeout" in result.output
+
+    def test_capacity_no_duplicate_fields(self, daemon):
+        """修复 6: /capacity 不应有 browsers_count (==M) 或 last_heartbeat_ts
+        (heartbeat 字段已合并成 watchdog_heartbeat_age_s)."""
+        r = _http("GET", f"{daemon}/capacity")
+        d = r["data"]
+        assert "browsers_count" not in d, (
+            f"browsers_count 跟 M 重复, 应去掉; keys={list(d.keys())}"
+        )
+        assert "last_heartbeat_ts" not in d, (
+            f"last_heartbeat_ts 跟 watchdog_heartbeat_age_s 重复"
+        )
+        # M, K, slots_total, watchdog_heartbeat_age_s 仍要在
+        for required in ("M", "K", "slots_total", "watchdog_heartbeat_age_s"):
+            assert required in d, f"应仍含 {required!r}, keys={list(d.keys())}"
+
+    def test_sessions_detail_returns_per_session_state(self, daemon):
+        """修复 8: /sessions?detail=1 返 [{name, url, title}, ...]."""
+        # 创两个 session, 各开一页面
+        _http("POST", f"{daemon}/sessions", {"name": "agent-x"})
+        _http("POST", f"{daemon}/sessions", {"name": "agent-y"})
+        _http("POST", f"{daemon}/open",
+              {"url": "data:text/html,<title>X-Page</title>", "session": "agent-x"})
+        _http("POST", f"{daemon}/open",
+              {"url": "data:text/html,<title>Y-Page</title>", "session": "agent-y"})
+        # ?detail=1
+        r = _http("GET", f"{daemon}/sessions?detail=1")
+        d = r["data"]
+        assert d.get("detail") is True
+        assert isinstance(d["sessions"], list)
+        # 找到 agent-x / agent-y 的 entry
+        by_name = {s["name"]: s for s in d["sessions"]}
+        assert "agent-x" in by_name and "agent-y" in by_name, (
+            f"detail list 应含两个 session, got {d['sessions']}"
+        )
+        # url 应包含 data:text/html (我们 open 的页面 url)
+        assert "data:text/html" in (by_name["agent-x"]["url"] or ""), (
+            f"agent-x url 错: {by_name['agent-x']}"
+        )
+        assert "data:text/html" in (by_name["agent-y"]["url"] or "")
+
+    def test_sessions_default_no_detail(self, daemon):
+        """默认 /sessions (不带 detail) — 保持简单 list[str], 不破契约."""
+        r = _http("GET", f"{daemon}/sessions")
+        d = r["data"]
+        assert "sessions" in d
+        assert "active_count" in d
+        # 不应有 detail 标志
+        assert d.get("detail") is None
+        # sessions 是名字 str 的 list (不变)
+        assert isinstance(d["sessions"], list)
+        if d["sessions"]:
+            assert isinstance(d["sessions"][0], str)

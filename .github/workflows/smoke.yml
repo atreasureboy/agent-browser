@@ -1,0 +1,85 @@
+name: smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: daemon smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install system deps (Playwright browsers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libatspi2.0-0 \
+            libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install chromium
+
+      - name: Start daemon
+        run: |
+          python -m semantic_browser.daemon.server --port 8765 --allow-data-scheme &
+          echo $! > /tmp/daemon.pid
+          # wait for /health to be ready (up to 60s)
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8765/health > /dev/null 2>&1; then
+              echo "daemon ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Smoke check /health
+        run: |
+          curl -sf http://127.0.0.1:8765/health | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; assert d['data']['status'] == 'ok'; print('health OK')"
+
+      - name: Smoke check /capacity
+        run: |
+          curl -sf http://127.0.0.1:8765/capacity | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; assert d['data']['M'] == 6; assert d['data']['K'] == 16; print(f\"capacity OK M={d['data']['M']} K={d['data']['K']}\")"
+
+      - name: Smoke check /open (data URL, allowed)
+        run: |
+          curl -sf -X POST "http://127.0.0.1:8765/open?url=data:text/html,<h1>smoke</h1><p>CI</p>" | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; print(f\"open OK type={d['data'].get('type')}\")"
+
+      - name: Smoke check /events SSE (3s window)
+        run: |
+          timeout 3 curl -N -sf "http://127.0.0.1:8765/events?topics=system.heartbeat" > /tmp/events.log
+          # expect ≥1 frame (id: + data:) — heartbeat 5s/帧, 3s 应该至少 0 (keepalive) 或 1 (heartbeat)
+          echo "captured $(wc -l < /tmp/events.log) lines from /events"
+          head -5 /tmp/events.log
+
+      - name: Smoke check /sessions
+        run: |
+          curl -sf -X POST "http://127.0.0.1:8765/sessions" -d '{"name":"ci-smoke"}' | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; print(f\"session create OK: {d['data']['name']}\")"
+          curl -sf "http://127.0.0.1:8765/sessions" | python -c "import sys, json; d = json.load(sys.stdin); assert 'ci-smoke' in d['data']['sessions']; print(f\"sessions list OK: {d['data']['sessions']}\")"
+          curl -sf -X DELETE "http://127.0.0.1:8765/sessions/ci-smoke" | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; print('session delete OK')"
+
+      - name: Stop daemon
+        if: always()
+        run: |
+          if [ -f /tmp/daemon.pid ]; then
+            kill $(cat /tmp/daemon.pid) 2>/dev/null || true
+            wait 2>/dev/null || true
+          fi

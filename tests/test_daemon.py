@@ -2444,3 +2444,130 @@ class TestT63p2LLMAugmentAndPolish:
         else:
             assert d["llm_classify_failure_rate"] is None
 
+    def test_open_link_refs_include_href(self, daemon):
+        """T64.1 (round 3 实测): dogfooding 时发现 wikipedia 22/91 link 没 href.
+        根因是 snapshot engine 把 <a href> 同时塞 links[] 和 controls[kind=link],
+        controls 没存 href 字段. /open refs 构造加 link_hrefs 反查, 同样 ref 的
+        control 不再产生重复 entry."""
+        # 用简单 HTML — 同一个 <a href> 应该在 refs 里只出现一次 + 带 href
+        url = ("data:text/html,<html><body>"
+               "<a href='/foo' id='a1'>Foo link</a>"
+               "<a href='/bar' id='a2'>Bar link</a>"
+               "<a href='/foo' id='a3'>Foo dup</a>"  # 同样 href, 不同 text
+               "</body></html>")
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        d = r["data"]
+        link_refs = [r for r in d["refs"] if r["kind"] == "link"]
+        # 每个 link 都应带 href
+        no_href = [r for r in link_refs if "href" not in r]
+        assert not no_href, (
+            f"所有 link refs 应有 href, 但 {len(no_href)} 个没有: "
+            f"{no_href[:3]}"
+        )
+        # 应能找到 a1 / a2 / a3 (或者它们的 href)
+        hrefs = [r["href"] for r in link_refs]
+        assert any("/foo" in h for h in hrefs), f"应有 /foo href, got {hrefs}"
+        assert any("/bar" in h for h in hrefs), f"应有 /bar href, got {hrefs}"
+
+
+@pytest.fixture
+def daemon_bad_llm():
+    """T65.2: 启 daemon 时把 OPENAI_API_BASE 指到不可达端口, 让 LLM 调用必失败.
+    用于测试 ?strict=true 模式下 LLM 故障 → LLM_UNAVAILABLE error code."""
+    port = _free_port()
+    log_path = f"/tmp/tb-daemon-test-strict-{port}.log"
+    env = os.environ.copy()
+    # 用一个连不上的 URL 触发 LLM 失败 — 比删 OPENAI_API_KEY 更能覆盖 strict
+    # 实际触发的代码路径 (heuristic < 0.5 时会真正跑 LLM).
+    # LLMEnhancedClassifier init 优先读 OPENAI_BASE_URL, 其次 OPENAI_API_BASE —
+    # 两个都覆盖才能确保 LLM 必走不可达 URL.
+    # 注意: 也必须设 OPENAI_MODEL, 不然 _llm_available=False, LLMEnhancedClassifier
+    # 会走"not configured"早返回路径 (return heuristic), 不会触发 httpx 异常.
+    env["OPENAI_BASE_URL"] = "http://127.0.0.1:1/v1"
+    env["OPENAI_API_BASE"] = "http://127.0.0.1:1/v1"
+    env["OPENAI_MODEL"] = "fake-model-for-strict-test"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port),
+         "--allow-data-scheme"],
+        stdout=open(log_path, "wb"),
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    base = f"http://127.0.0.1:{port}"
+    # 等 daemon 就绪 (最多 30s)
+    for _ in range(60):
+        try:
+            r = _http("GET", f"{base}/health")
+            if r.get("ok") and r.get("data", {}).get("status") == "ok":
+                break
+        except (URLError, ConnectionRefusedError, OSError):
+            time.sleep(0.5)
+    else:
+        proc.kill()
+        pytest.fail(f"daemon_bad_llm did not start; see {log_path}")
+
+    yield base
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    try:
+        os.unlink(log_path)
+    except OSError:
+        pass
+
+
+class TestT65p2StrictLLM:
+    """T65.2: ?strict=true 双路径 — 默认 silent fallback 不变; strict 模式下
+    LLM 失败返 503 + LLM_UNAVAILABLE (retryable=true)."""
+
+    def test_open_strict_param_accepted_with_heuristic_only(self, daemon):
+        """?strict=true 在 heuristic 高置信度时 (跳过 LLM 路径) 应照常 ok.
+        验证 query param 透传 + 不破坏 heuristic 路径.
+        注: data: URL 的 heuristic 可能 < 0.5, 触发 LLM 调用 — 这里用一段明显
+        是 article 的 HTML + 多 paragraph 拉高 heuristic confidence."""
+        # 多 paragraph + h1 + 长文 → heuristic 会判定 article 且 conf 高
+        html = ("data:text/html,<html><head><title>T</title></head>"
+                "<body><h1>Hello</h1>"
+                "<p>" + ("long paragraph content. " * 30) + "</p>"
+                "<p>" + ("another paragraph. " * 30) + "</p>"
+                "<p>" + ("third paragraph. " * 30) + "</p>"
+                "</body></html>")
+        # 先非 strict 跑一次暖 heuristic cache
+        r1 = _http("POST", f"{daemon}/open", {"url": html})
+        assert r1.get("ok"), f"warmup 应 ok: {r1}"
+        # 如果 warmup 已经走 heuristic (type_source=heuristic), strict 路径也应相同
+        if r1["data"].get("type_source") in ("heuristic", "cached"):
+            r2 = _http("POST", f"{daemon}/open?strict=true&classify=force",
+                       {"url": html})
+            assert r2.get("ok"), f"strict + heuristic 路径应 ok: {r2}"
+            # type_source 仍应是 heuristic (LLM 没调用)
+            assert r2["data"]["type_source"] in ("heuristic", "cached")
+
+    def test_open_strict_llm_failure_returns_unavailable(self, daemon_bad_llm):
+        """?strict=true + LLM 不可达 → 503 + LLM_UNAVAILABLE error code."""
+        # example.com 触发 heuristic < 0.5 + LLM 路径 (per llm-proxy-dev-env memory)
+        # daemon_bad_llm fixture 把 OPENAI_API_BASE 指到 127.0.0.1:1, LLM 必失败
+        r = _http("POST", f"{daemon_bad_llm}/open?strict=true",
+                  {"url": "http://example.com"}, timeout=60)
+        # strict 模式下 LLM 失败必须返 error envelope, 不能 silent fallback
+        assert r.get("ok") is False, f"strict mode LLM 失败应返 ok=false, got {r}"
+        err = r.get("error", {})
+        assert err.get("code") == "LLM_UNAVAILABLE", (
+            f"error code 应是 LLM_UNAVAILABLE, got {err}"
+        )
+        assert err.get("retryable") is True, f"LLM_UNAVAILABLE 应 retryable, got {err}"
+
+    def test_open_non_strict_silent_fallback_when_llm_fails(self, daemon_bad_llm):
+        """默认 (non-strict) + LLM 不可达 → ok + type_source=heuristic.
+        验证 silent fallback 路径不被 strict 改动破坏."""
+        r = _http("POST", f"{daemon_bad_llm}/open",
+                  {"url": "http://example.com"}, timeout=60)
+        # 默认 silent fallback 必须仍然工作
+        assert r.get("ok"), f"non-strict LLM 失败应 silent fallback, got {r}"
+        assert r["data"]["type_source"] in ("heuristic", "cached"), (
+            f"silent fallback 应返 heuristic/cached, got {r['data'].get('type_source')}"
+        )
+

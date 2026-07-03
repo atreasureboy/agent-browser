@@ -211,6 +211,8 @@ _STATUS_BY_CODE: dict[str, int] = {
     "SSRF_BLOCKED": 400,
     # T62: 收到 SIGTERM, daemon 进入 drain — 拒新 op, 等在飞完成
     "DAEMON_DRAINING": 503,
+    # T65.2: ?strict=true 模式下 LLM 失败返 503 (retryable) — 默认 silent fallback 维持
+    "LLM_UNAVAILABLE": 503,
     "INTERNAL": 500,
 }
 
@@ -221,6 +223,15 @@ class _SessionError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class _LLMUnavailableError(Exception):
+    """T65.2: ?strict=true 模式下 LLM proxy 抛错, 不再 silent fallback,
+    直接抛此异常给 agent 显式处理. retryable=True."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "LLM_UNAVAILABLE"
 
 
 class _DegradationError(Exception):
@@ -832,6 +843,19 @@ class TransparentBrowserDaemon:
                 final_code = e.code
                 self._send(req, final_status, err(e.code, str(e), retryable=False))
                 return
+            # T65.2: ?strict=true 模式下 LLM 失败 — 503 + Retry-After 让 agent
+            # 知道是临时性故障, 可以 defer / 切到本地启发式
+            if isinstance(e, _LLMUnavailableError):
+                final_status = _STATUS_BY_CODE.get(e.code, 503)
+                final_code = e.code
+                self._send_with_extra_headers(req, final_status, {
+                    "ok": False, "data": None,
+                    "error": {
+                        "code": e.code, "message": str(e),
+                        "retryable": True, "strict": True,
+                    },
+                }, {"Retry-After": "5"})
+                return
             # T56: 降级阻挡 — 503 + Retry-After (让 agent 知道要等/降级请求)
             if isinstance(e, _DegradationError):
                 final_status = _STATUS_BY_CODE.get(e.code, 503)
@@ -1091,6 +1115,7 @@ class TransparentBrowserDaemon:
                 args["url"], args.get("session"),
                 detail=args.get("detail", "summary"),
                 classify_force=str(args.get("classify", "")).lower() in ("1", "true", "force"),
+                classify_strict=str(args.get("strict", "")).lower() in ("1", "true"),
             ))
         if method == "GET" and path == "/snapshot":
             return self.owner.run(self._snapshot(
@@ -1531,7 +1556,8 @@ class TransparentBrowserDaemon:
 
     async def _open(self, url: str, session: str | None = None,
                     *, detail: str = "summary",
-                    classify_force: bool = False) -> dict[str, Any]:
+                    classify_force: bool = False,
+                    classify_strict: bool = False) -> dict[str, Any]:
         from semantic_browser.safety.ssrf import check_url as _ssrf_check, SSRFBlockedError
         # T58: SSRF guardrail (fable §7.1) — default-deny 私网/loopback/meta
         try:
@@ -1557,7 +1583,9 @@ class TransparentBrowserDaemon:
         # 同时打点 classify_latency_ms 让 agent / 运维知道这次耗时.
         import time as _time
         _t0 = _time.monotonic()
-        cls_result, src = await self._classify_with_cache(snap, force=classify_force)
+        cls_result, src = await self._classify_with_cache(
+            snap, force=classify_force, strict=classify_strict,
+        )
         classify_ms = round((_time.monotonic() - _t0) * 1000.0, 1)
         result: dict[str, Any] = {
             "url": snap.url, "title": snap.title,
@@ -1605,18 +1633,37 @@ class TransparentBrowserDaemon:
             # roundtrip (agent 开完页马上能 click, 不用先 /snapshot).
             # 字段精简: ref + text + (href|kind), 不带 outer_html/aria 这种重的
             refs: list[dict[str, Any]] = []
+            seen_refs: set[str] = set()
+            # T64.1: 索引 snap.links by ref — control 里 kind=link 的项可反查 href
+            # (snapshot engine 把 <a href> 同时塞到 links[] 和 controls[kind=link],
+            # 但 controls 没 href 字段. agent 看到 kind=link 但无 href 无法跳转.)
+            link_hrefs: dict[str, str] = {l.ref: l.href for l in snap.links if l.ref}
             for link in snap.links:
-                if link.ref:
+                if link.ref and link.ref not in seen_refs:
                     refs.append({
                         "ref": link.ref, "kind": "link",
                         "text": link.text, "href": link.href,
                     })
+                    seen_refs.add(link.ref)
             for ctrl_info in snap.controls:
-                if ctrl_info.ref:
-                    refs.append({
+                if ctrl_info.ref and ctrl_info.ref not in seen_refs:
+                    entry: dict[str, Any] = {
                         "ref": ctrl_info.ref, "kind": ctrl_info.kind,
                         "text": ctrl_info.label, "input_name": ctrl_info.input_name,
-                    })
+                    }
+                    # T64.1: kind=link 但 href 缺失时, 反查 snap.links by ref 兜底
+                    if ctrl_info.kind == "link" and "href" not in entry:
+                        # 先查 link_hrefs, 再用 text 模糊匹配
+                        href = link_hrefs.get(ctrl_info.ref)
+                        if not href and ctrl_info.label:
+                            for l in snap.links:
+                                if l.text and l.text.strip() == ctrl_info.label.strip():
+                                    href = l.href
+                                    break
+                        if href:
+                            entry["href"] = href
+                    refs.append(entry)
+                    seen_refs.add(ctrl_info.ref)
             result["refs"] = refs
             result["ref_count"] = len(refs)
         return result
@@ -1645,11 +1692,14 @@ class TransparentBrowserDaemon:
             return clf
 
     async def _classify_with_cache(self, snap: Any,
-                                    *, force: bool = False) -> tuple[dict[str, Any], str]:
+                                    *, force: bool = False,
+                                    strict: bool = False) -> tuple[dict[str, Any], str]:
         """T63.2: 三段式分类 — 启发式必跑, 命中缓存返 'cached',
         低置信度 + LLM 可用时跑 LLM, 失败/超时 silent 回启发式.
 
         T64: force=True 跳过缓存, 重跑分类 (content 变了或测试场景).
+        T65.2: strict=True 时 LLM 失败 → 抛 _LLMUnavailableError, 不 silent
+        fallback. agent 必须显式处理 (重试 / 切到启发式 / 拒分类).
 
         返回 (ClassificationResult.to_dict 风格 dict, source_label).
         """
@@ -1668,16 +1718,28 @@ class TransparentBrowserDaemon:
         if clf is None or heur.confidence >= 0.5:
             self._cache_put(cache_key, heur_dict)
             return heur_dict, "heuristic"
-        # 3. LLM augment
+        # 3. LLM augment — T65.2: 直接调底层 _llm_classify, 绕过 wrapper 的 silent
+        # fallback, 这样 server 端才能真正"看见" LLM 失败 (计数 + strict raise).
         try:
-            llm_res = await clf.classify(snap)
+            llm_res = await clf._llm_classify(snap)
+            if llm_res is None:
+                # LLM 配置缺失 (key/url/model 任一空) — 走 heuristic 路径
+                logger.warning("LLM not configured (key/url/model missing), "
+                               "falling back to heuristic for %s", snap.url)
+                self._cache_put(cache_key, heur_dict)
+                return heur_dict, "heuristic"
             llm_dict = self._normalize_confidence(llm_res.to_dict())
             self._classify_llm_calls += 1
             self._cache_put(cache_key, llm_dict)
             return llm_dict, "llm"
-        except Exception as e:  # noqa: BLE001 — silent degrade
+        except Exception as e:  # noqa: BLE001
             self._classify_llm_failures += 1
             logger.warning("LLM classify failed for %s: %s", snap.url, e)
+            # T65.2: strict mode 不允许 silent fallback, 让 agent 自己决定
+            if strict:
+                raise _LLMUnavailableError(
+                    f"LLM classify failed for {snap.url}: {type(e).__name__}: {e}"
+                ) from e
             self._cache_put(cache_key, heur_dict)
             return heur_dict, "heuristic"
 

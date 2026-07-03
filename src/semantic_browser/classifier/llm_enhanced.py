@@ -84,9 +84,14 @@ class LLMEnhancedClassifier:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._llm_available = bool(self._api_key) and bool(self._base_url) and bool(self.model)
 
-    async def classify(self, snapshot: PageSnapshot) -> ClassificationResult:
+    async def classify(self, snapshot: PageSnapshot, *,
+                       re_raise_on_failure: bool = False) -> ClassificationResult:
         """
         分类页面。先启发式，低置信度时 LLM 增强。
+
+        T65.2: re_raise_on_failure=True 时, LLM 调用失败 (连接错 / 401 / 5xx /
+        解析错) 直接向上抛, 不再 silent fallback. 调用方自己决定怎么处理.
+        默认 False 维持 backward-compat (启发式 silent fallback).
         """
         # Step 1: 启发式分类
         heuristic_result = self.heuristic.classify(snapshot)
@@ -129,6 +134,10 @@ class LLMEnhancedClassifier:
                 return llm_result
         except Exception as e:
             logger.warning("LLM classify failed: %s, falling back to heuristic", e)
+            # T65.2: strict 模式 → 直接抛, 让调用方决定 (返 LLM_UNAVAILABLE /
+            # 重试 / 切到启发式)
+            if re_raise_on_failure:
+                raise
 
         return heuristic_result
 

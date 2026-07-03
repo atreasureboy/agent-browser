@@ -580,7 +580,14 @@ class TransparentBrowserDaemon:
 
     # T51: 端点白名单 — 不需要 op_lock 的纯只读 / 元数据查询.
     # 其它端点 (open / click / snapshot / discover / etc.) 都串行化, 避免 controller 状态被覆盖.
-    _NO_LOCK_PATHS = frozenset({"/health", "/queue", "/stats", "/capacity", "/metrics", "/events"})
+    # T62: /admin/* 也放行 — 这些只翻 state flag (degrade/restore/drain),
+    # 不摸 controller, 不该跟 /open /click 抢锁. 否则 /admin/drain 会
+    # 排在所有 in-flight /open 后面, 等它跑起来 drain 标志才生效,
+    # 期间继续到达的 /open 全被放行 (B 测试用例失败原因).
+    _NO_LOCK_PATHS = frozenset({
+        "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
+        "/admin/drain", "/admin/degrade", "/admin/restore",
+    })
 
     # T56: 降级检查触发点 — 写 op 在 L3+ 被拒, 全 op 在 L4 被拒
     _WRITE_OPS = frozenset({
@@ -594,7 +601,7 @@ class TransparentBrowserDaemon:
     # T59: /events 也放行 (agent 仍要订阅降级状态)
     _DEGRADED_ALLOWED = frozenset({
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
-        "/admin/degrade", "/admin/restore",
+        "/admin/drain", "/admin/degrade", "/admin/restore",
     })
 
     def _start_snapshot_sweeper(self) -> None:
@@ -652,16 +659,19 @@ class TransparentBrowserDaemon:
 
         T59: 同时发 SSE pressure 事件 (system.pressure + daemon.degraded) —
         agent 订阅 /events 主动避让, 不必每次轮询 /capacity.
+
+        BUG-FIX: 之前用 if/elif — 同一次 ratio=0.95 进 if (升级 L0→L1) 后,
+        elif 不会再评估, 永远卡在 L1. 改成 sequential if 让单次调用能连升.
         """
         n = len(self.owner.list_sessions())
         max_ = self._capacity_max_contexts
         ratio = n / max(max_, 1)
-        # 升级到 L1 (拒新 session)
+        # 升级到 L1 (拒新 session) — sequential if, 不是 if/elif (fable §5.7)
         if ratio >= 0.85 and self._degradation_level < 1:
             self._degradation_level = 1
             logger.warning("DegradationController: auto-bumped to L1 (capacity_ratio=%.2f)", ratio)
             self._emit_pressure_event("high", reason="auto_capacity", capacity_ratio=ratio)
-        elif ratio >= 0.95 and self._degradation_level < 2:
+        if ratio >= 0.95 and self._degradation_level < 2:
             self._degradation_level = 2
             logger.warning("DegradationController: auto-bumped to L2 (capacity_ratio=%.2f)", ratio)
             self._emit_pressure_event("critical", reason="auto_capacity", capacity_ratio=ratio)

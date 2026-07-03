@@ -298,6 +298,8 @@ _STATUS_BY_CODE: dict[str, int] = {
     "SESSION_NOT_FOUND": 404,
     "CANNOT_DELETE_DEFAULT": 400,
     "SESSION_CREATE_FAILED": 503,
+    # T66.3: storage_state 快照查询 — 没有快照 404
+    "SNAPSHOT_NOT_FOUND": 404,
     # T56: 降级错误码 (fable §5.9)
     "CAPACITY_DEGRADED": 503,    # L1: 拒新 session
     "DEGRADED_READONLY": 503,    # L3: 只读
@@ -744,7 +746,7 @@ class TransparentBrowserDaemon:
     # 期间继续到达的 /open 全被放行 (B 测试用例失败原因).
     _NO_LOCK_PATHS = frozenset({
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
-        "/admin/drain", "/admin/degrade", "/admin/restore",
+        "/admin/drain", "/admin/drain/cancel", "/admin/degrade", "/admin/restore",
     })
 
     # T56: 降级检查触发点 — 写 op 在 L3+ 被拒, 全 op 在 L4 被拒
@@ -758,8 +760,9 @@ class TransparentBrowserDaemon:
     # T56: 降级时仍允许的只读/控制端点 (L4 全拒时除外)
     # T59: /events 也放行 (agent 仍要订阅降级状态)
     _DEGRADED_ALLOWED = frozenset({
-        "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
-        "/admin/drain", "/admin/degrade", "/admin/restore",
+        "/health", "/healthz", "/readyz", "/queue", "/stats", "/capacity",
+        "/metrics", "/events",
+        "/admin/drain", "/admin/drain/cancel", "/admin/degrade", "/admin/restore",
     })
 
     def _compute_mem_budget(self) -> tuple[int, int, int]:
@@ -996,12 +999,14 @@ class TransparentBrowserDaemon:
         if path.startswith("/v1/"):
             v1_path = path[3:]  # strip "/v1" → 跟原 path 等价
             v1_routes = {
-                "/healthz", "/capacity", "/events",
+                "/healthz", "/readyz", "/capacity", "/events",
                 "/sessions",  # POST 创建 + GET 列表
             }
             # /v1/sessions/{id}/... (GET 详情 + DELETE + lease CRUD)
             if v1_path == "/healthz":
-                path = "/health"
+                path = "/healthz"
+            elif v1_path == "/readyz":
+                path = "/readyz"
             elif v1_path == "/capacity":
                 path = "/capacity"
             elif v1_path == "/events":
@@ -1203,35 +1208,18 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/health":
             # T49: 健康检查带上下文 — pid / uptime / 当前页 URL, agent 排查时省一次 roundtrip
             # T62: drain 状态 — agent 看到 draining=true 时切到备份节点
-            import time as _time
-            page_url = None
-            try:
-                # T49: 只读 current_page.url — 不要触发 _ensure_page 创建 about:blank
-                # (会污染 state — 例如 test_state_no_page_returns_http_400)
-                page = self.owner.browser.controller.current_page
-                if page is not None and not page.is_closed():
-                    page_url = page.url
-            except Exception:
-                pass
-            status = "draining" if self._draining else "ok"
-            elapsed = (
-                round(_time.time() - self._drain_started_at, 1)
-                if (self._draining and self._drain_started_at)
-                else None
-            )
+            return self._handle_health_full()
+        # T66.5: /healthz (liveness) — 只验 "进程在跑 + PID 有效", 永远 200.
+        # k8s liveness probe 失败时由 kubelet 重启, 不该把 drain/L4 当失败.
+        if method == "GET" and path == "/healthz":
             return {
-                "status": status,
+                "alive": True,
                 "pid": os.getpid(),
-                "host": self.host,
-                "port": self.port,
-                "uptime_seconds": round(_time.time() - self.started_at, 1),
-                "page_url": page_url,
-                # T62: drain 字段
-                "draining": self._draining,
-                "drain_elapsed_s": elapsed,
-                "drain_timeout_s": self._drain_timeout_s,
-                "in_flight_op": self._current_op,
+                "uptime_seconds": round(time.time() - self.started_at, 1),
             }
+        # T66.5: /readyz (readiness) — "能接流量". 不满足 → 503 + Retry-After.
+        if method == "GET" and path == "/readyz":
+            return self._handle_readyz()
         # T51: 当前 op 队列状态 — agent 决定是否要等
         if method == "GET" and path == "/queue":
             import time as _time
@@ -1333,6 +1321,23 @@ class TransparentBrowserDaemon:
             return {"draining": True, "in_flight": self._current_op,
                     "drain_started_at": self._drain_started_at,
                     "drain_timeout_s": self._drain_timeout_s}
+        # T66.4: /admin/drain/cancel — 撤销 drain 标志, 让 daemon 恢复接流量.
+        # 误触 drain / 提前中止排水时用. 实时 + 简单: 只翻标志 + 发事件.
+        if method == "POST" and path == "/admin/drain/cancel":
+            was_draining = self._draining
+            self._draining = False
+            self._drain_started_at = None
+            try:
+                self.event_bus.publish(
+                    "daemon.drain.cancelled",
+                    {"ts": time.time(), "was_draining": was_draining},
+                    scope="global", tenant_id=_AsyncOwner.DEFAULT_TENANT,
+                    dedup_key=f"drain_cancel:{int(time.time())}",
+                    persistent=True,
+                )
+            except Exception:
+                logger.exception("drain cancel: failed to publish event")
+            return {"draining": False, "was_draining": was_draining}
         # T54: session CRUD — list / create / delete
         # T65.6: 加 ?tenant_id= 过滤 + tenant_id/agent_id 元数据 (在 metadata 字段).
         # 非 detail 模式保持 list[str] 不变 (向后兼容 dogfooding 路径);
@@ -1416,6 +1421,19 @@ class TransparentBrowserDaemon:
         # T65.7: 读 lease 状态 — /sessions/{name}/lease (GET)
         if method == "GET" and re.match(r"^/sessions/[^/]+/lease$", path):
             return self._handle_lease_get(path, args)
+        # T66.1: Reattach — POST /sessions/{name}/reattach
+        # daemon 重启 / 实例 crash 后, 旧 agent 用 lease_id+fence_token 恢复所有权.
+        if method == "POST" and re.match(r"^/sessions/[^/]+/reattach$", path):
+            return self._handle_lease_reattach(path, args)
+        # T66.2: Handoff — POST /sessions/{name}/handoff + /handoff/accept
+        # 当前 holder A 把 lease 主动让渡给 B (offer + 30s 内 accept).
+        if method == "POST" and re.match(r"^/sessions/[^/]+/handoff$", path):
+            return self._handle_handoff_offer(path, args)
+        if method == "POST" and re.match(r"^/sessions/[^/]+/handoff/accept$", path):
+            return self._handle_handoff_accept(path, args)
+        # T66.3: Storage state read — GET /sessions/{name}/storage_state
+        if method == "GET" and re.match(r"^/sessions/[^/]+/storage_state$", path):
+            return self._handle_storage_state(path, args)
         if method == "DELETE" and path.startswith("/sessions/"):
             name = path[len("/sessions/"):]
             if not name:
@@ -1940,6 +1958,283 @@ class TransparentBrowserDaemon:
             "session_id": session_name,
             "lease": cur.to_dict() if cur else None,
         }
+
+    # ── T66.1: Reattach ──────────────────────────────────────────
+
+    def _handle_lease_reattach(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """POST /sessions/{name}/reattach — daemon 重启后恢复所有权.
+
+        Body:
+          lease_id: str (必填)
+          fence_token: int (必填)
+          agent_id: str (default: 复用原 lease 的 agent_id)
+          tenant_id: str (default 'anonymous')
+
+        Returns:
+          {recovered: true, lease, age_ms, advice}
+          advice="re_verify_auth" if age > 300s (登录态可能过期)
+        """
+        m = re.match(r"^/sessions/([^/]+)/reattach$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        lease_id = args.get("lease_id") or ""
+        if not lease_id:
+            raise _LeaseError("MISSING_PARAM", "lease_id required")
+        try:
+            fence_token = int(args.get("fence_token", "0"))
+        except ValueError:
+            raise _LeaseError("MISSING_PARAM", "fence_token required (int)")
+        agent_id = args.get("agent_id") or ""
+        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+
+        cur = self.lease_manager.get_lease(lease_id)
+        if cur is None:
+            raise _LeaseError("LEASE_INVALID", f"lease {lease_id!r} not found",
+                              status_code=404)
+        # 缺 agent_id 时复用原 lease 的 (这样 fence_token 不需要重新交换)
+        effective_agent = agent_id or cur.agent_id
+        result = self.lease_manager.reattach(
+            lease_id=lease_id, fence_token=fence_token,
+            agent_id=effective_agent, tenant_id=tenant_id,
+        )
+        if not result.ok:
+            err = result.error or "UNKNOWN"
+            status = 410 if err in ("LEASE_LOST", "LEASE_INVALID") else 409
+            raise _LeaseError(err, f"reattach failed: {err}",
+                              holder=result.lease.to_dict() if result.lease else None,
+                              status_code=status)
+        # age_ms — 从 acquired_at_ms 到现在
+        now_ms = int(time.time() * 1000)
+        age_ms = max(0, now_ms - result.lease.acquired_at_ms)
+        advice: str | None = None
+        if age_ms > 300_000:  # 300s = 5 分钟 (fable §5.4)
+            advice = "re_verify_auth"
+        # T66.1: 触发 aget_controller 确保 BrowserContext 还在; 不在也 OK (lazy init)
+        try:
+            self.owner.run(self.owner.aget_controller(session_name))
+        except Exception:
+            pass  # T54 后 lazy init, 不强制要求存在
+        # 发 audit 事件 — 持久化, dedup 保证幂等
+        self.event_bus.publish(
+            "session.restored",
+            {"session_id": session_name, "lease_id": lease_id,
+             "fence_token": result.lease.fence_token,
+             "agent_id": effective_agent, "age_ms": age_ms, "ts": time.time()},
+            scope="session", scope_id=session_name,
+            tenant_id=tenant_id,
+            producer_kind="agent", producer_id=effective_agent,
+            dedup_key=f"restore:{lease_id}:{result.lease.fence_token}",
+            persistent=True,
+        )
+        out: dict[str, Any] = {
+            "recovered": True,
+            "lease": result.lease.to_dict(),
+            "age_ms": age_ms,
+            "advice": advice,
+        }
+        return out
+
+    # ── T66.2: Handoff ───────────────────────────────────────────
+
+    def _handle_handoff_offer(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """POST /sessions/{name}/handoff — 当前 holder A 主动让渡给 B.
+
+        Body:
+          agent_id: str (B 的 agent_id, 必填)
+          tenant_id: str (default 'anonymous')
+          ttl_s: float (default 30s)
+
+        Returns:
+          {offer_token, expires_at_ms, offered_to}
+        """
+        m = re.match(r"^/sessions/([^/]+)/handoff$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        to_agent = args.get("agent_id") or ""
+        if not to_agent:
+            raise _LeaseError("MISSING_PARAM", "agent_id required (the recipient)")
+        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+        ttl_s = 30.0
+        if args.get("ttl_s"):
+            try:
+                ttl_s = float(args["ttl_s"])
+            except ValueError:
+                pass
+        # 当前 holder 必须是 lease 元数据里的 agent_id (assume single holder)
+        cur = self.lease_manager.get_active_for_session(session_name)
+        if cur is None:
+            raise _LeaseError("LEASE_INVALID",
+                              f"no active lease for session {session_name!r}",
+                              status_code=404)
+        ok, offer_token, err, deadline_ms = self.lease_manager.offer(
+            session_id=session_name, from_agent=cur.agent_id, to_agent=to_agent,
+            tenant_id=tenant_id, ttl_s=ttl_s,
+        )
+        if not ok:
+            status = 409 if err == "BUSY" else 410
+            raise _LeaseError(err or "UNKNOWN",
+                              f"handoff offer failed: {err}",
+                              holder=cur.to_dict(), status_code=status)
+        return {
+            "offer_token": offer_token,
+            "expires_at_ms": deadline_ms,
+            "offered_to": to_agent,
+        }
+
+    def _handle_handoff_accept(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """POST /sessions/{name}/handoff/accept — B 用 offer_token 接受.
+
+        Body:
+          offer_token: str (必填)
+          agent_id: str (B 的 agent_id, 必填, 必须等于 offer_to)
+          tenant_id: str (default 'anonymous')
+
+        Returns:
+          {lease, acquired_from: old_lease_id}
+        """
+        m = re.match(r"^/sessions/([^/]+)/handoff/accept$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        offer_token = args.get("offer_token") or ""
+        if not offer_token:
+            raise _LeaseError("MISSING_PARAM", "offer_token required")
+        to_agent = args.get("agent_id") or ""
+        if not to_agent:
+            raise _LeaseError("MISSING_PARAM", "agent_id required (must match offer_to)")
+        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+
+        result = self.lease_manager.accept_handoff(
+            session_id=session_name, to_agent=to_agent,
+            offer_token=offer_token, tenant_id=tenant_id,
+        )
+        if not result.ok:
+            err = result.error or "UNKNOWN"
+            status = 410 if err in ("LEASE_LOST", "OFFER_NOT_FOUND",
+                                   "OFFER_EXPIRED", "LEASE_INVALID") else 409
+            raise _LeaseError(err,
+                              f"handoff accept failed: {err}",
+                              holder=result.lease.to_dict() if result.lease else None,
+                              status_code=status)
+        out: dict[str, Any] = {"lease": result.lease.to_dict()}
+        if result.preempted:
+            out["acquired_from"] = result.preempted.lease_id
+        # T66.2: 同步 session metadata 到新 agent
+        self.owner.set_session_meta(session_name,
+                                    tenant_id=tenant_id, agent_id=to_agent)
+        # audit event
+        self.event_bus.publish(
+            "session.handed_off",
+            {"session_id": session_name,
+             "from_agent": result.preempted.agent_id if result.preempted else None,
+             "to_agent": to_agent,
+             "new_lease_id": result.lease.lease_id,
+             "fence_token": result.lease.fence_token,
+             "ts": time.time()},
+            scope="session", scope_id=session_name,
+            tenant_id=tenant_id,
+            producer_kind="agent", producer_id=to_agent,
+            dedup_key=f"handoff:{result.lease.lease_id}",
+            persistent=True,
+        )
+        return out
+
+    # ── T66.3: Storage state read ────────────────────────────────
+
+    def _handle_storage_state(self, path: str, args: dict[str, Any]) -> dict[str, Any]:
+        """GET /sessions/{name}/storage_state — 读最新 storage_state 快照.
+
+        读 SnapshotStore.latest_snapshot(), 不存在 → 404 SNAPSHOT_NOT_FOUND.
+        每次导出 emit 一次审计事件 (T61 §7.8).
+        """
+        m = re.match(r"^/sessions/([^/]+)/storage_state$", path)
+        if not m:
+            raise ValueError(f"bad path: {path}")
+        session_name = m.group(1)
+        snap = self.snapshot_store.latest_snapshot(session_name)
+        if snap is None:
+            raise _SessionError("SNAPSHOT_NOT_FOUND",
+                                f"no snapshot for session {session_name!r}")
+        # 审计事件 — 每次导出都记, dedup 按 sha256(content)
+        import hashlib
+        content_bytes = json.dumps(snap["content"], ensure_ascii=False,
+                                   sort_keys=True).encode("utf-8")
+        content_sha = hashlib.sha256(content_bytes).hexdigest()
+        meta = self.owner.get_session_meta(session_name) or {}
+        tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
+        agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
+        self.event_bus.publish(
+            "session.storage_state.exported",
+            {"session_id": session_name, "snapshot_id": snap["snapshot_id"],
+             "size_bytes": snap["size_bytes"], "content_sha256": content_sha[:16],
+             "ts": time.time()},
+            scope="session", scope_id=session_name,
+            tenant_id=tenant_id,
+            producer_kind="agent", producer_id=agent_id,
+            dedup_key=f"ss_export:{session_name}:{content_sha[:16]}",
+            persistent=True,
+        )
+        return snap
+
+    # ── T66.5: Probes ────────────────────────────────────────────
+
+    def _handle_health_full(self) -> dict[str, Any]:
+        """T49+T62: /health 老路径 — 返完整 context (status / pid / uptime / drain / etc).
+        保持 backward-compat, agent dogfooding 路径大量依赖.
+        """
+        page_url = None
+        try:
+            # T49: 只读 current_page.url — 不要触发 _ensure_page 创建 about:blank
+            page = self.owner.browser.controller.current_page
+            if page is not None and not page.is_closed():
+                page_url = page.url
+        except Exception:
+            pass
+        status = "draining" if self._draining else "ok"
+        elapsed = (
+            round(time.time() - self._drain_started_at, 1)
+            if (self._draining and self._drain_started_at)
+            else None
+        )
+        return {
+            "status": status,
+            "pid": os.getpid(),
+            "host": self.host,
+            "port": self.port,
+            "uptime_seconds": round(time.time() - self.started_at, 1),
+            "page_url": page_url,
+            "draining": self._draining,
+            "drain_elapsed_s": elapsed,
+            "drain_timeout_s": self._drain_timeout_s,
+            "in_flight_op": self._current_op,
+        }
+
+    def _handle_readyz(self) -> dict[str, Any]:
+        """T66.5: /readyz — k8s readiness probe. 能接流量才返 200, 否则 503.
+
+        不满足任一条 → 503 + Retry-After: 30 (走 _DegradationError 路径):
+          1. not self._draining (drain 中不接新 op)
+          2. self._degradation_level < 4 (L4 全拒)
+          3. self._browser_pool is not None (T60 watchdog 已 init)
+        """
+        reasons: list[str] = []
+        if self._draining:
+            reasons.append("draining")
+        if getattr(self, "_degradation_level", 0) >= 4:
+            reasons.append("degraded_l4")
+        pool = getattr(self.owner, "pool", None)
+        if pool is None:
+            reasons.append("no_browser_pool")
+        if reasons:
+            # 走 _DegradationError 路径 → 自动 Retry-After: 30
+            raise _DegradationError(
+                "SERVICE_UNAVAILABLE",
+                f"not ready: {','.join(reasons)}",
+                level=getattr(self, "_degradation_level", 0),
+            )
+        return {"ready": True, "pid": os.getpid()}
 
     async def _state(self, session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)

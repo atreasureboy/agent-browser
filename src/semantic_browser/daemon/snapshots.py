@@ -241,6 +241,27 @@ class SnapshotStore:
         except Exception:
             return None
 
+    def latest_snapshot(self, session_id: str) -> Optional[dict[str, Any]]:
+        """T66.3: 读最新一份快照的完整 content — 给 /storage_state 端点用.
+
+        Returns: {snapshot_id, taken_at, trigger, size_bytes, content} or None.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT snapshot_id, taken_at, trigger, size_bytes, file_path "
+                "FROM session_snapshots WHERE session_id = ? ORDER BY taken_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        sid, ts, trig, sz, fpath = row
+        try:
+            content = json.loads(Path(fpath).read_bytes())
+        except Exception:
+            return None
+        return {"snapshot_id": sid, "taken_at": ts, "trigger": trig,
+                "size_bytes": sz, "content": content}
+
     def close(self) -> None:
         try:
             self._conn.close()

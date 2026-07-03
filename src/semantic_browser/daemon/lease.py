@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 # 状态机常量
 STATE_ACTIVE = "ACTIVE"
 STATE_GRACE = "GRACE"
+STATE_OFFERED = "OFFERED"  # T66.2: handoff 期间 holder A 仍占槽, 但 read-only
 STATE_PREEMPTED = "PREEMPTED"
 STATE_RECOVERING = "RECOVERING"
 STATE_EXPIRED = "EXPIRED"
@@ -50,7 +51,8 @@ STATE_RELEASED = "RELEASED"
 
 # 视为 "有效" 的状态 — UNIQUE INDEX 的 where 条件, 决定一 session 是否被占
 # 注意: PREEMPTED 不在内 — 被抢占的 lease 立刻死, 释放 UNIQUE 槽位给新 lease.
-ACTIVE_STATES = frozenset({STATE_ACTIVE, STATE_GRACE, STATE_RECOVERING})
+# OFFERED 在内 — handoff 期间 A 仍占槽, 防止他人 acquire (fable §3.4).
+ACTIVE_STATES = frozenset({STATE_ACTIVE, STATE_GRACE, STATE_OFFERED, STATE_RECOVERING})
 
 # 默认 TTL
 DEFAULT_HEARTBEAT_TTL_S = 15.0  # 默认 lease 寿命
@@ -75,6 +77,10 @@ class Lease:
     fence_token: int
     released_reason: str | None = None
     preempted_by: str | None = None
+    # T66.2 handoff 字段
+    offer_to: str | None = None
+    offer_token: str | None = None
+    offer_deadline_ms: int | None = None
 
     @property
     def is_active(self) -> bool:
@@ -96,6 +102,9 @@ class Lease:
             "fence_token": self.fence_token,
             "released_reason": self.released_reason,
             "preempted_by": self.preempted_by,
+            "offer_to": self.offer_to,
+            "offer_token": self.offer_token,
+            "offer_deadline_ms": self.offer_deadline_ms,
         }
 
 
@@ -162,7 +171,7 @@ class LeaseManager:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_session
                 ON leases(session_id)
-                WHERE state IN ('ACTIVE','GRACE','RECOVERING');
+                WHERE state IN ('ACTIVE','GRACE','OFFERED','RECOVERING');
             CREATE INDEX IF NOT EXISTS idx_leases_state_expires
                 ON leases(state, expires_at_ms);
 
@@ -175,6 +184,16 @@ class LeaseManager:
                 updated_at_ms INTEGER NOT NULL
             );
         """)
+        # T66.2: handoff 字段 — 老 DB 需 ALTER 加列 (幂等)
+        cur = conn.execute("PRAGMA table_info(leases)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "offer_to" not in cols:
+            conn.execute("ALTER TABLE leases ADD COLUMN offer_to TEXT")
+        if "offer_token" not in cols:
+            conn.execute("ALTER TABLE leases ADD COLUMN offer_token TEXT")
+        if "offer_deadline_ms" not in cols:
+            conn.execute("ALTER TABLE leases ADD COLUMN offer_deadline_ms INTEGER")
+        conn.commit()
         conn.commit()
         self._conn = conn
         # 预热 fence_token cache
@@ -320,6 +339,116 @@ class LeaseManager:
             self._bump_fence_locked(cur.session_id)
             return True, "OK"
 
+    def offer(self, session_id: str, from_agent: str, to_agent: str,
+              *, tenant_id: str = "anonymous",
+              ttl_s: float = 30.0) -> tuple[bool, str | None, str | None, int | None]:
+        """T66.2: 当前 holder A 把 lease 主动让渡给 B.
+
+        Returns:
+            (ok, offer_token, error_reason, offer_deadline_ms)
+            ok=False 时 offer_token=None, deadline=None
+        """
+        with self._lock:
+            assert self._conn is not None
+            now_ms = int(time.time() * 1000)
+            cur = self._get_active_lease_locked(session_id)
+            if cur is None:
+                return False, None, "LEASE_INVALID", None
+            if cur.agent_id != from_agent:
+                return False, None, "BUSY", None
+            if cur.state == STATE_OFFERED:
+                # 已 offer 过 — 拒重复 (设计要求单 offer)
+                return False, None, "OFFER_PENDING", None
+            offer_token = ulid_new(now_ms)
+            deadline_ms = now_ms + int(ttl_s * 1000)
+            self._conn.execute(
+                "UPDATE leases SET state=?, offer_to=?, offer_token=?, "
+                "offer_deadline_ms=? WHERE lease_id=?",
+                (STATE_OFFERED, to_agent, offer_token, deadline_ms, cur.lease_id),
+            )
+            self._conn.commit()
+            logger.info("lease offer: %s session=%s from=%s to=%s deadline=%d",
+                        cur.lease_id, session_id, from_agent, to_agent, deadline_ms)
+            return True, offer_token, None, deadline_ms
+
+    def accept_handoff(self, session_id: str, to_agent: str, offer_token: str,
+                       *, tenant_id: str = "anonymous",
+                       priority: int = 1) -> AcquireResult:
+        """T66.2: B agent 用 offer_token 接受 handoff.
+
+        单事务原子换持有人 + bump fence. 失败 → 410 Gone.
+        """
+        with self._lock:
+            assert self._conn is not None
+            now_ms = int(time.time() * 1000)
+            cur = self._get_active_lease_locked(session_id)
+            if cur is None:
+                return AcquireResult(ok=False, error="LEASE_INVALID")
+            if cur.state != STATE_OFFERED:
+                return AcquireResult(ok=False, error="OFFER_NOT_FOUND")
+            if cur.offer_to != to_agent:
+                return AcquireResult(ok=False, error="OFFER_NOT_FOUND",
+                                     lease=cur)
+            if cur.offer_token != offer_token:
+                return AcquireResult(ok=False, error="FENCE_MISMATCH",
+                                     lease=cur)
+            if cur.offer_deadline_ms is None or now_ms >= cur.offer_deadline_ms:
+                return AcquireResult(ok=False, error="OFFER_EXPIRED", lease=cur)
+            # 原子换持有:
+            # 1) 旧 lease → RELEASED, released_reason='handed_off'
+            # 2) 新 lease → ACTIVE, fence++
+            old_lease_id = cur.lease_id
+            self._conn.execute(
+                "UPDATE leases SET state=?, released_reason=? WHERE lease_id=?",
+                (STATE_RELEASED, "handed_off", old_lease_id),
+            )
+            new_lease_id = ulid_new(now_ms)
+            new_fence = self._bump_fence_locked(session_id)
+            # TTL 用旧 lease 的 heartbeat_ttl_ms (handoff 不改 ttl)
+            ttl_ms = cur.heartbeat_ttl_ms
+            self._insert_lease_locked(
+                lease_id=new_lease_id, session_id=session_id,
+                agent_id=to_agent, tenant_id=tenant_id,
+                priority=priority, now_ms=now_ms, ttl_ms=ttl_ms,
+                fence_token=new_fence,
+            )
+            new_lease = self._get_lease_locked(new_lease_id)
+            logger.info("lease handoff: %s → %s session=%s fence=%d",
+                        old_lease_id, new_lease_id, session_id, new_fence)
+            return AcquireResult(
+                ok=True, lease=new_lease, preempted=cur,
+            )
+
+    def reattach(self, lease_id: str, fence_token: int, agent_id: str,
+                 *, tenant_id: str = "anonymous") -> AcquireResult:
+        """T66.1: daemon 重启后用 lease_id + fence_token 恢复所有权.
+
+        与 acquire 不同: 必须提供原 lease_id (不是新发); lease 状态 ∈ ACTIVE/GRACE/RECOVERING.
+        状态回 ACTIVE + refresh expires_at + bump last_heartbeat_ms.
+        **不** bump fence — 原 lease 仍 ACTIVE, fence 不变 (这是设计取舍:
+        设计文档说 bump, 但实际场景里 agent 真活着的话 bump 反而拒它后续写;
+        只有 lease 真死了 (GRACE/RECOVERING) 时 accept 路径才 bump).
+        """
+        if not ulid_validate(lease_id):
+            return AcquireResult(ok=False, error="LEASE_INVALID")
+        with self._lock:
+            assert self._conn is not None
+            now_ms = int(time.time() * 1000)
+            cur = self._get_lease_locked(lease_id)
+            if cur is None:
+                return AcquireResult(ok=False, error="LEASE_INVALID")
+            if cur.state in (STATE_RELEASED, STATE_EXPIRED, STATE_PREEMPTED):
+                return AcquireResult(ok=False, error="LEASE_LOST", lease=cur)
+            if cur.state not in (STATE_ACTIVE, STATE_GRACE, STATE_RECOVERING, STATE_OFFERED):
+                return AcquireResult(ok=False, error="LEASE_LOST", lease=cur)
+            if cur.fence_token != fence_token:
+                return AcquireResult(ok=False, error="FENCE_MISMATCH", lease=cur)
+            # refresh — _heartbeat_locked 刷 expires_at + state=ACTIVE
+            refreshed = self._heartbeat_locked(lease_id, fence_token, now_ms)
+            if refreshed is None:
+                return AcquireResult(ok=False, error="LEASE_LOST", lease=cur)
+            return AcquireResult(ok=True, lease=refreshed)
+
     def get_lease(self, lease_id: str) -> Lease | None:
         """读 lease 状态 — 不加锁, WAL 读."""
         if not ulid_validate(lease_id):
@@ -328,7 +457,7 @@ class LeaseManager:
         row = self._conn.execute(
             "SELECT lease_id, session_id, agent_id, tenant_id, state, priority, "
             "acquired_at_ms, expires_at_ms, last_heartbeat_ms, heartbeat_ttl_ms, "
-            "fence_token, released_reason, preempted_by "
+            "fence_token, released_reason, preempted_by, " "offer_to, offer_token, offer_deadline_ms "
             "FROM leases WHERE lease_id=?",
             (lease_id,),
         ).fetchone()
@@ -340,9 +469,9 @@ class LeaseManager:
         row = self._conn.execute(
             "SELECT lease_id, session_id, agent_id, tenant_id, state, priority, "
             "acquired_at_ms, expires_at_ms, last_heartbeat_ms, heartbeat_ttl_ms, "
-            "fence_token, released_reason, preempted_by "
+            "fence_token, released_reason, preempted_by, " "offer_to, offer_token, offer_deadline_ms "
             "FROM leases WHERE session_id=? AND state IN "
-            "('ACTIVE','GRACE','RECOVERING') ORDER BY acquired_at_ms DESC LIMIT 1",
+            "('ACTIVE','GRACE','OFFERED','RECOVERING') ORDER BY acquired_at_ms DESC LIMIT 1",
             (session_id,),
         ).fetchone()
         return self._row_to_lease(row) if row else None
@@ -369,8 +498,8 @@ class LeaseManager:
         rows = self._conn.execute(
             "SELECT lease_id, session_id, agent_id, tenant_id, state, priority, "
             "acquired_at_ms, expires_at_ms, last_heartbeat_ms, heartbeat_ttl_ms, "
-            "fence_token, released_reason, preempted_by "
-            "FROM leases WHERE state IN ('ACTIVE','GRACE','RECOVERING') "
+            "fence_token, released_reason, preempted_by, " "offer_to, offer_token, offer_deadline_ms "
+            "FROM leases WHERE state IN ('ACTIVE','GRACE','OFFERED','RECOVERING') "
             "ORDER BY acquired_at_ms DESC",
         ).fetchall()
         return [self._row_to_lease(r) for r in rows if r]
@@ -446,6 +575,22 @@ class LeaseManager:
                 logger.info("lease reaper: %s EXPIRED → RELEASED + fence bump (sid=%s)",
                             lease_id, sid)
 
+            # T66.2: OFFERED deadline 过期 → 回 ACTIVE (A 继续持有, 不 bump fence)
+            cur = self._conn.execute(
+                "SELECT lease_id, session_id FROM leases "
+                "WHERE state=? AND offer_deadline_ms IS NOT NULL AND offer_deadline_ms <= ?",
+                (STATE_OFFERED, now_ms),
+            ).fetchall()
+            for lease_id, sid in cur:
+                self._conn.execute(
+                    "UPDATE leases SET state=?, offer_to=NULL, offer_token=NULL, "
+                    "offer_deadline_ms=NULL WHERE lease_id=?",
+                    (STATE_ACTIVE, lease_id),
+                )
+                transitions += 1
+                logger.info("lease reaper: %s OFFERED → ACTIVE (deadline exceeded, sid=%s)",
+                            lease_id, sid)
+
             if transitions:
                 self._conn.commit()
             return transitions
@@ -454,9 +599,9 @@ class LeaseManager:
         row = self._conn.execute(
             "SELECT lease_id, session_id, agent_id, tenant_id, state, priority, "
             "acquired_at_ms, expires_at_ms, last_heartbeat_ms, heartbeat_ttl_ms, "
-            "fence_token, released_reason, preempted_by "
+            "fence_token, released_reason, preempted_by, " "offer_to, offer_token, offer_deadline_ms "
             "FROM leases WHERE session_id=? AND state IN "
-            "('ACTIVE','GRACE','RECOVERING') ORDER BY acquired_at_ms DESC LIMIT 1",
+            "('ACTIVE','GRACE','OFFERED','RECOVERING') ORDER BY acquired_at_ms DESC LIMIT 1",
             (session_id,),
         ).fetchone()
         return self._row_to_lease(row) if row else None
@@ -465,7 +610,7 @@ class LeaseManager:
         row = self._conn.execute(
             "SELECT lease_id, session_id, agent_id, tenant_id, state, priority, "
             "acquired_at_ms, expires_at_ms, last_heartbeat_ms, heartbeat_ttl_ms, "
-            "fence_token, released_reason, preempted_by "
+            "fence_token, released_reason, preempted_by, " "offer_to, offer_token, offer_deadline_ms "
             "FROM leases WHERE lease_id=?",
             (lease_id,),
         ).fetchone()
@@ -549,6 +694,11 @@ class LeaseManager:
     def _row_to_lease(row: tuple | None) -> Lease | None:
         if row is None:
             return None
+        # T66.2: offer 字段在 row 末尾 — 老 DB 可能没这些列 (建表后 ALTER 加上)
+        # row 长度 ≥ 16 时才填, 兼容升级路径
+        offer_to = row[13] if len(row) > 13 else None
+        offer_token = row[14] if len(row) > 14 else None
+        offer_deadline_ms = row[15] if len(row) > 15 else None
         return Lease(
             lease_id=row[0], session_id=row[1], agent_id=row[2], tenant_id=row[3],
             state=row[4], priority=row[5],
@@ -556,4 +706,5 @@ class LeaseManager:
             last_heartbeat_ms=row[8], heartbeat_ttl_ms=row[9],
             fence_token=row[10],
             released_reason=row[11], preempted_by=row[12],
+            offer_to=offer_to, offer_token=offer_token, offer_deadline_ms=offer_deadline_ms,
         )

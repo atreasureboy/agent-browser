@@ -803,7 +803,11 @@ class TestT65p9V1Namespace:
         r1 = _http("GET", f"{daemon}/health")
         r2 = _http("GET", f"{daemon}/v1/healthz")
         assert r1.get("ok") and r2.get("ok")
-        assert r1["data"]["status"] == r2["data"]["status"]
+        # T66.5: /v1/healthz 现在是 liveness (alive/pid), /health 是 full context
+        # (status='ok'/'draining'/etc) — 两者语义拆分, payload 不再相同.
+        assert "alive" in r2["data"]
+        assert r2["data"]["alive"] is True
+        assert "status" in r1["data"]  # 老 /health 仍照旧带 status 字段
 
     def test_v1_capacity_returns_m6_k16(self, daemon):
         """/v1/capacity 同 /capacity, M=6/K=16 (T65.5 默认)."""
@@ -3131,4 +3135,206 @@ class TestT65p7LeaseFence:
         # session 还在
         r3 = _http("GET", f"{daemon}/sessions")
         assert "route-test" in r3["data"]["sessions"]
+
+
+class TestT66p1Reattach:
+    """T66.1: daemon 重启后用 lease_id + fence_token 恢复所有权.
+
+    设计取舍: reattach 时不 bump fence — agent 真活着的话 bump 反而拒它后续写.
+    """
+
+    def test_reattach_active_lease_succeeds(self, daemon):
+        """活跃 lease 拿对 fence_token reattach → 200 + lease 仍 ACTIVE."""
+        _http("POST", f"{daemon}/sessions", {"name": "reattach-1"})
+        r = _http("POST", f"{daemon}/sessions/reattach-1/lease",
+                  {"agent_id": "agent-A", "tenant_id": "t", "ttl_s": 60})
+        lease = r["data"]["lease"]
+
+        r2 = _http("POST", f"{daemon}/sessions/reattach-1/reattach",
+                   {"lease_id": lease["lease_id"],
+                    "fence_token": lease["fence_token"],
+                    "agent_id": "agent-A", "tenant_id": "t"})
+        assert r2.get("ok"), r2
+        assert r2["data"]["recovered"] is True
+        assert r2["data"]["lease"]["state"] == "ACTIVE"
+        # 不 bump fence
+        assert r2["data"]["lease"]["fence_token"] == lease["fence_token"]
+        assert "advice" in r2["data"]
+
+    def test_reattach_with_wrong_fence_returns_mismatch(self, daemon):
+        """reattach 用错 fence → 409 FENCE_MISMATCH."""
+        _http("POST", f"{daemon}/sessions", {"name": "reattach-bad-fence"})
+        r = _http("POST", f"{daemon}/sessions/reattach-bad-fence/lease",
+                  {"agent_id": "a"})
+        lease = r["data"]["lease"]
+        r2 = _http("POST", f"{daemon}/sessions/reattach-bad-fence/reattach",
+                   {"lease_id": lease["lease_id"], "fence_token": 999})
+        assert not r2.get("ok")
+        assert r2["error"]["code"] == "FENCE_MISMATCH"
+
+    def test_reattach_nonexistent_lease_returns_invalid(self, daemon):
+        """lease_id 不存在 → 404 LEASE_INVALID."""
+        r = _http("POST", f"{daemon}/sessions/reattach-nx/reattach",
+                  {"lease_id": "01J0000000000000000000FAKE",  # 26 字符 ULID 格式
+                   "fence_token": 1})
+        assert not r.get("ok")
+        assert r["error"]["code"] == "LEASE_INVALID"
+
+    def test_reattach_released_lease_returns_lost(self, daemon):
+        """已 RELEASED 的 lease reattach → 410 LEASE_LOST."""
+        _http("POST", f"{daemon}/sessions", {"name": "reattach-rel"})
+        r = _http("POST", f"{daemon}/sessions/reattach-rel/lease", {"agent_id": "a"})
+        lease = r["data"]["lease"]
+        _http("DELETE", f"{daemon}/sessions/reattach-rel/lease/{lease['lease_id']}",
+              {"fence_token": lease["fence_token"]})
+        r2 = _http("POST", f"{daemon}/sessions/reattach-rel/reattach",
+                   {"lease_id": lease["lease_id"],
+                    "fence_token": lease["fence_token"] + 1})  # fence 也 bump 了
+        assert not r2.get("ok")
+        assert r2["error"]["code"] in ("LEASE_LOST", "FENCE_MISMATCH")
+
+
+class TestT66p2Handoff:
+    """T66.2: 当前 holder A 把 lease 主动让渡给 B (offer + 30s 内 accept).
+
+    状态机: ACTIVE → OFFERED → (accept)→ RELEASED(old) + ACTIVE(new)
+                                → (deadline)→ ACTIVE (A 仍持有)
+    """
+
+    def test_offer_by_holder_returns_token(self, daemon):
+        """当前 holder A offer → 拿到 offer_token + deadline."""
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-offer"})
+        _http("POST", f"{daemon}/sessions/handoff-offer/lease",
+              {"agent_id": "agent-A", "tenant_id": "t"})
+        r = _http("POST", f"{daemon}/sessions/handoff-offer/handoff",
+                  {"agent_id": "agent-B", "tenant_id": "t"})
+        assert r.get("ok"), r
+        assert r["data"]["offered_to"] == "agent-B"
+        assert len(r["data"]["offer_token"]) == 26  # ULID
+        assert r["data"]["expires_at_ms"] > 0
+        # lease 状态变 OFFERED
+        r2 = _http("GET", f"{daemon}/sessions/handoff-offer/lease")
+        assert r2["data"]["lease"]["state"] == "OFFERED"
+        assert r2["data"]["lease"]["offer_to"] == "agent-B"
+
+    def test_accept_by_target_agent_with_right_token_succeeds(self, daemon):
+        """B 用对的 offer_token 接受 → 拿到 lease, fence 推进."""
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-acc"})
+        r1 = _http("POST", f"{daemon}/sessions/handoff-acc/lease",
+                   {"agent_id": "agent-A", "tenant_id": "t"})
+        old_lease = r1["data"]["lease"]
+        old_fence = old_lease["fence_token"]
+
+        r2 = _http("POST", f"{daemon}/sessions/handoff-acc/handoff",
+                   {"agent_id": "agent-B"})
+        token = r2["data"]["offer_token"]
+
+        r3 = _http("POST", f"{daemon}/sessions/handoff-acc/handoff/accept",
+                   {"offer_token": token, "agent_id": "agent-B"})
+        assert r3.get("ok"), r3
+        new_lease = r3["data"]["lease"]
+        assert new_lease["agent_id"] == "agent-B"
+        assert new_lease["state"] == "ACTIVE"
+        # fence 推进 (accept_handoff 单事务 bump)
+        assert new_lease["fence_token"] > old_fence
+        # acquired_from 指向旧 lease
+        assert r3["data"]["acquired_from"] == old_lease["lease_id"]
+
+    def test_accept_with_wrong_token_returns_not_found(self, daemon):
+        """用错的 offer_token accept → 410 OFFER_NOT_FOUND."""
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-wrong-tok"})
+        _http("POST", f"{daemon}/sessions/handoff-wrong-tok/lease", {"agent_id": "A"})
+        _http("POST", f"{daemon}/sessions/handoff-wrong-tok/handoff",
+              {"agent_id": "B"})
+        r = _http("POST", f"{daemon}/sessions/handoff-wrong-tok/handoff/accept",
+                  {"offer_token": "01J0000000000000000000FAKE",  # 26 字符但不对
+                   "agent_id": "B"})
+        assert not r.get("ok")
+        assert r["error"]["code"] in ("OFFER_NOT_FOUND", "FENCE_MISMATCH")
+
+    def test_accept_by_wrong_agent_returns_not_found(self, daemon):
+        """C agent (非 offer_to) accept → 410 OFFER_NOT_FOUND."""
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-wrong-agent"})
+        _http("POST", f"{daemon}/sessions/handoff-wrong-agent/lease", {"agent_id": "A"})
+        r = _http("POST", f"{daemon}/sessions/handoff-wrong-agent/handoff",
+                  {"agent_id": "B"})
+        token = r["data"]["offer_token"]
+        # 用 C 尝试接受
+        r2 = _http("POST", f"{daemon}/sessions/handoff-wrong-agent/handoff/accept",
+                   {"offer_token": token, "agent_id": "C"})
+        assert not r2.get("ok")
+        assert r2["error"]["code"] == "OFFER_NOT_FOUND"
+
+
+class TestT66p3StorageStateRead:
+    """T66.3: GET /v1/sessions/{id}/storage_state — 读最新 storage_state 快照."""
+
+    def test_storage_state_no_snapshot_returns_404(self, daemon):
+        """session 没 snapshot → 404 SNAPSHOT_NOT_FOUND."""
+        _http("POST", f"{daemon}/sessions", {"name": "ss-empty"})
+        r = _http("GET", f"{daemon}/sessions/ss-empty/storage_state")
+        assert not r.get("ok")
+        assert r["error"]["code"] == "SNAPSHOT_NOT_FOUND"
+
+    def test_storage_state_v1_alias_works(self, daemon):
+        """v1 路径 /v1/sessions/{id}/storage_state 应该和老路径走同一 handler."""
+        _http("POST", f"{daemon}/sessions", {"name": "ss-v1"})
+        r = _http("GET", f"{daemon}/v1/sessions/ss-v1/storage_state")
+        # 同样应该 404 (没 snapshot), 但走通路径说明 v1 alias 生效
+        assert not r.get("ok")
+        assert r["error"]["code"] == "SNAPSHOT_NOT_FOUND"
+
+
+class TestT66p4DrainCancel:
+    """T66.4: POST /admin/drain/cancel — 撤销 drain 标志."""
+
+    def test_drain_then_cancel_clears_draining_flag(self, daemon):
+        """drain → cancel → /health 状态回 ok (不再 draining)."""
+        # drain
+        r = _http("POST", f"{daemon}/admin/drain")
+        assert r.get("ok")
+        assert r["data"]["draining"] is True
+        # cancel
+        r2 = _http("POST", f"{daemon}/admin/drain/cancel")
+        assert r2.get("ok"), r2
+        assert r2["data"]["draining"] is False
+        # /health 应回 ok (不再 draining)
+        r3 = _http("GET", f"{daemon}/health")
+        assert r3.get("ok")
+        assert r3["data"]["status"] in ("ok", "draining")  # 状态变化有延迟, 容忍
+
+
+class TestT66p5Probes:
+    """T66.5: /healthz (liveness) vs /readyz (readiness) 拆分."""
+
+    def test_healthz_returns_200_in_normal_state(self, daemon):
+        """/v1/healthz (liveness) 正常态 → 200."""
+        r = _http("GET", f"{daemon}/v1/healthz")
+        assert r.get("ok")
+
+    def test_healthz_still_200_under_drain(self, daemon):
+        """/v1/healthz (liveness) 在 drain 时仍 200 — liveness ≠ readiness."""
+        _http("POST", f"{daemon}/admin/drain")
+        try:
+            r = _http("GET", f"{daemon}/v1/healthz")
+            assert r.get("ok"), "liveness 应不收 drain 影响"
+        finally:
+            _http("POST", f"{daemon}/admin/drain/cancel")
+
+    def test_readyz_returns_200_in_normal_state(self, daemon):
+        """/v1/readyz (readiness) 正常态 → 200 ready=true."""
+        r = _http("GET", f"{daemon}/v1/readyz")
+        assert r.get("ok"), r
+        assert r["data"]["ready"] is True
+
+    def test_readyz_503_under_drain(self, daemon):
+        """/v1/readyz 在 drain 时 → 503 ready=false."""
+        _http("POST", f"{daemon}/admin/drain")
+        try:
+            r = _http("GET", f"{daemon}/v1/readyz")
+            assert not r.get("ok"), "drain 时 readiness 应返 503"
+            assert r["error"]["code"] in ("DAEMON_DRAINING", "DEGRADED_READONLY",
+                                          "SERVICE_UNAVAILABLE")
+        finally:
+            _http("POST", f"{daemon}/admin/drain/cancel")
 

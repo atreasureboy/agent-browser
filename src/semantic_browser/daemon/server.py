@@ -2728,6 +2728,9 @@ class TransparentBrowserDaemon:
 
         topics_param = args.get("topics", "*") or "*"
         topic_patterns = [t.strip() for t in topics_param.split(",") if t.strip()] or ["*"]
+        # T65.8: ?tenant_id= 过滤 — 多 agent 共享 daemon 时只收本租户的事件.
+        # 默认 "anonymous" — 单 agent 场景不串就行
+        tenant_filter = args.get("tenant_id") or None
         # Last-Event-ID header 是 W3C SSE 标准: 客户端最后收到的 event id.
         # 0 (=header 不存在或 "0") → client 想从开头收
         # N>0 → client 想从 seq>N 开始 (跳过已收的)
@@ -2759,7 +2762,8 @@ class TransparentBrowserDaemon:
             # 全部 topic 走 replay (top-level selector "*") — bus.replay 暂不支持 glob
             # 拿到所有 seq > last_event_id 的事件, payload 带 topic 可以过滤
             # 这里简化: 不过滤 (Replay 阶段给 caller 全部; live 再按 topic 过滤)
-            for ev in self.event_bus.replay(since_seq=last_event_id, limit=500):
+            for ev in self.event_bus.replay(since_seq=last_event_id, limit=500,
+                                           tenant_id=tenant_filter):
                 # topic 过滤 (若有 patterns 非 "*")
                 if "*" not in topic_patterns:
                     ev_topic = ev["topic"]
@@ -2790,7 +2794,8 @@ class TransparentBrowserDaemon:
         async def bridge() -> None:
             try:
                 while not stop_bridge[0]:
-                    events = self.event_bus.replay(since_seq=last_seq_box[0], limit=200)
+                    events = self.event_bus.replay(since_seq=last_seq_box[0], limit=200,
+                                            tenant_id=tenant_filter)
                     for ev in events:
                         # topic 过滤 (bus.replay 全部返回, 这里按 pattern 过滤)
                         if "*" not in topic_patterns:

@@ -73,6 +73,8 @@ class _AsyncOwner:
     是一个独立的 BrowserController, 通过 name 区分.
     T65.6: 加 tenant/agent 元数据 — 多 agent 共享 daemon 时按 tenant 隔离 session,
     每个 session 记 tenant_id + agent_id (默认 "anonymous").
+    T66.6.1: _session_meta 跨重启保留 — 从 lease_manager.sessions_index 预热;
+            set_session_meta 镜像写回 sessions_index.
     """
 
     DEFAULT_SESSION = "default"
@@ -103,7 +105,10 @@ class _AsyncOwner:
         # T65.1: per-session last_used 跟踪 — idle recycle 用
         self._session_last_used: dict[str, float] = {}
         # T65.6: tenant/agent 元数据 — 每 session 记归属, 按 tenant 过滤 session 列表.
-        # 结构: name → {tenant_id, agent_id, created_at}
+        # T66.6.1: 跨重启保留 — daemon init 时从 lease_manager.sessions_index 预热,
+        #          set_session_meta 镜像写回 (sessions_index 是 source of truth).
+        # owner.lease_manager 由 daemon init 后置 (顺序: owner → lease_manager.start() → 预热)
+        self.lease_manager = None
         self._session_meta: dict[str, dict[str, Any]] = {}
         self.run(self.pool.start())
         # 预创建 default session — 保留 .browser 兼容旧代码
@@ -186,12 +191,26 @@ class _AsyncOwner:
         return self._session_meta.get(name)
 
     def set_session_meta(self, name: str, *, tenant_id: str, agent_id: str) -> None:
-        """T65.6: 给 session 写元数据 (POST /sessions 时调)."""
-        self._session_meta[name] = {
+        """T65.6: 给 session 写元数据 (POST /sessions 时调).
+
+        T66.6.1: 镜像写到 lease_manager.sessions_index — 跨重启保留.
+        """
+        prev = self._session_meta.get(name, {})
+        meta = {
             "tenant_id": tenant_id,
             "agent_id": agent_id,
-            "created_at": self._session_meta.get(name, {}).get("created_at", time.time()),
+            "created_at": prev.get("created_at", time.time()),
         }
+        self._session_meta[name] = meta
+        # 持久化到 sessions_index — 失败不抛 (内存写已生效)
+        if self.lease_manager is not None:
+            try:
+                self.lease_manager.upsert_session_meta(
+                    name, tenant_id, agent_id,
+                    created_at_ms=int(meta["created_at"] * 1000),
+                )
+            except Exception:
+                logger.exception("upsert_session_meta(%s) failed (non-fatal)", name)
 
     def release_session(self, name: str) -> bool:
         """T54: 关闭并移除指定 session. 返回是否真释放了一个.
@@ -492,6 +511,19 @@ class TransparentBrowserDaemon:
         from semantic_browser.daemon.lease import LeaseManager
         self.lease_manager = LeaseManager(leases_db, heartbeat_ttl_s=lease_heartbeat_ttl_s)
         self.lease_manager.start()
+        # T66.6.1: 把 lease_manager 传给 owner — _AsyncOwner.__init__ 用它预热
+        # _session_meta (跨重启保留 tenant/agent 元数据).
+        self.owner.lease_manager = self.lease_manager
+        # 触发预热 (owner 已经 init 过了, 这里手动重跑一次)
+        try:
+            for sid, tid, aid, _ft, cats_ms in self.lease_manager.list_session_meta():
+                self.owner._session_meta.setdefault(sid, {
+                    "tenant_id": tid,
+                    "agent_id": aid,
+                    "created_at": (cats_ms / 1000.0) if cats_ms else time.time(),
+                })
+        except Exception:
+            logger.exception("post-init load _session_meta failed")
         self.httpd: ThreadingHTTPServer | None = None
         self._shutting_down = False
         # T51: op 跟踪 — 浏览器锁在 owner.op_lock 上
@@ -1328,6 +1360,9 @@ class TransparentBrowserDaemon:
             self._draining = False
             self._drain_started_at = None
             try:
+                # T66.6.3 (B1): drain 是 global admin op, 无 tenant 上下文 —
+                # tenant_id='anonymous' 是预期语义, 不要改成 session 维度的 tenant.
+                # 改 'global' 字符串会破坏订阅过滤, 保持 'anonymous' 即可.
                 self.event_bus.publish(
                     "daemon.drain.cancelled",
                     {"ts": time.time(), "was_draining": was_draining},
@@ -1986,13 +2021,16 @@ class TransparentBrowserDaemon:
         except ValueError:
             raise _LeaseError("MISSING_PARAM", "fence_token required (int)")
         agent_id = args.get("agent_id") or ""
-        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
 
         cur = self.lease_manager.get_lease(lease_id)
         if cur is None:
             raise _LeaseError("LEASE_INVALID", f"lease {lease_id!r} not found",
                               status_code=404)
-        # 缺 agent_id 时复用原 lease 的 (这样 fence_token 不需要重新交换)
+        # T66.6.3 (B1): audit event 必须用原 lease 的 tenant_id, 不用 request body —
+        # body 经常漏传/写错, 而 lease 表里的 tenant_id 是权威. reattach 本质
+        # 是恢复, 不是新建 — tenant 应继承原 lease.
+        tenant_id = cur.tenant_id
+        # 缺 agent_id 时复用原 lease的 (这样 fence_token 不需要重新交换)
         effective_agent = agent_id or cur.agent_id
         result = self.lease_manager.reattach(
             lease_id=lease_id, fence_token=fence_token,
@@ -2104,7 +2142,15 @@ class TransparentBrowserDaemon:
         to_agent = args.get("agent_id") or ""
         if not to_agent:
             raise _LeaseError("MISSING_PARAM", "agent_id required (must match offer_to)")
-        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+        # T66.6.2 (B3): tenant_id 不能从 request body 拿 (用户经常漏传) — 必须
+        # 用原 lease 的 tenant_id (offer 时的), 防止 handoff 后 metadata 写 anonymous.
+        # 原 offer 是从 cur (active lease) 的 agent 视角发起的, tenant_id 也在 cur 里.
+        cur = self.lease_manager.get_active_for_session(session_name)
+        if cur is None:
+            raise _LeaseError("LEASE_INVALID",
+                              f"no active offer for session {session_name!r}",
+                              status_code=404)
+        tenant_id = cur.tenant_id
 
         result = self.lease_manager.accept_handoff(
             session_id=session_name, to_agent=to_agent,
@@ -2121,9 +2167,11 @@ class TransparentBrowserDaemon:
         out: dict[str, Any] = {"lease": result.lease.to_dict()}
         if result.preempted:
             out["acquired_from"] = result.preempted.lease_id
-        # T66.2: 同步 session metadata 到新 agent
+        # T66.2: 同步 session metadata 到新 agent. T66.6.2 (B3): 用新 lease 的
+        # tenant_id (accept_handoff 已经写到 sessions_index), 不用 request body.
         self.owner.set_session_meta(session_name,
-                                    tenant_id=tenant_id, agent_id=to_agent)
+                                    tenant_id=result.lease.tenant_id,
+                                    agent_id=to_agent)
         # audit event
         self.event_bus.publish(
             "session.handed_off",
@@ -2134,7 +2182,7 @@ class TransparentBrowserDaemon:
              "fence_token": result.lease.fence_token,
              "ts": time.time()},
             scope="session", scope_id=session_name,
-            tenant_id=tenant_id,
+            tenant_id=result.lease.tenant_id,
             producer_kind="agent", producer_id=to_agent,
             dedup_key=f"handoff:{result.lease.lease_id}",
             persistent=True,
@@ -2162,9 +2210,17 @@ class TransparentBrowserDaemon:
         content_bytes = json.dumps(snap["content"], ensure_ascii=False,
                                    sort_keys=True).encode("utf-8")
         content_sha = hashlib.sha256(content_bytes).hexdigest()
-        meta = self.owner.get_session_meta(session_name) or {}
-        tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
-        agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
+        # T66.6.3 (B1): 优先读 sessions_index (持久化, 跨重启保留) — T66.6.1
+        # 修完后 _AsyncOwner 启动时已预热, 但 owner.get_session_meta 读的是
+        # in-memory dict, 跟 sessions_index 可能脱节. 直接查 lease_manager
+        # 是 source of truth, 在两个地方都查不到时 fallback 到 in-memory.
+        idx = self.lease_manager.get_session_meta(session_name)
+        if idx is not None:
+            tenant_id, agent_id = idx
+        else:
+            meta = self.owner.get_session_meta(session_name) or {}
+            tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
+            agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
         self.event_bus.publish(
             "session.storage_state.exported",
             {"session_id": session_name, "snapshot_id": snap["snapshot_id"],

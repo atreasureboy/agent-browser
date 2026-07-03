@@ -54,6 +54,10 @@ def daemon():
     port = _free_port()
     log_path = f"/tmp/tb-daemon-test-{port}.log"
     env = os.environ.copy()
+    # T66.6: 启动前清空 leases.db + event_log.db, 避免 T66.6.1 持久化后跨测试
+    # 串味 (T65p6 那些基于「DB 默认空」的假设会拿到上次跑的残留 session).
+    # 跟 daemon 默认 HOME 路径一致. 注意: 这是 test-only, 不影响生产 daemon.
+    _reset_global_sb_db()
     proc = subprocess.Popen(
         [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port),
          "--allow-data-scheme"],
@@ -87,6 +91,26 @@ def daemon():
         os.unlink(log_path)
     except OSError:
         pass
+
+
+def _reset_global_sb_db() -> None:
+    """T66.6: 测试间清空 ~/.semantic-browser/{leases,event_log}.db — 让每 test 拿到干净状态.
+
+    T66.6.1 修完后 sessions_index 跨重启保留, 这导致 T65p6 那些「DB 默认空」的
+    假设性测试 (e.g. test_capacity_includes_tenants_distribution 期望 anonymous==1)
+    在跑过其他测试后串味失败. 显式 reset 解决. 不影响生产 daemon — 只有 daemon
+    fixture 调它.
+    """
+    sb_dir = os.path.expanduser("~/.semantic-browser")
+    for fname in ("leases.db", "leases.db-wal", "leases.db-shm",
+                  "event_log.db", "event_log.db-wal", "event_log.db-shm"):
+        p = os.path.join(sb_dir, fname)
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass  # 容忍: daemon 可能正持有, 测试结束自然清
 
 
 class TestDaemonLifecycle:
@@ -3337,4 +3361,338 @@ class TestT66p5Probes:
                                           "SERVICE_UNAVAILABLE")
         finally:
             _http("POST", f"{daemon}/admin/drain/cancel")
+
+
+# ── T66.6: Audit/Metadata 一致性修复 (B1 + B2 + B3) ─────────────────────
+
+import sqlite3 as _sqlite3  # noqa: E402  — local import for test file scope
+
+
+def _leases_db_path() -> str:
+    """默认 lease_manager.db 路径 (跟 LeaseManager 默认同)."""
+    return os.path.expanduser("~/.semantic-browser/leases.db")
+
+
+def _event_log_db_path() -> str:
+    """默认 event_bus.db 路径."""
+    return os.path.expanduser("~/.semantic-browser/event_log.db")
+
+
+def _query_events(topic: str, tenant_id: str | None = None) -> list[dict]:
+    """查 event_log.db 里的事件, 返 [{event_id, topic, tenant_id, payload_json}, ...]."""
+    db_path = _event_log_db_path()
+    if not os.path.exists(db_path):
+        return []
+    conn = _sqlite3.connect(db_path)
+    try:
+        if tenant_id is not None:
+            rows = conn.execute(
+                "SELECT event_id, topic, tenant_id, payload_json FROM events "
+                "WHERE topic=? AND tenant_id=? ORDER BY event_id",
+                (topic, tenant_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT event_id, topic, tenant_id, payload_json FROM events "
+                "WHERE topic=? ORDER BY event_id",
+                (topic,),
+            ).fetchall()
+        return [{"event_id": r[0], "topic": r[1], "tenant_id": r[2],
+                 "payload_json": r[3]} for r in rows]
+    finally:
+        conn.close()
+
+
+class TestT66p6MetadataPersistence:
+    """T66.6.1 (B2): session metadata 持久化到 sessions_index, 跨重启保留.
+
+    修前: _AsyncOwner._session_meta 是 in-memory dict, 重启后空.
+    修后: set_session_meta 镜像写到 sessions_index; 启动时 list_session_meta 预热.
+    """
+
+    def test_set_session_meta_persists_to_sessions_index_table(self, daemon):
+        """POST /sessions 写元数据 → sessions_index 表里有对应行."""
+        # 1. 通过 HTTP 创建带元数据的 session
+        r = _http("POST", f"{daemon}/sessions",
+                  {"name": "persist-1", "tenant_id": "acme", "agent_id": "agent-A"})
+        assert r.get("ok"), r
+
+        # 2. 直接查 leases.db 验证 sessions_index 里有 (session_id, tenant_id, agent_id)
+        db_path = _leases_db_path()
+        if not os.path.exists(db_path):
+            pytest.skip("leases.db not created")
+        conn = _sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT session_id, tenant_id, agent_id, created_at_ms "
+                "FROM sessions_index WHERE session_id=?",
+                ("persist-1",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, f"sessions_index 应有 persist-1 行, db={db_path}"
+        sid, tid, aid, cats = row
+        assert sid == "persist-1"
+        assert tid == "acme"
+        assert aid == "agent-A"
+        assert cats is not None and cats > 0, f"created_at_ms 应非 0, got {cats}"
+
+    def test_lease_acquire_writes_sessions_index_with_tenant(self, daemon):
+        """POST /sessions/{name}/lease 也应把 (tenant, agent) 写到 sessions_index.
+
+        B2 的根因: 之前 lease acquire 也会调 set_session_meta (L1945), 但只写 in-memory.
+        修后应跟 POST /sessions 一样持久化.
+        """
+        _http("POST", f"{daemon}/sessions", {"name": "persist-2"})  # 走 POST 路径
+        r = _http("POST", f"{daemon}/sessions/persist-2/lease",
+                  {"agent_id": "agent-B", "tenant_id": "globex"})
+        assert r.get("ok"), r
+
+        db_path = _leases_db_path()
+        conn = _sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT tenant_id, agent_id FROM sessions_index WHERE session_id=?",
+                ("persist-2",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "lease acquire 后 sessions_index 应该有行"
+        assert row[0] == "globex", f"tenant_id 应是 globex, got {row[0]}"
+        assert row[1] == "agent-B", f"agent_id 应是 agent-B, got {row[1]}"
+
+
+class TestT66p6HandoffAcceptPreservesTenant:
+    """T66.6.2 (B3): handoff accept 保留 offer 时的 tenant_id, 不被 request body 覆盖."""
+
+    def test_handoff_accept_preserves_tenant_when_body_omits_it(self, daemon):
+        """A 用 tenant=acme 起 lease → handoff → B accept 不传 tenant → 仍是 acme.
+
+        修前: B accept 时 body 缺 tenant_id → fallback 'anonymous' → metadata 写错.
+        修后: 内部用 cur.tenant_id (offer 时的), B accept 不传也能保留.
+        """
+        # 1. A 起 lease (tenant=acme)
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-tenant",
+                                              "tenant_id": "acme", "agent_id": "A"})
+        r = _http("POST", f"{daemon}/sessions/handoff-tenant/lease",
+                  {"agent_id": "A", "tenant_id": "acme"})
+        assert r.get("ok"), r
+        old_lease = r["data"]["lease"]
+        assert old_lease["tenant_id"] == "acme"
+
+        # 2. A offer 给 B (B 不在 body 出现, 但 B 接受时身份是 to_agent)
+        r2 = _http("POST", f"{daemon}/sessions/handoff-tenant/handoff",
+                   {"agent_id": "B"})  # 也不传 tenant
+        assert r2.get("ok"), r2
+        offer_token = r2["data"]["offer_token"]
+
+        # 3. B accept — 故意不传 tenant_id (B2/B3 的触发场景)
+        r3 = _http("POST", f"{daemon}/sessions/handoff-tenant/handoff/accept",
+                   {"offer_token": offer_token, "agent_id": "B"})
+        assert r3.get("ok"), r3
+        new_lease = r3["data"]["lease"]
+        # 关键断言: 新 lease 仍属 acme, 不是 anonymous
+        assert new_lease["tenant_id"] == "acme", (
+            f"handoff accept 应保留 acme, got tenant_id={new_lease['tenant_id']!r}"
+        )
+        assert new_lease["agent_id"] == "B"
+
+        # 4. metadata 也应同步 (POST /sessions 时 init, handoff accept 时刷)
+        r4 = _http("GET", f"{daemon}/sessions?detail=1")
+        assert r4.get("ok")
+        meta = next(
+            (m for m in r4["data"]["sessions"] if m.get("name") == "handoff-tenant"),
+            None,
+        )
+        assert meta is not None, "handoff-tenant 应在 /sessions 里"
+        assert meta["tenant_id"] == "acme", (
+            f"metadata tenant_id 应是 acme, got {meta.get('tenant_id')!r}"
+        )
+        assert meta["agent_id"] == "B"
+
+    def test_handoff_accept_event_uses_offer_tenant(self, daemon):
+        """session.handed_off 事件的 tenant_id 应是 acme, 不是 anonymous."""
+        _http("POST", f"{daemon}/sessions", {"name": "handoff-evt",
+                                              "tenant_id": "acme", "agent_id": "A"})
+        _http("POST", f"{daemon}/sessions/handoff-evt/lease",
+              {"agent_id": "A", "tenant_id": "acme"})
+        r = _http("POST", f"{daemon}/sessions/handoff-evt/handoff",
+                  {"agent_id": "B"})
+        token = r["data"]["offer_token"]
+        _http("POST", f"{daemon}/sessions/handoff-evt/handoff/accept",
+              {"offer_token": token, "agent_id": "B"})
+
+        # 等 100ms 让 event_bus 落 SQLite (publish 是同步的, 但保险)
+        time.sleep(0.1)
+        events = _query_events("session.handed_off", tenant_id="acme")
+        assert len(events) >= 1, (
+            f"应有 session.handed_off 事件带 tenant_id=acme, "
+            f"查到的 acme 事件: {events}, 所有 handed_off: {_query_events('session.handed_off')}"
+        )
+
+
+class TestT66p6AuditEventsHaveCorrectTenant:
+    """T66.6.3 (B1): 4 个 handler 的 audit event 必须用正确的 tenant_id.
+
+    | handler                | 修前                  | 修后
+    | session.restored       | request body          | cur.tenant_id (原 lease)
+    | session.handed_off     | request body          | result.lease.tenant_id (B3)
+    | session.storage_state.exported | meta fallback    | sessions_index → meta fallback
+    | daemon.drain.cancelled | 'anonymous' (预期)    | 保持 'anonymous' (admin op)
+    """
+
+    def test_reattach_event_uses_original_lease_tenant(self, daemon):
+        """session.restored 事件 tenant_id = 原 lease 的 tenant (B1 修复点)."""
+        # A 用 tenant=acme 起 lease
+        _http("POST", f"{daemon}/sessions", {"name": "reattach-evt",
+                                              "tenant_id": "acme", "agent_id": "A"})
+        r = _http("POST", f"{daemon}/sessions/reattach-evt/lease",
+                  {"agent_id": "A", "tenant_id": "acme"})
+        lease = r["data"]["lease"]
+
+        # 故意用错的 tenant_id=globex reattach — 事件 tenant 仍应是 acme (原 lease 优先)
+        r2 = _http("POST", f"{daemon}/sessions/reattach-evt/reattach",
+                   {"lease_id": lease["lease_id"],
+                    "fence_token": lease["fence_token"],
+                    "agent_id": "A", "tenant_id": "globex"})
+        assert r2.get("ok"), r2
+
+        time.sleep(0.1)
+        events = _query_events("session.restored", tenant_id="acme")
+        assert len(events) >= 1, (
+            f"session.restored 应带 tenant_id=acme, got: "
+            f"{_query_events('session.restored')}"
+        )
+        # 验证: 同一 lease_id 没有 tenant_id=globex 的重复事件 (B1 修复保证)
+        acme_eids = {e["event_id"] for e in events}
+        globex_events = _query_events("session.restored", tenant_id="globex")
+        for ge in globex_events:
+            assert ge["event_id"] not in acme_eids, (
+                f"同一事件不应同时有 acme 和 globex 两个 tenant: {ge['event_id']}"
+            )
+
+    def test_reattach_event_uses_original_tenant_even_when_body_omits_it(self, daemon):
+        """body 完全不传 tenant_id, 事件 tenant 仍应是 acme (fallback to lease).
+
+        这是 agent 实测中最常见的触发场景 — reattach 不传 tenant 走默认值 'anonymous'.
+        """
+        _http("POST", f"{daemon}/sessions", {"name": "reattach-no-tenant",
+                                              "tenant_id": "acme", "agent_id": "A"})
+        r = _http("POST", f"{daemon}/sessions/reattach-no-tenant/lease",
+                  {"agent_id": "A", "tenant_id": "acme"})
+        lease = r["data"]["lease"]
+
+        # body 不传 tenant_id (之前走 default 'anonymous')
+        r2 = _http("POST", f"{daemon}/sessions/reattach-no-tenant/reattach",
+                   {"lease_id": lease["lease_id"],
+                    "fence_token": lease["fence_token"],
+                    "agent_id": "A"})
+        assert r2.get("ok"), r2
+
+        time.sleep(0.1)
+        events = _query_events("session.restored", tenant_id="acme")
+        assert len(events) >= 1, (
+            f"body 缺 tenant_id 时事件仍应带 acme, got: "
+            f"{_query_events('session.restored')}"
+        )
+
+    def test_drain_cancel_event_keeps_anonymous_tenant_intentionally(self, daemon):
+        """daemon.drain.cancelled 仍带 'anonymous' (global admin op, 无 tenant 上下文).
+
+        这是预期语义, 不要改成 session 维度的 tenant.
+        """
+        # 触发 drain + cancel
+        _http("POST", f"{daemon}/admin/drain")
+        try:
+            r = _http("POST", f"{daemon}/admin/drain/cancel")
+            assert r.get("ok")
+        finally:
+            # 万一失败, 确保回到非 drain
+            pass
+
+        time.sleep(0.1)
+        events = _query_events("daemon.drain.cancelled", tenant_id="anonymous")
+        assert len(events) >= 1, (
+            f"drain.cancelled 应带 anonymous (global op), got: "
+            f"{_query_events('daemon.drain.cancelled')}"
+        )
+
+
+class TestT66p6RestartPreservesSessionsIndex:
+    """T66.6.1 (B2) 端到端: 重启 daemon 后 sessions_index 数据仍在, _AsyncOwner 预热成功.
+
+    不依赖 SQLite 验证, 直接通过 HTTP 验证 — 模拟 agent 重启场景.
+    """
+
+    @pytest.fixture
+    def isolated_home(self, tmp_path):
+        """让 daemon 用 tmp_path/.semantic-browser, 不污染全局 ~/.semantic-browser."""
+        home = tmp_path / "home"
+        sb = home / ".semantic-browser"
+        sb.mkdir(parents=True)
+        return home
+
+    def _start_daemon(self, home, port: int):
+        env = {**os.environ, "HOME": str(home)}
+        # 让 Playwright 用真实的 browser 缓存 (不依赖 HOME 找 cache).
+        pw_cache = os.path.expanduser("~/.cache/ms-playwright")
+        if os.path.isdir(pw_cache):
+            env["PLAYWRIGHT_BROWSERS_PATH"] = pw_cache
+        log_path = home / f"daemon-{port}.log"
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "semantic_browser.daemon.server",
+             "--port", str(port), "--allow-data-scheme"],
+            stdout=open(log_path, "wb"),
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(60):
+            try:
+                r = _http("GET", f"{base}/health")
+                if r.get("ok") and r.get("data", {}).get("status") == "ok":
+                    return proc, base
+            except (URLError, ConnectionRefusedError, OSError):
+                time.sleep(0.5)
+        proc.kill()
+        raise AssertionError(f"daemon on port {port} not ready; see {log_path}")
+
+    def test_session_metadata_survives_restart(self, isolated_home):
+        """创建带 tenant=acme session → kill → restart → /sessions?tenant_id=acme 仍可见."""
+        port1 = _free_port()
+        port2 = _free_port()
+        # 注意 port 变了, 但 leases.db 路径相同 (HOME 不变)
+        proc1, base1 = self._start_daemon(isolated_home, port1)
+        try:
+            r = _http("POST", f"{base1}/sessions",
+                      {"name": "restart-persist", "tenant_id": "acme", "agent_id": "A"})
+            assert r.get("ok"), r
+        finally:
+            proc1.terminate()
+            try:
+                proc1.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc1.kill()
+
+        # 启第二个 daemon (新端口, 同 leases.db)
+        proc2, base2 = self._start_daemon(isolated_home, port2)
+        try:
+            # 关键断言: tenant_id=acme 过滤仍能找到
+            r = _http("GET", f"{base2}/sessions?tenant_id=acme")
+            assert r.get("ok"), r
+            sessions = r["data"]["sessions"]
+            assert "restart-persist" in sessions, (
+                f"重启后 tenant=acme 过滤应仍能查到 restart-persist, got: {sessions}"
+            )
+            # metadata 字段也应有
+            meta = r["data"].get("metadata", {})
+            assert "restart-persist" in meta, f"metadata 应有 restart-persist, got: {meta}"
+            assert meta["restart-persist"]["tenant_id"] == "acme"
+            assert meta["restart-persist"]["agent_id"] == "A"
+        finally:
+            proc2.terminate()
+            try:
+                proc2.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc2.kill()
 

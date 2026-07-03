@@ -176,12 +176,15 @@ class LeaseManager:
                 ON leases(state, expires_at_ms);
 
             -- sessions_index 表: per-session 元数据 + fence_token 持久化
+            -- T66.6.1: 加 created_at_ms 列 — 给 _AsyncOwner 重启预热 _session_meta
+            --          时拿回创建时间 (老的行没这列, fallback 到 time.time()).
             CREATE TABLE IF NOT EXISTS sessions_index (
-                session_id  TEXT PRIMARY KEY,
-                tenant_id   TEXT NOT NULL,
-                agent_id    TEXT NOT NULL,
-                fence_token INTEGER NOT NULL DEFAULT 0,
-                updated_at_ms INTEGER NOT NULL
+                session_id    TEXT PRIMARY KEY,
+                tenant_id     TEXT NOT NULL,
+                agent_id      TEXT NOT NULL,
+                fence_token   INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL,
+                created_at_ms INTEGER
             );
         """)
         # T66.2: handoff 字段 — 老 DB 需 ALTER 加列 (幂等)
@@ -193,6 +196,11 @@ class LeaseManager:
             conn.execute("ALTER TABLE leases ADD COLUMN offer_token TEXT")
         if "offer_deadline_ms" not in cols:
             conn.execute("ALTER TABLE leases ADD COLUMN offer_deadline_ms INTEGER")
+        # T66.6.1: sessions_index 同样 ALTER — 老 DB 可能没 created_at_ms
+        cur2 = conn.execute("PRAGMA table_info(sessions_index)")
+        idx_cols = {row[1] for row in cur2.fetchall()}
+        if "created_at_ms" not in idx_cols:
+            conn.execute("ALTER TABLE sessions_index ADD COLUMN created_at_ms INTEGER")
         conn.commit()
         conn.commit()
         self._conn = conn
@@ -504,6 +512,59 @@ class LeaseManager:
         ).fetchall()
         return [self._row_to_lease(r) for r in rows if r]
 
+    # T66.6.1: session metadata 持久化 — sessions_index 作为 source of truth
+    # _AsyncOwner.set_session_meta 镜像写入, _AsyncOwner.__init__ 启动时读这个
+
+    def list_session_meta(self) -> list[tuple[str, str, str, int, int]]:
+        """读所有 sessions_index 行 — 给 _AsyncOwner 启动时预热 _session_meta.
+
+        Returns: list of (session_id, tenant_id, agent_id, fence_token, created_at_ms)
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT session_id, tenant_id, agent_id, fence_token, created_at_ms "
+            "FROM sessions_index ORDER BY session_id"
+        ).fetchall()
+        return [(r[0], r[1], r[2], int(r[3] or 0), int(r[4] or 0)) for r in rows]
+
+    def upsert_session_meta(self, session_id: str, tenant_id: str, agent_id: str,
+                            *, created_at_ms: int | None = None) -> None:
+        """set_session_meta 镜像写到 sessions_index — 跨重启保留.
+
+        不加锁, 单 row UPSERT ~1ms — 高频路径 (POST /sessions + lease acquire +
+        handoff accept) 频率低 (< 1/s) 可接受.
+        """
+        assert self._conn is not None
+        now_ms = int(time.time() * 1000)
+        # 保留原有 created_at_ms (如果有), 否则写入传入值或 now_ms
+        if created_at_ms is None:
+            row = self._conn.execute(
+                "SELECT created_at_ms FROM sessions_index WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            created_at_ms = int(row[0]) if (row and row[0]) else now_ms
+        self._conn.execute(
+            "INSERT INTO sessions_index (session_id, tenant_id, agent_id, "
+            "fence_token, updated_at_ms, created_at_ms) VALUES (?, ?, ?, 0, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "tenant_id=excluded.tenant_id, agent_id=excluded.agent_id, "
+            "updated_at_ms=excluded.updated_at_ms",
+            (session_id, tenant_id, agent_id, now_ms, created_at_ms),
+        )
+        self._conn.commit()
+
+    def get_session_meta(self, session_id: str) -> tuple[str, str] | None:
+        """读单 session 的 (tenant_id, agent_id) — 给 storage_state 等用, 比 list+filter 快.
+
+        Returns: (tenant_id, agent_id) 或 None (未注册)
+        """
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT tenant_id, agent_id FROM sessions_index WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
     # ── 内部 helpers ──────────────────────────────────────────
 
     def _reaper_loop(self) -> None:
@@ -650,14 +711,16 @@ class LeaseManager:
              STATE_ACTIVE, priority, now_ms, exp_ms, now_ms,
              ttl_ms, fence_token),
         )
-        # sessions_index upsert
+        # sessions_index upsert — 保留原有 created_at_ms (如有), 否则写入 now_ms
+        # T66.6.1: created_at_ms 让 _AsyncOwner 重启后能拿回创建时间
         self._conn.execute(
             "INSERT INTO sessions_index (session_id, tenant_id, agent_id, "
-            "fence_token, updated_at_ms) VALUES (?, ?, ?, ?, ?) "
+            "fence_token, updated_at_ms, created_at_ms) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(session_id) DO UPDATE SET "
             "tenant_id=excluded.tenant_id, agent_id=excluded.agent_id, "
-            "fence_token=excluded.fence_token, updated_at_ms=excluded.updated_at_ms",
-            (session_id, tenant_id, agent_id, fence_token, now_ms),
+            "fence_token=excluded.fence_token, updated_at_ms=excluded.updated_at_ms, "
+            "created_at_ms=COALESCE(sessions_index.created_at_ms, excluded.created_at_ms)",
+            (session_id, tenant_id, agent_id, fence_token, now_ms, now_ms),
         )
         self._conn.commit()
         self._fence_cache[session_id] = fence_token
@@ -666,6 +729,8 @@ class LeaseManager:
         """per-session fence_token +1 — 旧 holder 复活后写被拒.
 
         必须在 sessions_index 有记录. 没有的话 init = 1.
+        T66.6.1: 缺记录时不再硬编码 'anonymous' tenant — 用 DEFAULT_TENANT 兜底,
+        真实路径都先 _insert_lease_locked (sessions_index 已有正确 tenant).
         """
         cur = self._conn.execute(
             "SELECT fence_token FROM sessions_index WHERE session_id=?",
@@ -676,8 +741,9 @@ class LeaseManager:
             now_ms = int(time.time() * 1000)
             self._conn.execute(
                 "INSERT INTO sessions_index (session_id, tenant_id, agent_id, "
-                "fence_token, updated_at_ms) VALUES (?, 'anonymous', 'anonymous', ?, ?)",
-                (session_id, new_tok, now_ms),
+                "fence_token, updated_at_ms, created_at_ms) "
+                "VALUES (?, 'anonymous', 'anonymous', ?, ?, ?)",
+                (session_id, new_tok, now_ms, now_ms),
             )
         else:
             new_tok = int(cur[0]) + 1

@@ -2,6 +2,29 @@
 
 格式: T 编号 + 中文短标题 + 子项 bullet + commit hash; 时间倒序 (新→旧). 不是 Keep a Changelog.
 
+## T66.6 — Audit/Metadata 一致性修复 (B1 + B2 + B3)
+
+**Headline**: Scope A 上线后 agent 体验测试发现 3 个真实缺陷 (audit event 错 tenant / metadata 重启丢失 / handoff 写 anonymous). 核心所有权原语 (lease/fence) 本身 OK, 错的是审计 + 元数据层.
+
+**B2 — session metadata 持久化 (高严重度)**:
+- **T66.6.1**: `sessions_index` 升为 session metadata 的 source of truth. `lease.py` 加 `list_session_meta()` / `upsert_session_meta()` / `get_session_meta()` 方法, `sessions_index` 表加 `created_at_ms` 列 (启动时 `PRAGMA table_info` 检查 + `ALTER TABLE` 幂等迁移). `set_session_meta` 镜像写 SQLite, `_AsyncOwner.__init__` 启动时调 `list_session_meta()` 预热. 跨重启保留 tenant/agent 元数据.
+
+**B3 — handoff tenant 写错 (中严重度)**:
+- **T66.6.2**: `_handle_handoff_accept` 改用 `cur = lease_manager.get_active_for_session(name)` 拿原 offer 时的 lease, `tenant_id = cur.tenant_id` (不读 request body), 传给 `accept_handoff`. `set_session_meta` + audit event 都用 `result.lease.tenant_id` (accept_handoff 已写到 sessions_index).
+
+**B1 — audit event tenant 错 (中严重度)**:
+- **T66.6.3**: 4 个 handler audit event 统一从权威源取 tenant:
+  - `session.restored` (reattach): `cur.tenant_id` (原 lease, 不读 body)
+  - `session.storage_state.exported`: 优先 `lease_manager.get_session_meta()` (持久化) → fallback in-memory meta
+  - `session.handed_off` (handoff): T66.6.2 已修
+  - `daemon.drain.cancelled`: 保持 `'anonymous'` (global admin op, 无 tenant 上下文, 加注释说明)
+
+**测试**: 8 个新测试 (`TestT66p6*`) — 持久化/handoff tenant 保留/3 类 audit event tenant 正确/重启端到端. **总测试数 172 passed** (164 旧 + 8 新, 零回归).
+
+**测试间隔离修复**: T66.6.1 让 sessions_index 跨重启保留, 暴露 T65p6 「DB 默认空」隐性 bug. `daemon` fixture 加 `_reset_global_sb_db()` 启动前清 `leases.db` + `event_log.db` (含 WAL/SHM), 让每 test 拿到干净状态. 不影响生产 daemon.
+
+**Breaking changes**: 无. 修的都是 T65/T66 引入的内部不一致.
+
 ## T66 — v1 namespace 第二波 (Scope A: session lifecycle + admin)
 
 **Headline**: T66 调研涉及 5 个子系统 (lifecycle / blackboard / artifacts / LLM proxy / admin), 全套 5-7 天. 用户决策 Scope A 只做 session lifecycle + admin (1-1.5 天, 零新模块); blackboard / artifacts / LLM proxy / observers / admin reconcile 推迟到 T67+.

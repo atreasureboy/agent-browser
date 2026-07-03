@@ -2373,3 +2373,74 @@ class TestT63p2LLMAugmentAndPolish:
         # 最新插入的在 (url-4)
         assert "url-4" in fake._classify_cache
 
+    def test_open_includes_classify_latency_ms(self, daemon):
+        """T64 可观测: /open 返 classify_latency_ms — agent 可感知 LLM 耗时.
+        cached → ~0ms; heuristic → <5ms; LLM → 100ms+."""
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        r = _http("POST", f"{daemon}/open", {"url": url})
+        d = r["data"]
+        assert "classify_latency_ms" in d, (
+            f"/open 应含 classify_latency_ms, got keys={list(d.keys())}"
+        )
+        lat = d["classify_latency_ms"]
+        assert isinstance(lat, (int, float))
+        # 启发式 < 5ms; 缓存命中 < 1ms; LLM 100ms-2s. 都不该超 30s
+        assert 0 <= lat < 30000, f"classify_latency_ms 异常: {lat}"
+
+    def test_classify_force_bypasses_cache(self, daemon):
+        """T64: ?classify=force 跳过缓存 — 同 URL 二次 open 仍跑启发式.
+        无 LLM 时 type_source=heuristic, 不会变 cached."""
+        url = f"data:text/html,{self._HTML_LANDING.replace(chr(10), '').replace(chr(9), '')}"
+        # 第一次: 写缓存
+        r1 = _http("POST", f"{daemon}/open", {"url": url})
+        assert r1["data"]["type_source"] in ("heuristic", "llm")
+        # 第二次: 正常应该 cached
+        r2 = _http("POST", f"{daemon}/open", {"url": url})
+        assert r2["data"]["type_source"] == "cached"
+        # 第三次: 加 classify=force → 跳过缓存 (走启发式, 因无 LLM)
+        r3 = _http("POST", f"{daemon}/open?classify=force", {"url": url})
+        assert r3["data"]["type_source"] != "cached", (
+            f"classify=force 应跳过缓存, got source={r3['data']['type_source']!r}"
+        )
+
+    def test_classify_confidence_floor_on_unknown(self, daemon):
+        """T64 健壮性: 启发式偶返 conf=0.0 + page_type=unknown, agent 看 0.0
+        误以为分类器坏了. 改成 floor 0.05 (unknown) / 0.10 (其他).
+        直接调 _normalize_confidence 静态方法."""
+        from semantic_browser.daemon.server import TransparentBrowserDaemon
+        # unknown 0.0 → floor 0.05
+        r1 = TransparentBrowserDaemon._normalize_confidence({
+            "page_type": "unknown", "confidence": 0.0,
+        })
+        assert r1["confidence"] == 0.05, f"unknown floor 应=0.05, got {r1['confidence']}"
+        # article 0.0 → floor 0.10
+        r2 = TransparentBrowserDaemon._normalize_confidence({
+            "page_type": "article", "confidence": 0.0,
+        })
+        assert r2["confidence"] == 0.10, f"article floor 应=0.10, got {r2['confidence']}"
+        # 高置信度不动
+        r3 = TransparentBrowserDaemon._normalize_confidence({
+            "page_type": "article", "confidence": 0.85,
+        })
+        assert r3["confidence"] == 0.85, f"0.85 不应被 floor 影响, got {r3['confidence']}"
+        # 中等置信度不动
+        r4 = TransparentBrowserDaemon._normalize_confidence({
+            "page_type": "list", "confidence": 0.30,
+        })
+        assert r4["confidence"] == 0.30, f"0.30 不应被 floor 影响, got {r4['confidence']}"
+
+    def test_capacity_exposes_llm_counters(self, daemon):
+        """T64 可观测: /capacity 应暴露 LLM call / failure / cache 大小 + 命中."""
+        r = _http("GET", f"{daemon}/capacity")
+        d = r["data"]
+        for f in ("llm_classify_calls", "llm_classify_failures",
+                  "classify_cache_size", "classify_cache_hits"):
+            assert f in d, f"/capacity 应含 {f}, keys={list(d.keys())}"
+            assert isinstance(d[f], int), f"{f} 应是 int, got {type(d[f])}"
+        # failure_rate 在 calls=0 时是 None; calls>0 时是 0..1 float
+        if d["llm_classify_calls"] > 0:
+            assert d["llm_classify_failure_rate"] is not None
+            assert 0.0 <= d["llm_classify_failure_rate"] <= 1.0
+        else:
+            assert d["llm_classify_failure_rate"] is None
+

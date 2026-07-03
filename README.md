@@ -662,6 +662,27 @@ T62 上线后我作为 agent 真把 daemon 当工具用了一遍 (开 wikipedia 
 
 `_classify_with_cache` 缓存 (URL → {page_type, confidence}) 256 LRU. `/state` 也吃缓存, `/open` → `/state` 常见模式无重复 LLM.
 
+**T64 — Round 2 实测加固 (4 项):**
+
+dogfooding round 2 拿 4 个真站实测 (example.com / wikipedia / github.com / duckduckgo), 在 T63.2 基础上补 4 个细节:
+
+- **`heading` fallback**: 页面无 h1 (e.g. 搜索结果页) → `heading` 用 title 兜底, 不返 None. 同时给 `heading_source` 字段 ("h1" / "title" / null), agent 知道字段从哪来
+- **`type_confidence` floor**: 启发式/LLM 偶返 `confidence=0.0` + `page_type=unknown` 让 agent 误以为分类器坏了. 物理 floor: `unknown ≥ 0.05`, 其他类型 `≥ 0.10`. 真实高置信度 (≥0.10) 不动
+- **`/open?classify=force`**: 跳过缓存重跑分类 — 内容变了或测试场景用. 默认行为不变 (cached 优先)
+- **`classify_latency_ms` 可观测**: `/open` 返分类耗时 (缓存命中 0ms / 启发式 <1ms / LLM 200ms-2s), agent / 运维感知 LLM 健康
+
+`/capacity` 也加了运维可见的 LLM 计数器:
+
+```json
+{
+  "llm_classify_calls": 12,            // 累计 LLM 分类调用
+  "llm_classify_failures": 0,          // 累计失败
+  "llm_classify_failure_rate": 0.0,    // 失败率; calls=0 时 null
+  "classify_cache_size": 8,            // 当前缓存 URL 数 (≤256)
+  "classify_cache_hits": 47            // 累计缓存命中 (重分类免费)
+}
+```
+
 ### 端点映射: daemon vs MCP
 
 agent 既能用 daemon HTTP 端点也能用 MCP 工具, 两套 API 风格不同 (daemon kebab-case + GET/POST, MCP snake_case + JSON-RPC):
@@ -685,7 +706,7 @@ curl -N http://127.0.0.1:8765/events
 # data: {"topic": "daemon.degraded", "data": {"level": 2, ...}, "ts": ...}
 ```
 
-测试 25 个 (T63 + T63.1 + T63.2) `TestT63*` 全过; 总测试 776 passed.
+测试 25 个 (T63 + T63.1 + T63.2) `TestT63*` + 5 个 T64 全过; 总测试 781 passed.
 
 ## T58 — SSRF guardrail (fable §7.1)
 

@@ -406,6 +406,10 @@ class TransparentBrowserDaemon:
         self._llm_classifier_lock = threading.Lock()
         self._classify_cache: dict[str, dict[str, Any]] = {}
         self._classify_cache_max = 256
+        # T64: 运维观测 — LLM call 成功 / 失败计数, /capacity 暴露
+        self._classify_llm_calls: int = 0
+        self._classify_llm_failures: int = 0
+        self._classify_cache_hits: int = 0
 
     def serve_forever(self) -> None:
         daemon = self
@@ -994,6 +998,16 @@ class TransparentBrowserDaemon:
                 "mem_total_estimate_mb": mem_total_mb,
                 "watchdog_heartbeat_age_s": round(time.time() - self._last_heartbeat_ts, 1)
                     if self._last_heartbeat_ts else None,
+                # T64: LLM 分类计数器 + 缓存命中率 — 运维判断 LLM 是否健康.
+                # failure_rate = failures / calls; 0/0 时是 None.
+                "llm_classify_calls": self._classify_llm_calls,
+                "llm_classify_failures": self._classify_llm_failures,
+                "llm_classify_failure_rate": (
+                    round(self._classify_llm_failures / max(self._classify_llm_calls, 1), 3)
+                    if self._classify_llm_calls else None
+                ),
+                "classify_cache_size": len(self._classify_cache),
+                "classify_cache_hits": self._classify_cache_hits,
             }
         # T59: /events — SSE stream of all EventBus events (持久 + live)
         if method == "GET" and path == "/events":
@@ -1076,6 +1090,7 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._open(
                 args["url"], args.get("session"),
                 detail=args.get("detail", "summary"),
+                classify_force=str(args.get("classify", "")).lower() in ("1", "true", "force"),
             ))
         if method == "GET" and path == "/snapshot":
             return self.owner.run(self._snapshot(
@@ -1515,7 +1530,8 @@ class TransparentBrowserDaemon:
         return {"url": url, "title": title, "type": page_type}
 
     async def _open(self, url: str, session: str | None = None,
-                    *, detail: str = "summary") -> dict[str, Any]:
+                    *, detail: str = "summary",
+                    classify_force: bool = False) -> dict[str, Any]:
         from semantic_browser.safety.ssrf import check_url as _ssrf_check, SSRFBlockedError
         # T58: SSRF guardrail (fable §7.1) — default-deny 私网/loopback/meta
         try:
@@ -1537,12 +1553,18 @@ class TransparentBrowserDaemon:
         # 2. URL 已有缓存 → 直接复用
         # 3. 启发式置信度 < 0.5 且 OPENAI_API_KEY 配了 → LLM 二次判断
         #    失败/超时 → silent 回启发式
-        cls_result, src = await self._classify_with_cache(snap)
+        # T64: ?classify=force 跳过 cache (内容变了或测试场景),
+        # 同时打点 classify_latency_ms 让 agent / 运维知道这次耗时.
+        import time as _time
+        _t0 = _time.monotonic()
+        cls_result, src = await self._classify_with_cache(snap, force=classify_force)
+        classify_ms = round((_time.monotonic() - _t0) * 1000.0, 1)
         result: dict[str, Any] = {
             "url": snap.url, "title": snap.title,
             "type": cls_result["page_type"],
             "type_confidence": cls_result.get("confidence"),
             "type_source": src,  # "heuristic" | "cached" | "llm"
+            "classify_latency_ms": classify_ms,  # T64: 可观测 — 缓存 0ms / 启发式 <1ms / LLM 200ms-2s
         }
         # T63.2 (#2 修): 默认 summary 模式比 _open 之前更丰富 — agent 第一次
         # open 后能立刻知道 "这个页面是干嘛的", 不用再调 /snapshot. 体积仍小
@@ -1622,20 +1644,25 @@ class TransparentBrowserDaemon:
             self._llm_classifier = clf
             return clf
 
-    async def _classify_with_cache(self, snap: Any) -> tuple[dict[str, Any], str]:
+    async def _classify_with_cache(self, snap: Any,
+                                    *, force: bool = False) -> tuple[dict[str, Any], str]:
         """T63.2: 三段式分类 — 启发式必跑, 命中缓存返 'cached',
         低置信度 + LLM 可用时跑 LLM, 失败/超时 silent 回启发式.
+
+        T64: force=True 跳过缓存, 重跑分类 (content 变了或测试场景).
 
         返回 (ClassificationResult.to_dict 风格 dict, source_label).
         """
         from semantic_browser.classifier.heuristic import PageClassifier
         # 1. 缓存命中 → 直接返 (按 URL 维度, agent 二次访问同 URL 秒返)
+        #    force=True 时跳过 — 给 agent 强制重分类的口子
         cache_key = snap.url
-        if cache_key in self._classify_cache:
+        if not force and cache_key in self._classify_cache:
+            self._classify_cache_hits += 1
             return self._classify_cache[cache_key], "cached"
         # 2. 启发式 (同步, < 1ms)
         heur = PageClassifier().classify(snap)
-        heur_dict = heur.to_dict()
+        heur_dict = self._normalize_confidence(heur.to_dict())
         # 高置信度 / LLM 不可用 → 直接用启发式结果
         clf = self._get_llm_classifier()
         if clf is None or heur.confidence >= 0.5:
@@ -1644,13 +1671,32 @@ class TransparentBrowserDaemon:
         # 3. LLM augment
         try:
             llm_res = await clf.classify(snap)
-            llm_dict = llm_res.to_dict()
+            llm_dict = self._normalize_confidence(llm_res.to_dict())
+            self._classify_llm_calls += 1
             self._cache_put(cache_key, llm_dict)
             return llm_dict, "llm"
         except Exception as e:  # noqa: BLE001 — silent degrade
+            self._classify_llm_failures += 1
             logger.warning("LLM classify failed for %s: %s", snap.url, e)
             self._cache_put(cache_key, heur_dict)
             return heur_dict, "heuristic"
+
+    @staticmethod
+    def _normalize_confidence(result: dict[str, Any]) -> dict[str, Any]:
+        """T64: 启发式/LLM 偶返 conf=0.0 让 agent 误以为分类器坏了. 给个
+        物理 floor: unknown=0.05 (承认不确定), 其他类型=0.10 (有结果但
+        把握低). 真实高置信度 (>0.10) 完全不受影响."""
+        conf = result.get("confidence", 0.0)
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = 0.0
+        page_type = result.get("page_type", "unknown")
+        floor = 0.05 if page_type == "unknown" else 0.10
+        if conf < floor:
+            result = dict(result)  # 不改原 dict 引用
+            result["confidence"] = floor
+        return result
 
     def _cache_put(self, key: str, value: dict[str, Any]) -> None:
         """T63.2: LRU-ish 缓存 put — 超出 max 时清最早插入 (dict popitem

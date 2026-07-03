@@ -706,6 +706,31 @@ curl -N http://127.0.0.1:8765/events
 # data: {"topic": "daemon.degraded", "data": {"level": 2, ...}, "ts": ...}
 ```
 
+#### SSE 客户端示例 (T65.3)
+
+仓库带两个可运行的参考客户端 — 一个 Python 一个 TypeScript, 都演示 topic 过滤 + Last-Event-ID 断线续传 + 优雅退出:
+
+- `examples/sse_client.py` — 用 `httpx.Client.stream()` 拉流, W3C SSE 帧解析 + 指数退避重连. 默认订阅 `system.heartbeat,system.pressure,daemon.degraded`.
+  ```bash
+  # 实时订阅
+  python examples/sse_client.py --url http://127.0.0.1:8765
+  # 断线续传 (从 seq=42 之后的事件开始收)
+  python examples/sse_client.py --url http://127.0.0.1:8765 --resume-seq 42
+  # 只跑测试场景 (收 N 个事件就退出)
+  python examples/sse_client.py --url http://127.0.0.1:8765 --max-events 5
+  ```
+- `examples/sse_client.ts` — TypeScript, 用 native `fetch` + `ReadableStream` 手动解析 SSE 帧 + 重连. 编译跑:
+  ```bash
+  npx tsc examples/sse_client.ts --target es2022 --module commonjs --outDir dist/
+  node dist/sse_client.js --url http://127.0.0.1:8765
+  ```
+  两份示例都默认输出 `JSON-per-line` 到 stdout (方便 pipe 到 `jq`), 状态信息去 stderr.
+
+契约要点 (W3C SSE + T55 续传):
+- 帧格式: `id: <seq>\ndata: <json>\n\n`; keepalive 用 `: keepalive\n\n` 注释行
+- 断线续传 header: `Last-Event-ID: <seq>` 或 query `?since_seq=N`, server 从 event_log SQLite 重放后接 live
+- topics: 逗号分隔多个 pattern, 支持 `system.*` 通配符; `*` 全部
+
 测试 25 个 (T63 + T63.1 + T63.2) `TestT63*` + 5 个 T64 全过; 总测试 781 passed.
 
 ## T58 — SSRF guardrail (fable §7.1)

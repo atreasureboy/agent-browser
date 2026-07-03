@@ -2663,3 +2663,87 @@ class TestT65p1SessionIdleRecycle:
             f"持续 touch 的 session 不应被回收, got {r['data']['sessions']}"
         )
 
+
+class TestT65p6TenantAgentIdentification:
+    """T65.6: 多 agent 共享 daemon — 每 session 带 tenant_id + agent_id 元数据,
+    GET /sessions 支持 ?tenant_id= 过滤, /capacity 加 tenants 分布."""
+
+    def test_post_sessions_accepts_tenant_id_and_agent_id(self, daemon):
+        """POST /sessions 带 tenant_id + agent_id → 响应回显, metadata 同步记录."""
+        r = _http("POST", f"{daemon}/sessions",
+                  {"name": "t-agent-1", "tenant_id": "acme", "agent_id": "claude-1"})
+        assert r.get("ok"), f"应创建成功: {r}"
+        assert r["data"]["tenant_id"] == "acme"
+        assert r["data"]["agent_id"] == "claude-1"
+        assert r["data"]["name"] == "t-agent-1"
+
+    def test_post_sessions_without_tenant_defaults_to_anonymous(self, daemon):
+        """不传 tenant_id → 默认 'anonymous' (backward-compat 路径)."""
+        r = _http("POST", f"{daemon}/sessions", {"name": "anon-test"})
+        assert r.get("ok"), f"应创建成功: {r}"
+        assert r["data"]["tenant_id"] == "anonymous"
+        assert r["data"]["agent_id"] == "anonymous"
+
+    def test_get_sessions_includes_metadata_field(self, daemon):
+        """GET /sessions 非 detail 模式也带 metadata 字段 — 每 session 一份 tenant/agent."""
+        _http("POST", f"{daemon}/sessions",
+              {"name": "meta-test", "tenant_id": "tenant-x", "agent_id": "agent-y"})
+        r = _http("GET", f"{daemon}/sessions")
+        assert r.get("ok")
+        # backward-compat: sessions 仍是 list[str]
+        assert isinstance(r["data"]["sessions"], list)
+        assert all(isinstance(s, str) for s in r["data"]["sessions"])
+        # metadata 字段同步出现
+        assert "metadata" in r["data"]
+        assert "meta-test" in r["data"]["metadata"]
+        assert r["data"]["metadata"]["meta-test"]["tenant_id"] == "tenant-x"
+        assert r["data"]["metadata"]["meta-test"]["agent_id"] == "agent-y"
+
+    def test_get_sessions_filter_by_tenant_id(self, daemon):
+        """GET /sessions?tenant_id=acme 只返该 tenant 的 session."""
+        _http("POST", f"{daemon}/sessions", {"name": "acme-1", "tenant_id": "acme"})
+        _http("POST", f"{daemon}/sessions", {"name": "acme-2", "tenant_id": "acme"})
+        _http("POST", f"{daemon}/sessions", {"name": "other-1", "tenant_id": "globex"})
+
+        r = _http("GET", f"{daemon}/sessions?tenant_id=acme")
+        assert r.get("ok")
+        # default session tenant_id="anonymous" ≠ "acme", 应被过滤掉
+        assert sorted(r["data"]["sessions"]) == ["acme-1", "acme-2"], (
+            f"应只返 acme tenant 的 session (default 归 anonymous, 应过滤): "
+            f"{r['data']['sessions']}"
+        )
+        assert "other-1" not in r["data"]["sessions"]
+        assert "default" not in r["data"]["sessions"]
+        # 响应里也带 tenant_id 字段表明过滤生效
+        assert r["data"].get("tenant_id") == "acme"
+
+    def test_delete_session_clears_metadata(self, daemon):
+        """DELETE /sessions/{name} → metadata 一并清掉."""
+        _http("POST", f"{daemon}/sessions",
+              {"name": "to-del", "tenant_id": "acme", "agent_id": "x"})
+        r = _http("GET", f"{daemon}/sessions")
+        assert "to-del" in r["data"]["sessions"]
+        assert "to-del" in r["data"]["metadata"]
+
+        r = _http("DELETE", f"{daemon}/sessions/to-del")
+        assert r.get("ok")
+        assert "to-del" not in r["data"]["active"]
+
+        r = _http("GET", f"{daemon}/sessions")
+        assert "to-del" not in r["data"]["metadata"], (
+            f"delete 后 metadata 应清掉, got {r['data']['metadata']}"
+        )
+
+    def test_capacity_includes_tenants_distribution(self, daemon):
+        """/capacity 暴露 tenants 分布 — 每 tenant 用了几 session."""
+        _http("POST", f"{daemon}/sessions", {"name": "t1", "tenant_id": "tA"})
+        _http("POST", f"{daemon}/sessions", {"name": "t2", "tenant_id": "tA"})
+        _http("POST", f"{daemon}/sessions", {"name": "t3", "tenant_id": "tB"})
+        r = _http("GET", f"{daemon}/capacity")
+        assert r.get("ok")
+        tenants = r["data"]["tenants"]
+        assert tenants.get("tA") == 2
+        assert tenants.get("tB") == 1
+        # default session 归 anonymous
+        assert tenants.get("anonymous") == 1
+

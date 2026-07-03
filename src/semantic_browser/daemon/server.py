@@ -70,9 +70,13 @@ class _AsyncOwner:
 
     T54: 持有 ControllerPool (共享 chromium + 多 BrowserContext). 每个 session
     是一个独立的 BrowserController, 通过 name 区分.
+    T65.6: 加 tenant/agent 元数据 — 多 agent 共享 daemon 时按 tenant 隔离 session,
+    每个 session 记 tenant_id + agent_id (默认 "anonymous").
     """
 
     DEFAULT_SESSION = "default"
+    DEFAULT_TENANT = "anonymous"
+    DEFAULT_AGENT = "anonymous"
 
     class _BrowserShim:
         """Backward-compat: 让 owner.browser.controller.X() 还能工作."""
@@ -97,10 +101,19 @@ class _AsyncOwner:
         self.op_lock = _threading.Lock()
         # T65.1: per-session last_used 跟踪 — idle recycle 用
         self._session_last_used: dict[str, float] = {}
+        # T65.6: tenant/agent 元数据 — 每 session 记归属, 按 tenant 过滤 session 列表.
+        # 结构: name → {tenant_id, agent_id, created_at}
+        self._session_meta: dict[str, dict[str, Any]] = {}
         self.run(self.pool.start())
         # 预创建 default session — 保留 .browser 兼容旧代码
         default_ctrl = self.run(self.pool.acquire(self.DEFAULT_SESSION))
         self._session_last_used[self.DEFAULT_SESSION] = time.time()  # T65.1
+        # T65.6: default session 归 default tenant + agent
+        self._session_meta[self.DEFAULT_SESSION] = {
+            "tenant_id": self.DEFAULT_TENANT,
+            "agent_id": self.DEFAULT_AGENT,
+            "created_at": time.time(),
+        }
         self.browser = self._BrowserShim(default_ctrl)
 
     def _run_loop(self) -> None:
@@ -160,9 +173,29 @@ class _AsyncOwner:
         """T54: 列出所有活跃 session 名."""
         return self.pool.list_active()
 
+    def list_sessions_for_tenant(self, tenant_id: str) -> list[str]:
+        """T65.6: 按 tenant_id 过滤 — 返回该 tenant 下的所有 session 名."""
+        return [
+            n for n, meta in self._session_meta.items()
+            if meta["tenant_id"] == tenant_id
+        ]
+
+    def get_session_meta(self, name: str) -> dict[str, Any] | None:
+        """T65.6: 取 session 元数据 (tenant_id / agent_id / created_at)."""
+        return self._session_meta.get(name)
+
+    def set_session_meta(self, name: str, *, tenant_id: str, agent_id: str) -> None:
+        """T65.6: 给 session 写元数据 (POST /sessions 时调)."""
+        self._session_meta[name] = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "created_at": self._session_meta.get(name, {}).get("created_at", time.time()),
+        }
+
     def release_session(self, name: str) -> bool:
         """T54: 关闭并移除指定 session. 返回是否真释放了一个.
         T65.1: 同时清掉 _session_last_used 跟踪.
+        T65.6: 同时清掉 _session_meta.
 
         给 HTTP handler (跨线程) 用 — 内部调 self.run() 把协程扔到 loop 线程.
         T65.1 修: 不能在 event loop 线程上直接调这个, 会 deadlock (loop 等
@@ -179,6 +212,7 @@ class _AsyncOwner:
             ok = self.run(_release())
             if ok:
                 self._session_last_used.pop(name, None)
+                self._session_meta.pop(name, None)
             return ok
         except Exception:
             return False
@@ -193,6 +227,7 @@ class _AsyncOwner:
                 ok = self.pool._controllers.pop(name, None) is not None
             if ok:
                 self._session_last_used.pop(name, None)
+                self._session_meta.pop(name, None)
             return ok
         except Exception:
             return False
@@ -1174,6 +1209,13 @@ class TransparentBrowserDaemon:
                 ),
                 "classify_cache_size": len(self._classify_cache),
                 "classify_cache_hits": self._classify_cache_hits,
+                # T65.6: 按 tenant 分布 — 多 agent 共享 daemon 时给 ops 一眼
+                # 看出每 tenant 用了多少 slot.
+                "tenants": {
+                    tid: sum(1 for m in self.owner._session_meta.values()
+                             if m["tenant_id"] == tid)
+                    for tid in {m["tenant_id"] for m in self.owner._session_meta.values()}
+                },
             }
         # T59: /events — SSE stream of all EventBus events (持久 + live)
         if method == "GET" and path == "/events":
@@ -1215,16 +1257,29 @@ class TransparentBrowserDaemon:
                     "drain_started_at": self._drain_started_at,
                     "drain_timeout_s": self._drain_timeout_s}
         # T54: session CRUD — list / create / delete
+        # T65.6: 加 ?tenant_id= 过滤 + tenant_id/agent_id 元数据 (在 metadata 字段).
+        # 非 detail 模式保持 list[str] 不变 (向后兼容 dogfooding 路径);
+        # metadata 字段额外暴露每 session 的 tenant/agent 归属.
         if method == "GET" and path == "/sessions":
-            sessions = self.owner.list_sessions()
+            tenant_filter = args.get("tenant_id")
+            if tenant_filter:
+                sessions = self.owner.list_sessions_for_tenant(tenant_filter)
+            else:
+                sessions = self.owner.list_sessions()
             # T63.1: ?detail=1 时每 session 返 url+title — agent 想看 N 个
             # session 各自当前在哪个页, 不必 N+1 次 /state?session=NAME.
             # 失败 (controller 死了/lazy 没 init) 时 url/title 留 None, 不抛.
+            # T65.6: detail 模式也带 tenant_id/agent_id 元数据.
             detail = str(args.get("detail", "")).lower() in ("1", "true", "yes")
             if detail:
                 items = []
                 for s in sessions:
                     entry: dict[str, Any] = {"name": s}
+                    meta = self.owner.get_session_meta(s)
+                    if meta:
+                        entry["tenant_id"] = meta["tenant_id"]
+                        entry["agent_id"] = meta["agent_id"]
+                        entry["created_at"] = meta["created_at"]
                     try:
                         ctrl = self.owner.run(self.owner.aget_controller(s))
                         entry["url"] = self.owner.run(ctrl.get_url())
@@ -1233,15 +1288,45 @@ class TransparentBrowserDaemon:
                         entry["url"] = None
                         entry["title"] = None
                     items.append(entry)
-                return {"sessions": items, "active_count": len(items), "detail": True}
-            return {"sessions": sessions, "active_count": len(sessions)}
+                resp: dict[str, Any] = {
+                    "sessions": items, "active_count": len(items), "detail": True,
+                }
+                if tenant_filter:
+                    resp["tenant_id"] = tenant_filter
+                return resp
+            # 非 detail 模式: backward-compat — sessions 仍为 list[str]
+            # (dogfooding 路径大量依赖), tenant/agent 元数据放 metadata 字段.
+            metadata: dict[str, dict[str, Any]] = {}
+            for s in sessions:
+                meta = self.owner.get_session_meta(s)
+                if meta:
+                    metadata[s] = {
+                        "tenant_id": meta["tenant_id"],
+                        "agent_id": meta["agent_id"],
+                    }
+            resp_simple: dict[str, Any] = {
+                "sessions": sessions, "active_count": len(sessions),
+                "metadata": metadata,
+            }
+            if tenant_filter:
+                resp_simple["tenant_id"] = tenant_filter
+            return resp_simple
         if method == "POST" and path == "/sessions":
             name = args.get("name") or f"agent-{len(self.owner.list_sessions()) + 1}"
+            # T65.6: 接受 tenant_id + agent_id 元数据 — 没带则用 default (anonymous).
+            # 给多 agent 共享 daemon 时按 tenant 隔离 session 列表.
+            tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+            agent_id = args.get("agent_id") or _AsyncOwner.DEFAULT_AGENT
             try:
                 _ = self.owner.get_controller(name)
+                self.owner.set_session_meta(name, tenant_id=tenant_id, agent_id=agent_id)
             except Exception as e:
                 raise _SessionError("SESSION_CREATE_FAILED", f"{type(e).__name__}: {e}") from None
-            return {"name": name, "created": True, "active": self.owner.list_sessions()}
+            return {
+                "name": name, "created": True,
+                "tenant_id": tenant_id, "agent_id": agent_id,
+                "active": self.owner.list_sessions(),
+            }
         if method == "DELETE" and path.startswith("/sessions/"):
             name = path[len("/sessions/"):]
             if not name:

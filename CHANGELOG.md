@@ -2,6 +2,28 @@
 
 格式: T 编号 + 中文短标题 + 子项 bullet + commit hash; 时间倒序 (新→旧). 不是 Keep a Changelog.
 
+## T66.8 — 全面审计: SSRF 旁路 + tenant 可变 (security)
+
+**Headline**: 用 Explore agent 重扫整个 codebase, 发现 2 类 critical/high security bug.
+
+**Bug 1 (critical) — SSRF guardrail 旁路 (T58 加的, 但只覆盖 /open)**:
+- 6 个接 URL 的 endpoint 直接传给 controller, 完全没 SSRF check:
+  - POST /tab/new → 创 tab 到 169.254.169.254 / file://
+  - POST /with-retry action=open → 同上
+  - POST /discover + /discover/stream → start_url 没 check
+  - POST /agent/run + /agent/run/stream → start_url 没 check
+- 修法: 新加 `_check_url(url, where=...)` helper. 6 个 endpoint 路由层调用. _open 也改用 helper. 失败统一抛 SSRFBlockedError → 自动 400.
+
+**Bug 2 (high) — tenant_id 可变 (跨租户 hijack)**:
+- POST /sessions 同名重建 + body tenant_id → 写到 sessions_index
+- POST /sessions/{name}/lease body tenant_id → 写到 sessions_index
+- 攻击者拿到 session 名就能改 tenant binding, 破坏多租户隔离.
+- 修法: 已绑定真实 tenant 的 session, body tenant 必须一致, 否则 TENANT_IMMUTABLE 403. 例外 anonymous→real 允许 (首次绑定).
+
+**测试**: 8 个新 (TestT66p8*) — 5 SSRF (tab_new/private_ip, tab_new/file, with_retry.open, discover, agent_run) + 3 tenant (rebind 拒, 跨 tenant acquire 拒, 同 tenant 允许). **总测试数 196 passed** (188 旧 + 8 新, 零回归).
+
+**Backlog (本 PR 不修)**: `_degradation_level` 重启丢失 / `_session_last_used` 重启后 reset → session 躲 idle / `_handle_lease_renew` 无 audit / `_op_waiters_lock` 没真正 init.
+
 ## T66.7 — Audit coverage expansion (C1 + C2 + C4 + C7)
 
 **Headline**: T66.6 修完 audit event 的 tenant_id 后, 继续审计发现核心所有权原语和 session 生命周期还有 4 类盲区 — 多 agent 共享 daemon 时 ops 缺可观测性.

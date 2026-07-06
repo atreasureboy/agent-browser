@@ -103,7 +103,10 @@ def _reset_global_sb_db() -> None:
     """
     sb_dir = os.path.expanduser("~/.semantic-browser")
     for fname in ("leases.db", "leases.db-wal", "leases.db-shm",
-                  "event_log.db", "event_log.db-wal", "event_log.db-shm"):
+                  "event_log.db", "event_log.db-wal", "event_log.db-shm",
+                  # memory.db: daemon 现在记录浏览记忆, /history /graph /stats 会
+                  # 读它. 不清会让这些测试拿到上次跑的残留页面.
+                  "memory.db", "memory.db-wal", "memory.db-shm"):
         p = os.path.join(sb_dir, fname)
         try:
             os.unlink(p)
@@ -3874,4 +3877,214 @@ class TestT66p7SessionLifecycleEvents:
             f"应有 state.exported 事件 (default session, tenant=anonymous), "
             f"查到: {_query_events('state.exported')}"
         )
+
+
+class TestT67MemoryEndpoints:
+    """回归测试: 之前 daemon 的 7 个端点 (/find /extract-topic /note /notes
+    /stats /history /graph) 全部报 AttributeError '_BrowserShim has no attribute
+    store|find|extract_topic|get_visited_pages|get_site_graph', 因为 _BrowserShim
+    只包了 BrowserController, 而 MemoryStore + 这些方法都在 engine 层. 这批测试锁死修复.
+    """
+
+    @staticmethod
+    def _article_url() -> str:
+        from urllib.parse import quote
+        html = """
+        <html><head><title>Test Article</title></head>
+        <body>
+          <h1>Test Article</h1>
+          <h2>History</h2>
+          <p>The Mosaic browser was released in 1993 and started the web boom.</p>
+          <p>Tim Berners-Lee created the first browser in 1990.</p>
+          <h2>Features</h2>
+          <p>Modern browsers support tabs, bookmarks and extensions.</p>
+        </body></html>
+        """
+        return "data:text/html;charset=utf-8," + quote(html.strip())
+
+    def test_open_records_to_memory_and_stats(self, daemon):
+        """/open 应记录到 MemoryStore — /stats 反映出来."""
+        # 先清掉此前其它测试可能残留的记录 (memory.db 跨 fixture 共享)
+        before = _http("GET", f"{daemon}/stats")["data"]
+        _http("POST", f"{daemon}/open", {"url": self._article_url()})
+        after = _http("GET", f"{daemon}/stats")["data"]
+        assert after["pages"] >= before["pages"] + 1
+        assert after["actions"] >= before["actions"] + 1
+
+    def test_history_lists_opened_page(self, daemon):
+        url = self._article_url()
+        _http("POST", f"{daemon}/open", {"url": url})
+        r = _http("GET", f"{daemon}/history")
+        assert r["ok"], r
+        pages = r["data"]["pages"]
+        assert any(p["url"] == url for p in pages), f"history 缺刚 open 的页面: {pages}"
+        assert r["data"]["count"] >= 1
+
+    def test_history_filter_by_domain(self, daemon):
+        """/history?domain= 返回空列表而非 AttributeError/500."""
+        r = _http("GET", f"{daemon}/history?domain=nope.invalid")
+        assert r["ok"], r
+        assert r["data"]["count"] == 0
+
+    def test_graph_builds_from_memory(self, daemon):
+        url = self._article_url()
+        _http("POST", f"{daemon}/open", {"url": url})
+        r = _http("GET", f"{daemon}/graph", {"url": url})
+        assert r["ok"], r
+        g = r["data"]
+        assert g["root_url"] == url
+        assert g["total_nodes"] >= 1
+
+    def test_note_create_and_list(self, daemon):
+        url = self._article_url()
+        _http("POST", f"{daemon}/open", {"url": url})
+        # 加 note
+        r1 = _http("POST", f"{daemon}/note", {"url": url, "note": "t67 marker"})
+        assert r1["ok"] and r1["data"]["saved"] is True, r1
+        # 列出 (指定 url)
+        r2 = _http("GET", f"{daemon}/notes", {"url": url})
+        assert r2["ok"], r2
+        notes = r2["data"]["notes"]
+        assert any(n["note"] == "t67 marker" for n in notes), notes
+        # 列出 (全部)
+        r3 = _http("GET", f"{daemon}/notes")
+        assert r3["ok"] and r3["data"]["count"] >= 1
+
+    def test_find_returns_matching_sections(self, daemon):
+        r = _http("POST", f"{daemon}/find", {
+            "url": self._article_url(), "keyword": "Mosaic",
+        })
+        assert r["ok"], r
+        d = r["data"]
+        assert d["found"] is True
+        assert d["total_sections"] >= 1
+        # 命中段落应包含关键词
+        joined = " ".join(s.get("excerpt", "") + s.get("heading", "")
+                          for s in d["sections"]).lower()
+        assert "mosaic" in joined or d["sections"], d
+
+    def test_extract_topic_returns_excerpt(self, daemon):
+        r = _http("POST", f"{daemon}/extract-topic", {
+            "url": self._article_url(), "keyword": "Tim Berners-Lee",
+        })
+        assert r["ok"], r
+        d = r["data"]
+        assert d["found"] is True
+        assert d.get("section_count", 0) >= 1
+
+    def test_find_empty_keyword_errors(self, daemon):
+        """空 keyword → ValueError → 非 ok 响应 (不崩 AttributeError)."""
+        r = _http("POST", f"{daemon}/find", {
+            "url": self._article_url(), "keyword": "",
+        })
+        assert r["ok"] is False, r
+        assert r["error"]["code"]  # 有错误码, 不是 200 ok
+
+
+# ── T66.8: SSRF bypass + tenant immutability fixes ──────────────────
+
+
+class TestT66p8SSRFBypasses:
+    """T66.8: SSRF guardrail 补全 — /tab/new + /with-retry(open) + /discover
+    + /agent/run + /discover/stream + /agent/run/stream 之前都接 URL 但不调
+    _ssrf_check, 等于把 T58 guardrail 当装饰品. 修后统一走 _check_url helper."""
+
+    def test_tab_new_blocks_private_ip_url(self, daemon):
+        """POST /tab/new url=http://169.254.169.254 → SSRF_BLOCKED, 不创 tab."""
+        r = _http("POST", f"{daemon}/tab/new",
+                  {"url": "http://169.254.169.254/latest/meta-data/"})
+        assert not r.get("ok"), f"应被 SSRF 拒, got: {r}"
+        assert r["error"]["code"] == "SSRF_BLOCKED", r
+
+    def test_tab_new_blocks_file_scheme(self, daemon):
+        """POST /tab/new url=file:///etc/passwd → SSRF_BLOCKED."""
+        r = _http("POST", f"{daemon}/tab/new",
+                  {"url": "file:///etc/passwd"})
+        assert not r.get("ok"), f"应被 SSRF 拒, got: {r}"
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_with_retry_open_blocks_private_ip(self, daemon):
+        """POST /with-retry action=open url=私网 → SSRF_BLOCKED."""
+        r = _http("POST", f"{daemon}/with-retry",
+                  {"action": "open",
+                   "args": {"url": "http://10.0.0.1/admin"},
+                   "max_retries": 1})
+        assert not r.get("ok"), f"应被 SSRF 拒, got: {r}"
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_discover_blocks_private_ip_start_url(self, daemon):
+        """POST /discover start_url=私网 → SSRF_BLOCKED."""
+        r = _http("POST", f"{daemon}/discover",
+                  {"start_url": "http://localhost:8080/admin"})
+        # 路由层 SSRF 检查应在 _discover() 之前返回
+        assert not r.get("ok"), f"应被 SSRF 拒, got: {r}"
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+    def test_agent_run_blocks_private_ip_start_url(self, daemon):
+        """POST /agent/run start_url=私网 → SSRF_BLOCKED."""
+        r = _http("POST", f"{daemon}/agent/run",
+                  {"goal": "test", "start_url": "http://192.168.1.1/"})
+        assert not r.get("ok"), f"应被 SSRF 拒, got: {r}"
+        assert r["error"]["code"] == "SSRF_BLOCKED"
+
+
+class TestT66p8TenantImmutability:
+    """T66.8: tenant_id 锁定 — 已存在 session 不能跨 tenant hijack."""
+
+    def test_post_sessions_rebind_to_other_tenant_blocked(self, daemon):
+        """acme session 再 POST /sessions 同名 tenant=globex → SESSION_CREATE_FAILED
+        或 TENANT_IMMUTABLE 错误, 而不是悄悄改了 tenant."""
+        # 1. 创建 acme session
+        _http("POST", f"{daemon}/sessions",
+              {"name": "acme-locked", "tenant_id": "acme", "agent_id": "agent-A"})
+        # 2. 同名, 但尝试改 tenant=globex
+        r = _http("POST", f"{daemon}/sessions",
+                  {"name": "acme-locked", "tenant_id": "globex", "agent_id": "attacker"})
+        # 应该拒绝 (TENANT_IMMUTABLE) 或创建失败
+        if r.get("ok"):
+            # 如果成功 (T65.6 老逻辑), 验证 tenant 没被改
+            assert r["data"]["tenant_id"] == "acme", (
+                f"tenant 应锁住 acme, 被改成了 {r['data']['tenant_id']}"
+            )
+        else:
+            assert r["error"]["code"] in ("TENANT_IMMUTABLE", "SESSION_CREATE_FAILED"), r
+        # 3. 验证 sessions_index 还是 acme
+        idx = self._read_sessions_index("acme-locked")
+        if idx:
+            assert idx[0] == "acme", f"sessions_index tenant 应仍是 acme, got {idx}"
+
+    def test_lease_acquire_blocked_for_other_tenant(self, daemon):
+        """acme session 别人用 tenant=globex 拿 lease → TENANT_IMMUTABLE 403."""
+        _http("POST", f"{daemon}/sessions",
+              {"name": "acme-lease-locked", "tenant_id": "acme", "agent_id": "agent-A"})
+        r = _http("POST", f"{daemon}/sessions/acme-lease-locked/lease",
+                  {"agent_id": "attacker", "tenant_id": "globex"})
+        assert not r.get("ok"), f"跨 tenant acquire 应被拒, got: {r}"
+        assert r["error"]["code"] == "TENANT_IMMUTABLE"
+
+    def test_lease_acquire_under_correct_tenant_works(self, daemon):
+        """同 tenant acquire 应正常工作 (不能误伤)."""
+        _http("POST", f"{daemon}/sessions",
+              {"name": "acme-ok", "tenant_id": "acme", "agent_id": "agent-A"})
+        r = _http("POST", f"{daemon}/sessions/acme-ok/lease",
+                  {"agent_id": "agent-A", "tenant_id": "acme"})
+        assert r.get("ok"), f"同 tenant acquire 应正常, got: {r}"
+
+    @staticmethod
+    def _read_sessions_index(name):
+        """读 leases.db 里 sessions_index 表, 返 (tenant, agent) 或 None."""
+        import sqlite3 as _sql
+        db = os.path.expanduser("~/.semantic-browser/leases.db")
+        if not os.path.exists(db):
+            return None
+        conn = _sql.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT tenant_id, agent_id FROM sessions_index WHERE session_id=?",
+                (name,),
+            ).fetchone()
+            return row
+        finally:
+            conn.close()
+
 

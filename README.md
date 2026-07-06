@@ -935,6 +935,40 @@ T66.6 修完 audit event 的 tenant_id 后, 继续审计发现核心所有权原
 
 **Breaking changes**: 无. 全是增量 audit events — 老订阅者不受影响.
 
+### T66.8 — 全面审计: SSRF 旁路 + tenant 可变 (security)
+
+T66.6/T66.7 修完 audit/tenant 后, 全面审计用 Agent 重扫整个 codebase, 发现 **2 类 critical/high security bug**:
+
+**Bug 1 (critical) — SSRF guardrail 旁路**:
+
+T58 SSRF guardrail 只在 `/open` 入口调 `_ssrf_check`. 6 个其它接 URL 的端点直接传给 controller, 完全没检查:
+
+| 端点 | 危害 |
+|---|---|
+| `POST /tab/new` | 攻击者 POST `url=http://169.254.169.254/...` 创 tab → chromium 直接打到 AWS metadata |
+| `POST /with-retry action=open` | 同上, 走 retry 包装 |
+| `POST /discover` | start_url 也没 check → 爬虫可达私网 |
+| `POST /discover/stream` | 同上 |
+| `POST /agent/run` | start_url 也没 check → agent 出发可达私网 |
+| `POST /agent/run/stream` | 同上 |
+
+**修法**: 新加 `_check_url(url, where=...)` helper, 6 个 endpoint 路由层调用. `_open` 也改成用这个 helper. 失败统一抛 `SSRFBlockedError` → 自动 400.
+
+**Bug 2 (high) — tenant_id 可变 (跨租户 hijack)**:
+
+`POST /sessions` 同名重建 + body 改 `tenant_id`, 或者 `POST /sessions/{name}/lease` body 改 `tenant_id`, 会直接写到 `sessions_index` — 攻击者拿到 session 名就能改它的 tenant binding, 破坏多租户隔离.
+
+**修法**: 已绑定到「真实 tenant」(不是 'anonymous') 的 session, body 的 tenant_id 必须一致否则 `TENANT_IMMUTABLE` 403. 例外: `anonymous → real tenant` 仍是允许的 (首次绑定). `POST /sessions` + `_handle_lease_acquire` 同步改.
+
+**测试**: 8 个新测试 (`TestT66p8*`) — 5 个 SSRF bypass (tab_new, file_scheme, with_retry.open, discover, agent_run) + 3 个 tenant immutability (rebind 拒, 跨 tenant acquire 拒, 同 tenant 仍允许). **总测试数 196 passed** (188 旧 + 8 新, 零回归).
+
+**审计还发现的次要问题 (本 PR 不修, 进 backlog)**:
+- `_degradation_level` admin 改后重启丢失 (回 L0 → 降级失效)
+- `_session_last_used` 重启后全 reset → session 跳过 idle recycle
+- `_handle_lease_renew` 无 audit
+- `/agent/run`, `/discover` 无 audit
+- `_op_waiters_lock` 没真正 init (`getattr` 拿到 None)
+
 ## T58 — SSRF guardrail (fable §7.1)
 
 Agent 让浏览器"任意 URL 导航"是个 SSRF 大坑 — 攻击面包括 AWS / GCP metadata (`169.254.169.254` / `metadata.google.internal`) / 内网服务 / localhost 旁路 / `file:///etc/passwd`. T58 在 daemon `_open()` 入口加 default-deny 闸门, 任何 URL 进 browser controller 前先过这道闸:

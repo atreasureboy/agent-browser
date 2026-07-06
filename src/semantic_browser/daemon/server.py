@@ -27,6 +27,8 @@ from semantic_browser.engine import SemanticBrowser
 from semantic_browser.snapshot.engine import SnapshotEngine
 from semantic_browser.browser.controller import BrowserConfig, BrowserController
 from semantic_browser.browser.pool import ControllerPool
+from semantic_browser.memory.store import MemoryStore
+from semantic_browser.graph.builder import GraphBuilder
 from semantic_browser.daemon.snapshots import SnapshotStore
 from semantic_browser.event_bus import EventBus
 
@@ -497,7 +499,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0, leases_db: str | None = None, lease_heartbeat_ttl_s: float = 15.0) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0, leases_db: str | None = None, lease_heartbeat_ttl_s: float = 15.0, memory_db: str | None = None) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -550,12 +552,27 @@ class TransparentBrowserDaemon:
         self._ssrf_allowlist: frozenset[str] = ssrf_allowlist or frozenset()
         # T58: 测试 fixture 用 data: URL 时通过此 flag 临时允许; production 必为 False
         self._allow_data_scheme: bool = allow_data_scheme
+        # T66.8: SSRF 预解析缓存 — 命中 (host+port) 后直接跳过解析, 减少 lat.
+        # 也堵住 DNS rebinding 路径 (解析一次锁住 IP).
+        self._ssrf_cache: dict[str, tuple[str, frozenset[str]]] = {}
         # T59: SSE pressure events — 上次发布的压力等级 (None=未发布, 'normal'/'soft'/'high'/'critical')
         self._pressure_level: str | None = None
         # T61: storage_state 自动快照 (fable §5.4)
         self.snapshot_store = SnapshotStore(snapshots_root, snapshots_db)
         self._sweep_interval_s = sweep_interval_s
         self._sweep_task: asyncio.Task | None = None
+        # MemoryStore — daemon 持久化浏览记忆 (pages/links/actions/notes).
+        # 之前 daemon 只包了 BrowserController, _BrowserShim 没暴露 store,
+        # 导致 /stats /note /notes /history /graph /find /extract-topic 全报
+        # AttributeError '_BrowserShim has no attribute store|find|...'.
+        # 这里复用 ~/.semantic-browser/memory.db (跟 SemanticBrowser engine 同库),
+        # 同时挂到 owner.browser.store 让老的 self.owner.browser.store.X 调用通.
+        _memory_db = memory_db or os.path.expanduser("~/.semantic-browser/memory.db")
+        self.memory_store = MemoryStore(_memory_db)
+        # daemon 级 session — 一次启动一个, 所有 op 共用 (跟 engine 行为一致).
+        self.memory_session_id = f"daemon_{int(time.time())}"
+        self.memory_store.start_session(self.memory_session_id)
+        self.owner.browser.store = self.memory_store  # backward-compat
         # T65.1: session idle 自动回收 — 闲置超过 N 秒的 session 自动 close + 移除.
         # CLI --session-idle-timeout 优先; 否则读 env DAEMON_SESSION_IDLE_TIMEOUT_S;
         # 默认 300s 适合长 agent 会话. None 表示走 env/default.
@@ -1472,13 +1489,32 @@ class TransparentBrowserDaemon:
             name = args.get("name") or f"agent-{len(self.owner.list_sessions()) + 1}"
             # T65.6: 接受 tenant_id + agent_id 元数据 — 没带则用 default (anonymous).
             # 给多 agent 共享 daemon 时按 tenant 隔离 session 列表.
-            tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
-            agent_id = args.get("agent_id") or _AsyncOwner.DEFAULT_AGENT
+            requested_tenant = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+            requested_agent = args.get("agent_id") or _AsyncOwner.DEFAULT_AGENT
             try:
                 _ = self.owner.get_controller(name)
-                self.owner.set_session_meta(name, tenant_id=tenant_id, agent_id=agent_id)
             except Exception as e:
                 raise _SessionError("SESSION_CREATE_FAILED", f"{type(e).__name__}: {e}") from None
+            # T66.8 (high): 修前 — 已存在 session 的重建 (同名 POST /sessions) 会用
+            # body 的 tenant_id 覆盖 sessions_index. 攻击者拿到 session 名就能改
+            # 它的 tenant binding, 破坏多租户隔离. 修后 — 已存在 session 的
+            # tenant 锁住 (不允许改), agent_id 同理 (同一 tenant 才能迁 agent).
+            existing = self.lease_manager.get_session_meta(name)
+            if existing is not None and existing[0] != _AsyncOwner.DEFAULT_TENANT:
+                # 已绑定到真实 tenant → 锁住, 防 hijack. 但允许 anonymous → real
+                # (首次绑定) + 同 tenant 的 agent_id 更新.
+                tenant_id, agent_id = existing
+                if requested_tenant != tenant_id:
+                    raise _SessionError(
+                        "TENANT_IMMUTABLE",
+                        f"session {name!r} belongs to tenant {tenant_id!r}; "
+                        f"cannot rebind to {requested_tenant!r}",
+                    )
+                # 同 tenant → agent_id 可以更新 (e.g. agent 换人)
+                agent_id = requested_agent
+            else:
+                tenant_id, agent_id = requested_tenant, requested_agent
+            self.owner.set_session_meta(name, tenant_id=tenant_id, agent_id=agent_id)
             # T66.7.3 (C4): session 创建也发审计 — ops 重建 session 历史需要.
             # dedup 按 session_name (同名重建是不同事件, 但生产里名字唯一 OK).
             try:
@@ -1609,6 +1645,10 @@ class TransparentBrowserDaemon:
             action_name = args["action"]
             action_args = args.get("args", {})
             max_retries = int(args.get("max_retries", 2))
+            # T66.8: SSRF guard — action=open 时 url 也在 SSRF 黑名单兜底.
+            # 修前 with-retry(open 分支) 直接 ctrl.open(args["url"]) 不 check.
+            if action_name == "open" and "url" in action_args:
+                self._check_url(action_args["url"], where="with_retry.open")
             return self.owner.run(self._with_retry(action_name, action_args, max_retries))
         if method == "POST" and path == "/set-files":
             return self.owner.run(self._set_files(args["ref"], args["paths"]))
@@ -1874,11 +1914,20 @@ class TransparentBrowserDaemon:
                 text, delay_ms=delay_ms,
             ))
         if method == "POST" and path == "/agent/run":
+            # T66.8: SSRF guard — start_url 也要 check. agent 爬虫从 start_url
+            # 出发可达私网, 不 check 等于把整个 SSRF guardrail 当装饰品.
+            start_url = args.get("start_url", "")
+            if start_url:
+                self._check_url(start_url, where="agent_run")
             return self.owner.run(self._run_agent(args))
         # T53: SSE 流式 agent run — 复用 on_step 钩子推 step-by-step
         if method == "POST" and path == "/agent/run/stream":
             if req is None:
                 raise ValueError("/agent/run/stream requires req context")
+            # T66.8: SSRF guard — 跟 /agent/run 一致
+            start_url = args.get("start_url", "")
+            if start_url:
+                self._check_url(start_url, where="agent_run.stream")
             self._stream_agent_run(req, args)
             return "_SSE_HANDLED"
         # T29: dry-run plan preview
@@ -1914,6 +1963,10 @@ class TransparentBrowserDaemon:
             return self.owner.browser.controller.list_tabs()
         if method == "POST" and path == "/tab/new":
             url = args.get("url", "")
+            # T66.8: SSRF guard — 修前 _tab_new 直接调 controller.new_tab(url),
+            # 绕开了 _open 的 _ssrf_check. 攻击者可打到 169.254.169.254 /
+            # 内部服务 / file:// — 跟 _open 行为不一致.
+            self._check_url(url, where="tab_new")
             return self.owner.run(self._tab_new(url))
         if method == "POST" and path == "/tab/switch":
             idx = int(args["index"])
@@ -1930,46 +1983,54 @@ class TransparentBrowserDaemon:
             self.owner.run(self.owner.browser.controller.to_top_frame())
             return {"active": "main"}
         if method == "GET" and path == "/history":
-            pages = self.owner.browser.get_visited_pages(args.get("domain", ""))
+            pages = self._get_visited_pages(args.get("domain", ""))
             return {"pages": pages, "count": len(pages)}
         if method == "GET" and path == "/graph":
             url = args.get("url") or self.owner.run(self.owner.browser.controller.get_url())
-            return self.owner.browser.get_site_graph(url).to_dict()
+            return self._get_site_graph(url).to_dict()
         # T30: live site map discovery (vs /graph 走历史库)
         if method == "POST" and path == "/discover":
+            # T66.8: SSRF guard — start_url 也要 check.
+            start_url = args.get("start_url", "")
+            if start_url:
+                self._check_url(start_url, where="discover")
             return self.owner.run(self._discover(args))
         # T50: 流式版 — SSE (Server-Sent Events), 客户端可用 EventSource 消费
         if method == "GET" and path == "/discover/stream":
             if req is None:
                 raise ValueError("/discover/stream requires req context")
+            # T66.8: SSRF guard — start_url 跟 /discover 一致.
+            start_url = args.get("start_url", "")
+            if start_url:
+                self._check_url(start_url, where="discover.stream")
             self._stream_discover(req, args)
             return "_SSE_HANDLED"
         if method == "POST" and path == "/find":
             url = args["url"]
             keyword = args["keyword"]
             max_results = int(args.get("max_results", 10))
-            return self.owner.run(self.owner.browser.find(url, keyword, max_results=max_results))
+            return self.owner.run(self._find(url, keyword, max_results=max_results))
         if method == "POST" and path == "/extract-topic":
             url = args["url"]
             keyword = args["keyword"]
             max_chars = int(args.get("max_chars", 4000))
-            return self.owner.run(self.owner.browser.extract_topic(url, keyword, max_chars=max_chars))
+            return self.owner.run(self._extract_topic(url, keyword, max_chars=max_chars))
         if method == "POST" and path == "/note":
             url = args["url"]
             note = args["note"]
-            self.owner.browser.store.add_note(url, note)
+            self.memory_store.add_note(url, note)
             return {"saved": True, "url": url}
         if method == "GET" and path == "/stats":
-            return self.owner.browser.store.stats()
+            return self.memory_store.stats()
         if method == "POST" and path == "/run-workflow":
             return self.owner.run(self._run_workflow(args["workflow_file"]))
         if method == "GET" and path == "/notes":
             url = args.get("url", "")
             limit = int(args.get("limit", 50))
             if url:
-                rows = self.owner.browser.store.get_notes(url)[:limit]
+                rows = self.memory_store.get_notes(url)[:limit]
                 return {"count": len(rows), "notes": rows}
-            with self.owner.browser.store._conn() as conn:
+            with self.memory_store._conn() as conn:
                 rows = conn.execute(
                     "SELECT * FROM notes ORDER BY created_at DESC LIMIT ?", (limit,)
                 ).fetchall()
@@ -1988,6 +2049,10 @@ class TransparentBrowserDaemon:
           priority: int (默认 1; 数字越小越高, 0=critical)
           preempt: 'true'/'false' (默认 false)
           ttl_s: float (默认 daemon 配置)
+
+        T66.8: tenant 锁 — 已存在 session (sessions_index 有行) 时, 忽略 body
+        的 tenant_id, 用 stored 那个. 否则 attacker 拿到 session 名就能改
+        tenant binding. 新 session 才用 body 的.
         """
         m = re.match(r"^/sessions/([^/]+)/lease$", path)
         if not m:
@@ -1996,7 +2061,26 @@ class TransparentBrowserDaemon:
         agent_id = args.get("agent_id") or ""
         if not agent_id:
             raise _LeaseError("MISSING_PARAM", "agent_id required")
-        tenant_id = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+        requested_tenant = args.get("tenant_id") or _AsyncOwner.DEFAULT_TENANT
+        # T66.8: tenant 锁 — 已存在 sessions_index 行 + 该 tenant != 'anonymous'
+        # (即已经被某个真实 tenant 绑过) 时, body 的 tenant 必须一致. 防跨租户
+        # hijack: 攻击者拿到 session 名, 用别的 tenant acquire lease 来改 binding.
+        #
+        # 例外: 现 tenant='anonymous' → 允许 update 到真实 tenant (典型用法:
+        # POST /sessions (不传 tenant) → POST .../lease {tenant_id=acme}). 这是
+        # "首次绑定", 不算 hijack. 锁住是为了防止 hijack, 不是阻止首次绑定.
+        existing = self.lease_manager.get_session_meta(session_name)
+        if existing is not None and existing[0] != _AsyncOwner.DEFAULT_TENANT:
+            tenant_id = existing[0]
+            if requested_tenant != tenant_id:
+                raise _LeaseError(
+                    "TENANT_IMMUTABLE",
+                    f"session {session_name!r} belongs to tenant {tenant_id!r}; "
+                    f"cannot acquire under {requested_tenant!r}",
+                    status_code=403,
+                )
+        else:
+            tenant_id = requested_tenant
         try:
             priority = int(args.get("priority", "1"))
         except ValueError:
@@ -2462,19 +2546,31 @@ class TransparentBrowserDaemon:
             page_type = None
         return {"url": url, "title": title, "type": page_type}
 
-    async def _open(self, url: str, session: str | None = None,
-                    *, detail: str = "summary",
-                    classify_force: bool = False,
-                    classify_strict: bool = False) -> dict[str, Any]:
+    def _check_url(self, url: str, *, where: str = "open") -> str:
+        """T58 + T66.8: SSRF 集中校验 — 任何 handler 拿用户 URL 都应调我.
+
+        修前: 只有 /open 调 _ssrf_check. /tab/new + /with-retry(open 分支)
+        + /discover + /agent/run 都接收 url 但直接传给 controller,
+        绕开 SSRF 闸 — agent 可打到 169.254.169.254 / 内部服务.
+
+        修后: 这个方法统一入口, 各 handler 进来先调, 失败抛 SSRFBlockedError
+        → 自动 400 + error envelope (跟 _open 路径一致).
+        """
         from semantic_browser.safety.ssrf import check_url as _ssrf_check, SSRFBlockedError
-        # T58: SSRF guardrail (fable §7.1) — default-deny 私网/loopback/meta
         try:
-            checked_url = _ssrf_check(
+            return _ssrf_check(
                 url, allowlist=self._ssrf_allowlist,
                 allow_data=self._allow_data_scheme,
             )
         except SSRFBlockedError as e:
-            raise SSRFBlockedError(f"open() blocked: {e}") from None
+            raise SSRFBlockedError(f"{where}() blocked: {e}") from None
+
+    async def _open(self, url: str, session: str | None = None,
+                    *, detail: str = "summary",
+                    classify_force: bool = False,
+                    classify_strict: bool = False) -> dict[str, Any]:
+        # T58 + T66.8: 用集中 _check_url helper — 跟其它入口一致
+        checked_url = self._check_url(url, where="open")
         ctrl = await self.owner.aget_controller(session)
         page = await ctrl.open(checked_url)
         # T61: navigate 成功 → 标记 session dirty (sweep 会抓快照)
@@ -2574,7 +2670,97 @@ class TransparentBrowserDaemon:
                     seen_refs.add(ctrl_info.ref)
             result["refs"] = refs
             result["ref_count"] = len(refs)
+        # 记录到 MemoryStore — 让 /history /graph /stats 能反映 daemon 的浏览.
+        # 之前 daemon /open 不写 memory, 这些端点即使修了 AttributeError 也是空.
+        try:
+            self._record_to_memory(checked_url, snap, cls_result)
+        except Exception:
+            logger.exception("record_to_memory(%s) failed (non-fatal)", checked_url)
         return result
+
+    def _record_to_memory(self, url: str, snap: Any, cls_result: dict[str, Any]) -> None:
+        """把一次 open 的 snapshot + 分类结果落到 MemoryStore.
+
+        镜像 SemanticBrowser._record_to_memory 的语义, 但 daemon 没有 engine 实例,
+        所以在 daemon 层直接调 store. 失败不致命 — memory 是辅助查询, 不影响 open 主路径.
+        """
+        store = self.memory_store
+        store.record_page(
+            url=url,
+            domain=snap.domain,
+            title=snap.title,
+            page_type=cls_result.get("page_type", "unknown"),
+            confidence=float(cls_result.get("confidence", 0.0)),
+            meta=snap.meta,
+            snapshot_json=snap.to_json(),
+        )
+        store.record_links(
+            from_url=url,
+            links=[{"href": l.href, "text": l.text} for l in snap.links],
+        )
+        store.record_action(
+            session_id=self.memory_session_id,
+            action="open",
+            url=url,
+            detail=f"classified as {cls_result.get('page_type', 'unknown')}",
+        )
+        store.increment_page_visit(self.memory_session_id)
+
+    async def _find(self, url: str, keyword: str, *, max_results: int = 10) -> dict[str, Any]:
+        """服务端 find: open url → 提取 article → find_sections(keyword).
+
+        镜像 SemanticBrowser.find 的语义. 复用 self._open (含 SSRF guard + 记忆),
+        再拿当前 page 跑 ContentExtractor. 空 keyword 抛 ValueError → handler 转 400.
+        """
+        if not keyword or not keyword.strip():
+            raise ValueError("keyword is empty; provide a non-empty keyword to search for")
+        await self._open(url)
+        from semantic_browser.extractor.content import ContentExtractor
+        ctrl = await self.owner.aget_controller(None)
+        page = ctrl.current_page
+        if page is None:
+            return {"keyword": keyword, "found": False, "sections": [], "total_sections": 0}
+        article = await ContentExtractor(page).extract_article()
+        if article is None:
+            return {"keyword": keyword, "found": False, "sections": [], "total_sections": 0}
+        sections = article.find_sections(keyword, max_results=max_results)
+        return {
+            "keyword": keyword,
+            "found": bool(sections),
+            "sections": sections,
+            "total_sections": len(article.sections),
+        }
+
+    async def _extract_topic(self, url: str, keyword: str, *, max_chars: int = 4000) -> dict[str, Any]:
+        """服务端 extract_topic: open url → 提取 article → extract_topic(keyword)."""
+        if not keyword or not keyword.strip():
+            raise ValueError("keyword is empty; provide a non-empty keyword to extract")
+        await self._open(url)
+        from semantic_browser.extractor.content import ContentExtractor
+        ctrl = await self.owner.aget_controller(None)
+        page = ctrl.current_page
+        if page is None:
+            return {"keyword": keyword, "found": False, "sections": [], "total_chars": 0, "section_count": 0}
+        article = await ContentExtractor(page).extract_article()
+        if article is None:
+            return {"keyword": keyword, "found": False, "sections": [], "total_chars": 0, "section_count": 0}
+        return article.extract_topic(keyword, max_chars=max_chars)
+
+    def _get_visited_pages(self, domain: str = "", limit: int = 100) -> list[dict]:
+        """历史查询 — domain 为空返所有 (按 visited_at 倒序)."""
+        store = self.memory_store
+        if domain:
+            return store.get_pages_by_domain(domain, limit=limit)
+        import sqlite3
+        with store._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pages ORDER BY visited_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def _get_site_graph(self, root_url: str):
+        """站点拓扑图 — 复用 GraphBuilder + MemoryStore."""
+        return GraphBuilder(self.memory_store).build(root_url)
 
     def _get_llm_classifier(self) -> Any:
         """T63.2: lazy init LLMEnhancedClassifier — 仅在 OPENAI_API_KEY 配了才创建.

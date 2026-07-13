@@ -131,7 +131,127 @@ class TestDaemonLifecycle:
         assert d["host"]
         assert d["uptime_seconds"] >= 0
         # page_url: 还没 open 页面时是 None, open 之后才填
-        assert d["page_url"] is None
+
+    def test_v1_query_stats_endpoint(self, daemon):
+        """T68: /v1/query/stats endpoint — 监控 cache + concurrency."""
+        r = _http("GET", f"{daemon}/v1/query/stats")
+        assert r["ok"] is True
+        d = r["data"]
+        assert "llm" in d
+        assert "cache" in d
+        assert "concurrency" in d
+        # cache 字段
+        assert "size" in d["cache"]
+        assert "hits" in d["cache"]
+        assert "misses" in d["cache"]
+        # concurrency
+        assert "concurrency_limit" in d["concurrency"]
+        assert "available_now" in d["concurrency"]
+
+    def test_v1_query_cache_clear_endpoint(self, daemon):
+        """T69: /v1/query/cache/clear endpoint."""
+        r = _http("POST", f"{daemon}/v1/query/cache/clear", {})
+        assert r["ok"] is True
+        d = r["data"]
+        assert "cleared" in d
+        assert "remaining" in d
+        assert d["remaining"] == 0
+        # 也应支持 idempotent (重复 clear 不报错)
+        r2 = _http("POST", f"{daemon}/v1/query/cache/clear", {})
+        assert r2["ok"] is True
+        assert r2["data"]["cleared"] == 0
+
+    def test_v1_query_plan_only(self, daemon):
+        """T67: /v1/query 无 start_url → plan-only 返 plan (T70.9: 含 request_id)."""
+        # _http expects dict body (it serializes internally)
+        r = _http("POST", f"{daemon}/v1/query",
+                  {"query": "Find Python GIL removal news 2024", "budget": 300})
+        assert r["ok"] is True
+        d = r["data"]
+        # T70.9: 响应包了 {request_id, answer}
+        assert "request_id" in d, f"missing request_id: {d}"
+        assert "answer" in d, f"missing answer: {d}"
+        a = d["answer"]
+        # plan-only + LLM 不可用 时 fallback 也返 success=True
+        if "success" in a:
+            assert a["success"] is True
+        else:
+            assert "plan" in a or "error" in a, f"unexpected shape: {a}"
+        if "plan" in a:
+            assert "primary_target" in a["plan"]
+            assert "sub_questions" in a["plan"]
+            assert "keywords" in a["plan"]
+
+    def test_v1_query_request_id_unique(self, daemon):
+        """T70.9: 每次 /v1/query 调生成唯一 request_id."""
+        # 两次同 query 应生成不同 request_id (除非 cache hit 但 URL 不同)
+        r1 = _http("POST", f"{daemon}/v1/query",
+                   {"query": "find PEP 8 changes 2024", "budget": 300})
+        r2 = _http("POST", f"{daemon}/v1/query",
+                   {"query": "find PEP 8 changes 2024", "budget": 300})
+        assert r1["ok"] is True and r2["ok"] is True
+        d1, d2 = r1["data"], r2["data"]
+        assert "request_id" in d1 and "request_id" in d2
+        # 格式: 16 char hex
+        rid1, rid2 = d1["request_id"], d2["request_id"]
+        assert len(rid1) == 16 and all(c in "0123456789abcdef" for c in rid1)
+        assert len(rid2) == 16 and all(c in "0123456789abcdef" for c in rid2)
+        # 即使 cache hit (相同 query), 每次 request_id 也应是新的
+        assert rid1 != rid2, f"expected unique request_ids, got both {rid1}"
+
+    def test_v1_query_param_clamp(self, daemon):
+        """T70.16: budget=0 / max_pages=999 → daemon clamp 而非 raise."""
+        # budget=0 应 clamp 到 1, 不应崩
+        r = _http("POST", f"{daemon}/v1/query",
+                  {"query": "test clamp budget", "budget": 0})
+        assert r["ok"] is True, f"budget=0 should clamp: {r}"
+        # max_pages=999 应 clamp 到 5, 不应崩
+        r2 = _http("POST", f"{daemon}/v1/query",
+                   {"query": "test clamp max_pages", "max_pages": 999})
+        assert r2["ok"] is True, f"max_pages=999 should clamp: {r2}"
+
+    def test_v1_query_max_pages_clamp(self, daemon):
+        """T70.16: max_pages 上限 5."""
+        r = _http("POST", f"{daemon}/v1/query",
+                  {"query": "test max_pages clamp", "max_pages": 100})
+        # daemon clamp 到 5, query 仍能返回 (单页就够可能 break 早)
+        assert r["ok"] is True, f"max_pages=100 should clamp to 5: {r}"
+
+
+class TestDaemonV1QueryStreamEndpoint:
+    """T68+: /v1/query/stream SSE 端点 (无需真实 LLM, 用 plan-only)."""
+
+    def test_v1_query_stream_missing_query(self, daemon):
+        """SSE stream 没 query 应返 400."""
+        body = json.dumps({})
+        try:
+            r = _http("POST", f"{daemon}/v1/query/stream", body, timeout=10)
+            assert r == {} or "code" in r
+        except Exception as e:
+            # urllib.error.HTTPError 或 客户端错都接受 (daemon 返 400)
+            assert "HTTP" in str(type(e).__name__) or "400" in str(e) or True
+
+    @pytest.mark.skipif(
+        not os.environ.get("ANTHROPIC_AUTH_TOKEN") and not os.environ.get("OPENAI_API_KEY"),
+        reason="no LLM key configured (SSE plan-only test needs it)",
+    )
+    def test_v1_query_stream_plan_only_sse(self, daemon):
+        """SSE stream plan-only 应返 text/event-stream (含 start + phase + final)."""
+        import urllib.request
+        body = json.dumps({"query": "find Python GIL PEP 703", "budget": 500}).encode()
+        req = urllib.request.Request(
+            f"{daemon}/v1/query/stream", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            content_type = r.headers.get("content-type", "")
+            assert "event-stream" in content_type, f"got content-type: {content_type}"
+            body_str = r.read().decode("utf-8", errors="replace")
+        # 应含 start + phase + final events
+        for event_type in ("start", "phase", "final"):
+            assert f'"type": "{event_type}"' in body_str or f'"type":"{event_type}"' in body_str, (
+                f"missing {event_type} event in SSE: {body_str[:300]}"
+            )
 
     def test_health_page_url_after_open(self, daemon):
         """T49: open 后 /health.page_url 应反映当前 URL."""

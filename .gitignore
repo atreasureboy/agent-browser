@@ -35,3 +35,14 @@ storage-state.json
 # Internal project tracking (not source of truth; lives outside the repo in normal use)
 .progress.json
 plan-*.md
+
+# Environment / secrets — never commit
+.env
+.env.*
+*.local
+
+# Internal iteration logs (goal.md + .loop state) — local notes from the
+# autonomous /goal iteration; the canonical doc surface is README + CHANGELOG.
+.loop/
+goal.md
+

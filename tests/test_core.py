@@ -380,6 +380,14 @@ class TestLLMEnhancedClassifier:
     def test_llm_unavailable_without_key(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_BASE_URL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
         cls = LLMEnhancedClassifier(enable_llm=True)
         assert cls._llm_available is False
 

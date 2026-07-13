@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -262,6 +263,11 @@ class _AsyncOwner:
 _OP_LOCK_TIMEOUT_S = 30.0  # 等锁超过 30s → 503 错; 长任务应主动拆小
 
 
+def _new_request_id() -> str:
+    """T70.9: 生成唯一 request_id — 让 agent 能追踪多请求关联."""
+    return uuid.uuid4().hex[:16]  # 16-char hex, 紧凑够排重
+
+
 # T65.5: 容量公式常量 (设计文档 §1.2) — 64GB 单机推荐 M=6 / K=16.
 # 公式: mem_per_browser = BASE + K × (CTX + P̄ × PAGE)
 #       mem_total = M × mem_per_browser + DAEMON + OS_RESERVE
@@ -499,7 +505,7 @@ def _make_handler(daemon: "TransparentBrowserDaemon"):
 
 
 class TransparentBrowserDaemon:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0, leases_db: str | None = None, lease_heartbeat_ttl_s: float = 15.0, memory_db: str | None = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, headless: bool = True, storage_state_path: str | None = None, event_bus_path: str | None = None, snapshots_root: str | None = None, snapshots_db: str | None = None, ssrf_allowlist: frozenset[str] | None = None, allow_data_scheme: bool = False, m_browsers: int = 6, k_contexts: int = 16, watchdog_interval_s: float = 5.0, sweep_interval_s: float = 60.0, session_idle_timeout_s: float | None = None, drain_timeout_s: float = 30.0, leases_db: str | None = None, lease_heartbeat_ttl_s: float = 15.0, memory_db: str | None = None, query_cache_path: str | None = None, query_concurrency: int = 4) -> None:
         import time as _time
         self.host = host
         self.port = port
@@ -509,6 +515,20 @@ class TransparentBrowserDaemon:
         # T55: 持久化 Event Bus — SSE Last-Event-ID 续传 + 跨 SSE 状态共享
         self.event_bus = EventBus(event_bus_path)
         self.owner.run_coro(self.event_bus.start())
+        # T68+ T69: shared SemanticQuery 实例 (跨请求共享 cache / llm / 状态)
+        # 多 agent 共享 daemon 时, 同 query 命中 cache 能跨请求 + 跨重启
+        from semantic_browser.query import SemanticQuery
+        cache_path = query_cache_path or str(Path.home() / ".semantic-browser" / "query_cache.json")
+        try:
+            self._semantic_query = SemanticQuery(cache_persist_path=cache_path)
+            self._query_cache_path = cache_path
+        except Exception as e:
+            logger.warning("failed to init shared SemanticQuery: %s; /v1/query will create per-request instances", e)
+            self._semantic_query = None
+            self._query_cache_path = None
+        # T69: 并发限制 — 同一时刻最大 N 个 query 在跑 (避免浏览器/内存过载)
+        import asyncio as _asyncio
+        self._query_semaphore = _asyncio.Semaphore(query_concurrency)
         # T65.7: Lease/Fence — 多 agent 共享 daemon 所有权原语 (设计 §2)
         from semantic_browser.daemon.lease import LeaseManager
         self.lease_manager = LeaseManager(leases_db, heartbeat_ttl_s=lease_heartbeat_ttl_s)
@@ -804,6 +824,9 @@ class TransparentBrowserDaemon:
         "/drag", "/select-option", "/fill-form", "/set-files",
         "/scroll", "/press", "/download", "/back", "/forward", "/reload",
         "/agent/run", "/agent/run/stream", "/discover", "/discover/stream",
+        "/v1/query",  # T67: semantic query 写 (起 browser + 多次 LLM 调用)
+        "/v1/query/stream",  # T68: SSE stream 也算写 op (起 browser)
+        "/v1/query/cache/clear",  # T69: cache write 也算 write op (modify in-memory state)
     })
 
     # T56: 降级时仍允许的只读/控制端点 (L4 全拒时除外)
@@ -1090,6 +1113,7 @@ class TransparentBrowserDaemon:
             v1_routes = {
                 "/healthz", "/readyz", "/capacity", "/events",
                 "/sessions",  # POST 创建 + GET 列表
+                "/query", "/query/stream", "/query/stats", "/query/cache/clear",  # T67+T68+T69
             }
             # /v1/sessions/{id}/... (GET 详情 + DELETE + lease CRUD)
             if v1_path == "/healthz":
@@ -1102,6 +1126,14 @@ class TransparentBrowserDaemon:
                 path = "/events"
             elif v1_path == "/sessions":
                 path = "/sessions"
+            elif v1_path == "/query":
+                path = "/v1/query"  # 直路由 (不脱 v1 前缀, _dispatch 里识别)
+            elif v1_path == "/query/stream":
+                path = "/v1/query/stream"
+            elif v1_path == "/query/stats":
+                path = "/v1/query/stats"
+            elif v1_path == "/query/cache/clear":
+                path = "/v1/query/cache/clear"
             elif v1_path.startswith("/sessions/"):
                 # 保留 lease 路径模式
                 path = v1_path
@@ -1920,6 +1952,30 @@ class TransparentBrowserDaemon:
             if start_url:
                 self._check_url(start_url, where="agent_run")
             return self.owner.run(self._run_agent(args))
+        # T67: /v1/query — semantic query 入口 (model-driven browser semantic layer)
+        if method == "POST" and path == "/v1/query":
+            start_url = args.get("start_url", "") or ""
+            if start_url:
+                # T66.8 SSRF: 跟 /agent/run /discover 一样检查 start_url
+                self._check_url(start_url, where="v1_query")
+            return self.owner.run(self._run_semantic_query(args))
+        # T67+ T68: /v1/query/stream — SSE 流式 progress
+        if method == "POST" and path == "/v1/query/stream":
+            start_url = args.get("start_url", "") or ""
+            if start_url:
+                self._check_url(start_url, where="v1_query.stream")
+            if req is None:
+                raise ValueError("/v1/query/stream requires req context")
+            self._stream_semantic_query(req, args)
+            return "_SSE_HANDLED"
+        # T68: /v1/query/stats — 监控 endpoint
+        if method == "GET" and path == "/v1/query/stats":
+            return self.owner.run(self._run_query_stats())
+        # T69: POST /v1/query/cache/clear — 清空共享 SemanticQuery cache
+        if method == "POST" and path == "/v1/query/cache/clear":
+            if self._semantic_query is not None:
+                return self._semantic_query.clear_cache()
+            return {"cleared": 0, "remaining": 0, "note": "no shared SemanticQuery configured"}
         # T53: SSE 流式 agent run — 复用 on_step 钩子推 step-by-step
         if method == "POST" and path == "/agent/run/stream":
             if req is None:
@@ -3176,6 +3232,107 @@ class TransparentBrowserDaemon:
             "graph_dict": result.graph.to_dict(),
         }
 
+    async def _run_semantic_query(self, args: dict[str, Any]) -> dict[str, Any]:
+        """T67: /v1/query 处理器.
+
+        接受 query 文本, 可选 start_url + budget + max_pages.
+        内部跑 SemanticQuery 全流程 (plan → browse → relevance → synthesize).
+        返 SemanticAnswer 的 dict 形式 + T70 request_id.
+        """
+        from semantic_browser.query import SemanticQuery
+
+        query_text = (args.get("query") or args.get("goal") or "").strip()
+        if not query_text:
+            return {
+                "ok": False,
+                "data": None,
+                "error": {
+                    "code": "MISSING_PARAM",
+                    "message": "query is required",
+                    "retryable": False,
+                },
+            }
+
+        budget = args.get("budget")
+        max_pages = args.get("max_pages")
+        try:
+            budget_int = int(budget) if budget is not None else None
+            max_pages_int = int(max_pages) if max_pages is not None else None
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "data": None,
+                "error": {
+                    "code": "INVALID_PARAM",
+                    "message": f"budget/max_pages must be int (got budget={budget}, max_pages={max_pages})",
+                    "retryable": False,
+                },
+            }
+
+        # T70.15: 跟 SemanticQuery.__init__ 一致 — budget >= 1, max_pages >= 0
+        if budget_int is not None and budget_int < 1:
+            budget_int = 1   # 兜底防 client 错传 budget=0/-1
+        if max_pages_int is not None:
+            if max_pages_int < 0:
+                max_pages_int = 1   # 兜底
+            if max_pages_int > 5:
+                max_pages_int = 5   # daemon 上限
+
+        # T69: 共享 daemon-wide SemanticQuery (cache 跨请求持久)
+        sq = self._semantic_query if self._semantic_query is not None else SemanticQuery()
+        own_sq = self._semantic_query is None
+        try:
+            # T69: 并发 semaphore
+            async with self._query_semaphore:
+                answer = await sq.run(
+                    query_text,
+                    start_url=args.get("start_url") or None,
+                    budget=budget_int,
+                    max_pages=max_pages_int,
+                )
+            # daemon 的 _dispatch 把返回值再包一层 Result envelope;
+            # 这里返 inner 数据, 让外层包装成 {ok:True, data:{...answer...}}
+            return {
+                "request_id": args.get("_request_id") or _new_request_id(),
+                "answer": answer.to_dict(),
+            }
+        except Exception as e:
+            logger.exception("/v1/query failed")
+            raise RuntimeError(f"QUERY_FAILED: {type(e).__name__}: {e}")[:300]
+        finally:
+            # 只有当 sq 不是共享实例时才关 (避免把 daemon-wide 的 browser 也关了)
+            if own_sq:
+                try:
+                    await sq.close()
+                except Exception:
+                    pass
+
+    # T68+: /v1/query/stats — LLM 服务 + cache 配置
+    async def _run_query_stats(self) -> dict[str, Any]:
+        from semantic_browser.llm import get_default_service
+        try:
+            llm_stats = get_default_service().stats() if hasattr(get_default_service(), 'stats') else {}
+        except Exception:
+            llm_stats = {}
+        # T69: 共享 SemanticQuery 的 cache_stats 现在是 daemon 进程级
+        cache_stats = {}
+        if self._semantic_query is not None:
+            try:
+                cache_stats = self._semantic_query.cache_stats()
+            except Exception:
+                pass
+        # T69: 并发 semaphore 状态
+        semaphore_info = {
+            "concurrency_limit": self._query_concurrency if hasattr(self, '_query_concurrency') else 4,
+            "available_now": self._query_semaphore._value if hasattr(self, '_query_semaphore') else None,
+        }
+        return {
+            "llm": llm_stats,
+            "cache": cache_stats,
+            "concurrency": semaphore_info,
+            "cache_persist_path": getattr(self, '_query_cache_path', None),
+        }
+
     def _stream_discover(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
         """T50: SSE 流式 discover — 每页/失败/done 一个 event.
         T55: 持久化到 Event Bus + Last-Event-ID 续传.
@@ -3597,17 +3754,8 @@ class TransparentBrowserDaemon:
             except Exception:
                 pass
 
-
-def _topic_matches_pattern(pattern: str, topic: str) -> bool:
-    """T59 helper: pattern can be 'system.*' or exact 'system.pressure' or '*'."""
-    if pattern == "*":
-        return True
-    if pattern == topic:
-        return True
-    if pattern.endswith(".*"):
-        return topic.startswith(pattern[:-1])
-    return False
-
+    # ── T67 fix: 之前是 orphan methods (缩进错, 被 AST 当成 _topic_matches_pattern 的嵌套) ──
+    # 现在移到类内, /llm/slice /llm/summarize /llm/extract /llm/find-ref 端点实际可用
     async def _llm_slice(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import slice_refs_for_goal, get_default_service
         from semantic_browser.snapshot.engine import SnapshotEngine
@@ -3657,6 +3805,154 @@ def _topic_matches_pattern(pattern: str, topic: str) -> bool:
             tier=args.get("tier", "cheap"),
         )
         return {"ref": ref}
+
+    def _stream_semantic_query(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
+        """T67+ T68: SSE 流式 /v1/query — 每 phase 一个 event.
+
+        Event 格式 (JSON 一行):
+          data: {"type":"start", "query": "...", ...}
+          data: {"type":"phase", "phase":"plan_start|plan_done|browse_done|relevance_done|synth_done|...", ...}
+          data: {"type":"final", "answer": {...完整 SemanticAnswer.to_dict()...}}
+        """
+        import json as _json
+        from semantic_browser.query import SemanticQuery
+
+        query_text = (args.get("query") or args.get("goal") or "").strip()
+        if not query_text:
+            req.send_response(400)
+            req.send_header("content-type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": false, "error": {"code": "MISSING_PARAM", "message": "query is required"}}')
+            return
+
+        budget = args.get("budget")
+        max_pages = args.get("max_pages")
+        try:
+            budget_int = int(budget) if budget is not None else None
+            max_pages_int = int(max_pages) if max_pages is not None else None
+        except (TypeError, ValueError):
+            req.send_response(400)
+            req.send_header("content-type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": false, "error": {"code": "INVALID_PARAM"}}')
+            return
+        # T70.15: 跟 SemanticQuery.__init__ 一致 — budget >= 1, max_pages >= 0
+        if budget_int is not None and budget_int < 1:
+            budget_int = 1   # daemon 兜底, 不让 client 错传导致崩溃
+        if max_pages_int is not None:
+            if max_pages_int < 0:
+                max_pages_int = 1   # 同上兜底
+            if max_pages_int > 5:
+                max_pages_int = 5   # daemon 上限, 防滥用
+
+        req.send_response(200)
+        req.send_header("content-type", "text/event-stream; charset=utf-8")
+        req.send_header("cache-control", "no-cache")
+        req.send_header("x-accel-buffering", "no")
+        req.send_header("connection", "keep-alive")
+        req.end_headers()
+
+        # write start frame (T70.10: 加 request_id 让 client 关联 events)
+        start_entry = {
+            "type": "start",
+            "query": query_text,
+            "budget": budget_int,
+            "max_pages": max_pages_int,
+            "request_id": _new_request_id(),
+        }
+        req.wfile.write(b"data: " + _json.dumps(start_entry, ensure_ascii=False).encode("utf-8") + b"\n\n")
+        try:
+            req.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        # bridge queue (thread-safe; thread from HTTP handler → asyncio loop)
+        event_queue: queue.Queue = queue.Queue(maxsize=256)
+        loop_ref = self.owner.loop
+
+        def push_phase(entry: dict) -> None:
+            """sync callback from SemanticQuery._record_step (在 asyncio loop 里执行)."""
+            try:
+                event_queue.put_nowait(entry)
+            except queue.Full:
+                logger.warning("/v1/query/stream queue full, drop")
+
+        async def run_query() -> None:
+            try:
+                # T69+: 用 daemon-wide 共享实例 (cache 跨请求命中)
+                own_sq = self._semantic_query is None
+                sq = self._semantic_query if self._semantic_query is not None else SemanticQuery(on_phase=push_phase)
+                try:
+                    answer = await sq.run(
+                        query_text,
+                        start_url=args.get("start_url") or None,
+                        budget=budget_int,
+                        max_pages=max_pages_int,
+                    )
+                    event_queue.put_nowait({"type": "_final", "answer": answer.to_dict()})
+                finally:
+                    # 仅在 own_sq 时关 (避免关掉 daemon-wide 实例)
+                    if own_sq:
+                        try:
+                            await sq.close()
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.exception("/v1/query/stream failed")
+                event_queue.put_nowait({"type": "_final", "answer": {"_error": f"{type(e).__name__}: {e}"}})
+
+        # schedule run_query on the daemon's loop
+        future = asyncio.run_coroutine_threadsafe(run_query(), loop_ref)
+
+        # pump events from queue to SSE stream until "_final"
+        try:
+            seq = 0
+            while True:
+                try:
+                    entry = event_queue.get(timeout=30)
+                except queue.Empty:
+                    # keepalive
+                    try:
+                        req.wfile.write(b": keepalive\n\n")
+                        req.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        future.cancel()
+                        return
+                    continue
+                seq += 1
+                if entry.get("type") == "_final":
+                    # final event — include answer
+                    final = {"type": "final", **entry}
+                    frame = (b"id: " + str(seq).encode("utf-8") + b"\n"
+                             + b"data: " + _json.dumps(final, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                else:
+                    entry_with_type = {"type": "phase", **entry}
+                    frame = (b"id: " + str(seq).encode("utf-8") + b"\n"
+                             + b"data: " + _json.dumps(entry_with_type, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                try:
+                    req.wfile.write(frame)
+                    req.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    future.cancel()
+                    return
+                if entry.get("type") == "_final":
+                    return
+        finally:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+
+
+def _topic_matches_pattern(pattern: str, topic: str) -> bool:
+    """T59 helper: pattern can be 'system.*' or exact 'system.pressure' or '*'."""
+    if pattern == "*":
+        return True
+    if pattern == topic:
+        return True
+    if pattern.endswith(".*"):
+        return topic.startswith(pattern[:-1])
+    return False
 
 
 def main(argv: list[str] | None = None) -> None:

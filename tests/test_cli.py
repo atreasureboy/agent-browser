@@ -38,6 +38,8 @@ class TestCLIRegistration:
         ("crawl", ["--max-pages", "--max-depth", "--no-same-domain"]),
         ("interactive", ["URL", "--no-headless"]),
         ("login", ["--state"]),
+        # T70.1: query 命令的 cache 相关 flag
+        ("query", ["--cache-persist-path", "--clear-cache", "--verbose"]),
     ])
     def test_command_help(self, cmd, help_contains):
         result = self.runner.invoke(cli, [cmd, "--help"])

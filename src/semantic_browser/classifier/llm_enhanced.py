@@ -82,7 +82,13 @@ class LLMEnhancedClassifier:
             or "https://api.openai.com/v1"
         )
         self._api_key = os.getenv("OPENAI_API_KEY", "")
-        self._llm_available = bool(self._api_key) and bool(self._base_url) and bool(self.model)
+        # 也认 Claude Code 风格的 ANTHROPIC_* (让 anthropic provider 也走 LLMService)
+        self._anthropic_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+        self._anthropic_base = os.getenv("ANTHROPIC_BASE_URL", "")
+        self._llm_available = (
+            (bool(self._api_key) and bool(self._base_url) and bool(self.model))
+            or (bool(self._anthropic_key) and bool(self._anthropic_base))
+        )
 
     async def classify(self, snapshot: PageSnapshot, *,
                        re_raise_on_failure: bool = False) -> ClassificationResult:
@@ -142,20 +148,45 @@ class LLMEnhancedClassifier:
         return heuristic_result
 
     async def _llm_classify(self, snapshot: PageSnapshot) -> Optional[ClassificationResult]:
-        """调用 LLM 进行分类。"""
+        """调用 LLM 进行分类。
+
+        优先用 LLMService (auto-detect provider, 支持 anthropic / openai / gemini / ollama);
+        失败回落到直连 OpenAI-compat endpoint 保持向后兼容 (老的 OPENAI_* 单独设置仍能工作).
+        """
+        from semantic_browser.llm import LLMService  # 避免循环 import
+
         user_prompt = self._build_prompt(snapshot)
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Path A: LLMService (走 anthropic/openai/gemini/ollama 全 provider 路由)
+        try:
+            svc = LLMService(timeout=self.timeout)
+            if svc.is_available():
+                # 显式 model 优先, 否则用 service 解析出来的 cheap tier
+                if self.model and not os.getenv("LLM_MODEL_CHEAP"):
+                    svc.model_cheap = self.model
+                result = await svc.complete_json(
+                    messages, tier="cheap",
+                    temperature=0.1, max_tokens=500,
+                )
+                return self._parse_result(result)
+        except Exception as e:
+            logger.warning("LLMService path failed: %s; trying direct OpenAI-compat", e)
+
+        # Path B: 直连 OpenAI-compat (legacy 路径, 老的 OPENAI_* 单独配置还能用)
+        if not (self._api_key and self._base_url and self.model):
+            return None
 
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._api_key}",
         }
-
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
             "temperature": 0.1,
             "max_tokens": 300,
         }
@@ -170,29 +201,29 @@ class LLMEnhancedClassifier:
             data = resp.json()
 
         content = data["choices"][0]["message"]["content"].strip()
-        # 尝试提取 JSON（LLM 可能包裹在 markdown 代码块里）
+        return self._parse_content(content)
+
+    def _parse_result(self, result: dict) -> "ClassificationResult":
+        """从已 parse 的 JSON dict 构造 ClassificationResult."""
+        page_type = result.get("page_type", "unknown").lower().strip()
+        if page_type not in VALID_TYPES:
+            page_type = "unknown"
+        confidence = float(result.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+        return ClassificationResult(
+            page_type=page_type,
+            confidence=confidence,
+            reason=result.get("reason", "LLM classified"),
+            signals=["llm_enhanced"],
+        )
+
+    def _parse_content(self, content: str) -> "ClassificationResult":
+        """从 LLM 原始文本里剥 markdown 包裹 + parse JSON + 构造结果."""
         if "```" in content:
             match = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
             if match:
                 content = match.group(1).strip()
-
-        result = json.loads(content)
-
-        page_type = result.get("page_type", "unknown").lower().strip()
-        if page_type not in VALID_TYPES:
-            page_type = "unknown"
-
-        confidence = float(result.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-
-        reason = result.get("reason", "LLM classified")
-
-        return ClassificationResult(
-            page_type=page_type,
-            confidence=confidence,
-            reason=reason,
-            signals=["llm_enhanced"],
-        )
+        return self._parse_result(json.loads(content))
 
     def _build_prompt(self, snapshot: PageSnapshot) -> str:
         """构建给 LLM 的 prompt。"""

@@ -66,11 +66,17 @@ def build_provider(
             timeout=timeout,
         )
     if name == "anthropic":
+        # Claude Code 用 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL (不是 ANTHROPIC_API_KEY);
+        # 兼容 Claude Code 客户端配置. 也读 LLM_* 作通用兜底.
         return AnthropicProvider(
             api_key=(api_key if api_key is not None
-                     else (os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY", ""))),
+                     else (os.getenv("LLM_API_KEY")
+                           or os.getenv("ANTHROPIC_API_KEY")
+                           or os.getenv("ANTHROPIC_AUTH_TOKEN", ""))),
             base_url=(base_url if base_url is not None
-                      else (os.getenv("LLM_BASE_URL") or "https://api.anthropic.com")),
+                      else (os.getenv("LLM_BASE_URL")
+                            or os.getenv("ANTHROPIC_BASE_URL")
+                            or "https://api.anthropic.com")),
             timeout=timeout,
         )
     if name == "gemini":

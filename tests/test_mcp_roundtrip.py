@@ -36,6 +36,10 @@ from semantic_browser.mcp_server.server import (
 _LLM_DRIVEN = frozenset({
     "sb_agent_run", "sb_agent_plan", "sb_discover",
     "sb_snapshot_vision", "sb_safety_check",
+    # T67+T70: 需要 M3 + Chromium — 单测无法跑, 跳过 roundtrip 测试
+    "sb_query",
+    # T70.2: 需要 SemanticQuery 实例 (会调 LLMService.is_available), 跳过
+    "sb_query_stats", "sb_query_clear_cache",
 })
 
 # 每个非 LLM 工具的最小合法 args (按 inputSchema 必填)

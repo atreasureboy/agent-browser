@@ -318,7 +318,9 @@ def test_ollama_provider_uses_default_localhost_base():
 
 # ── LLMService 集成 (provider 路由) ─────────────────────────
 
-def test_llm_service_selects_provider_explicit():
+def test_llm_service_selects_provider_explicit(monkeypatch):
+    # 屏蔽 ANTHROPIC_MODEL 兜底, 走 default_model_for 的 claude 默认
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     from semantic_browser.llm import LLMService
     from semantic_browser.llm.providers import AnthropicProvider
     svc = LLMService(provider="anthropic", api_key="x")

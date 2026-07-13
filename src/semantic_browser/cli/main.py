@@ -459,6 +459,84 @@ def find(url, keyword, max_results, json_out, llm):
     _run_async(_run())
 
 
+@cli.command("query")
+@click.argument("query")
+@click.option("--start-url", default=None, help="入口 URL (省略时仅返回 plan)")
+@click.option("--budget", type=int, default=None, help="LLM token 预算 (默认 2000)")
+@click.option("--max-pages", type=int, default=None, help="最大浏览页数 (默认 1)")
+@click.option("--cache-persist-path", default=None,
+              help="持久化 cache 路径 (跨 sb query 调用复用)")
+@click.option("--clear-cache", is_flag=True, help="清空 cache 后再跑")
+@click.option("--json-out", is_flag=True, help="输出结构化 JSON")
+@click.option("--quiet", "-q", is_flag=True, help="只输出最终 answer markdown")
+@click.option("--verbose", "-v", is_flag=True, help="显示 cache stats + steps 详情")
+def semantic_query(query, start_url, budget, max_pages, cache_persist_path, clear_cache, json_out, quiet, verbose):
+    """Model-driven semantic query: 自然语言问题 → M3 驱动浏览 → 紧凑答案.
+
+    这是"模型驱动的浏览器语义层"的顶层入口. 顶层 agent 用一次调用获取:
+    - markdown 精炼答案 (≤ max_chars)
+    - sources URL 列表
+    - confidence (M3 自评)
+    - tokens_used (透明披露)
+    - 二次调用命中 cache → 0 token 消耗 (跨进程可用 --cache-persist-path)
+
+    示例:
+        sb query "找到 GitHub 关于 PEP 703 的最新讨论并给我 3 个观点" \\
+                --start-url https://github.com/python/peps
+
+        sb query "Python 3.13 features" \\
+                --start-url https://docs.python.org/3/whatsnew/3.13.html \\
+                --cache-persist-path /tmp/my_cache.json \\
+                --verbose  # 显示 cache stats + steps
+    """
+    async def _run():
+        from semantic_browser.query import SemanticQuery
+        sq = SemanticQuery(
+            budget=budget or SemanticQuery.DEFAULT_BUDGET,
+            max_pages=max_pages if max_pages is not None else SemanticQuery.DEFAULT_MAX_PAGES,
+            cache_persist_path=cache_persist_path,
+        )
+        try:
+            if clear_cache:
+                cleared = sq.clear_cache()
+                if verbose:
+                    click.echo(f"[cache cleared: {cleared['cleared']} entries]", err=True)
+            result = await sq.run(query, start_url=start_url)
+            if json_out:
+                _emit_json(result.to_dict())
+            elif quiet:
+                click.echo(result.answer)
+            else:
+                # 可读视图
+                click.echo("=" * 60)
+                click.echo(f"Query: {query}")
+                click.echo("=" * 60)
+                click.echo(result.answer)
+                click.echo("-" * 60)
+                tu = result.tokens_used or {}
+                click.echo(
+                    f"[confidence={result.confidence:.2f}  "
+                    f"tokens={tu.get('used', {}).get('total', 0)}/{tu.get('max_total', 0)}  "
+                    f"sources={len(result.sources)}  "
+                    f"success={result.success}]"
+                )
+                # T70: cache hit 标注
+                if tu.get('cache_hit'):
+                    click.echo(f"[cache_hit=True age={tu.get('cache_age_s')}s]")
+                # T70: --verbose 显示 cache stats + 步骤 phase 详情
+                if verbose:
+                    click.echo(f"[cache_stats: {sq.cache_stats()}]", err=True)
+                    if result.steps:
+                        phases = [s.get('phase') for s in result.steps if s.get('phase')]
+                        click.echo(f"[step phases: {phases}]", err=True)
+                elif result.steps:
+                    click.echo(f"[steps={len(result.steps)} see --json-out for detail]")
+        finally:
+            await sq.close()
+
+    _run_async(_run())
+
+
 @cli.command()
 @click.argument("url")
 @click.argument("keyword")

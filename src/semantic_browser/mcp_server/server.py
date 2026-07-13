@@ -66,6 +66,20 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "sb_graph", "description": "从记忆库构建站点拓扑图。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
     {"name": "sb_history", "description": "返回访问历史；可按 domain 过滤。", "inputSchema": _schema({"domain": {"type": "string"}})},
     {"name": "sb_stats", "description": "返回记忆库统计。", "inputSchema": _schema({})},
+    # T67: semantic query — 顶层 agent 直接调, M3 驱动浏览 + 精炼
+    {"name": "sb_query", "description": "Model-driven semantic query: 自然语言问题 → M3 驱动浏览 → 紧凑 markdown 答案. 这是 '模型驱动的浏览器语义层' 的顶层入口.",
+     "inputSchema": _schema({
+         "query": {"type": "string", "description": "自然语言问题"},
+         "start_url": {"type": "string", "description": "入口 URL; 省略时仅返 plan"},
+         "budget": {"type": "integer", "description": "LLM token 预算 (默认 2000)"},
+         "max_pages": {"type": "integer", "description": "最大浏览页数 (默认 1)"},
+     }, ["query"])},
+    # T70.2: query 缓存状态 — 监控工具 (Claude Desktop 等能查)
+    {"name": "sb_query_stats", "description": "返回 SemanticQuery 缓存状态 + 命中率 (监控 cache 有效性).",
+     "inputSchema": _schema({})},
+    # T70.2: query 缓存清空 — 运维工具
+    {"name": "sb_query_clear_cache", "description": "清空 SemanticQuery 内存缓存. 用于强制刷新或测试.",
+     "inputSchema": _schema({})},
     # T37: 高级 agent 工具 — 让 MCP 客户端 (Claude Desktop 等) 直接用 agent 能力
     {"name": "sb_agent_run", "description": "LLM-driven autonomous loop: 给个 goal, agent 自主完成.",
      "inputSchema": _schema({"goal": {"type": "string"},
@@ -216,6 +230,8 @@ class MCPServer:
         self._engine = engine
         # T57: daemon_url 不传时读 env — 让 Claude Desktop config 设环境变量就能切 daemon
         self._daemon_url = daemon_url or os.environ.get(DAEMON_URL_ENV)
+        # T70.12: shared SemanticQuery instance for MCP (cache cross-MCP-call)
+        self._shared_sq = None
         if self._daemon_url:
             logger.info("MCPServer routing daemon-level tools to %s", self._daemon_url)
 
@@ -405,6 +421,36 @@ class MCPServer:
             return {"pages": pages, "count": len(pages)}
         if name == "sb_stats":
             return self._ensure_engine().get_memory_stats()
+        # T67: semantic query — 顶层 agent 直接调; M3 驱动浏览 → 紧凑答案
+        if name == "sb_query":
+            from semantic_browser.query import SemanticQuery
+            sq = SemanticQuery()
+            try:
+                answer = await sq.run(
+                    query=args["query"],
+                    start_url=args.get("start_url") or None,
+                    budget=args.get("budget"),
+                    max_pages=args.get("max_pages"),
+                )
+                return answer.to_dict()
+            finally:
+                try:
+                    await sq.close()
+                except Exception:
+                    pass
+        # T70.2: query 缓存状态 — 监控
+        if name == "sb_query_stats":
+            # T70.12: 用 MCP server 进程级 shared SemanticQuery (cache 跨调用)
+            if self._shared_sq is None:
+                from semantic_browser.query import SemanticQuery
+                self._shared_sq = SemanticQuery()
+            return self._shared_sq.cache_stats()
+        # T70.2: query 缓存清空 — 运维
+        if name == "sb_query_clear_cache":
+            if self._shared_sq is None:
+                from semantic_browser.query import SemanticQuery
+                self._shared_sq = SemanticQuery()
+            return self._shared_sq.clear_cache()
         # T37: 高级 agent 工具
         if name == "sb_agent_run":
             from semantic_browser.agent import GoalAgent

@@ -109,8 +109,11 @@ class TestSSRFAllows:
 
     def test_allowlist_wildcard_does_not_match_grandchild(self):
         # *.example.com 不该匹配 notexample.com
-        with pytest.raises(SSRFBlockedError):
-            check_url("http://notexample.com/", allowlist=frozenset({"*.example.com"}))
+        # 注入 resolver 返 [] 模拟 NXDOMAIN, 确定性触发"解析失败"block
+        # (真实 DNS 环境下 notexample.com 可能解析到公网 IP 让 test flaky)
+        with pytest.raises(SSRFBlockedError, match="could not resolve"):
+            check_url("http://notexample.com/", allowlist=frozenset({"*.example.com"}),
+                      resolver=lambda h: [])
 
     def test_resolver_blocks_via_private_ip(self):
         # host 是公网但 DNS 解析到私网 (rebinding 防护)

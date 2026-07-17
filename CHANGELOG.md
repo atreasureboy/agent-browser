@@ -1,3 +1,24 @@
+## T80+T81+T82 — MCP query_log + Prometheus metrics + op_lock 改造
+
+**T80**: MCP 暴露 query log
+- `sb_query_log` (proxy 到 daemon /v1/query/log)
+- `sb_query_log_clear` (本地兜底)
+
+**T81**: Prometheus metrics 加 query-specific series
+- `tb_query_cache_hits_total / tb_query_cache_misses_total` (counter)
+- `tb_query_tokens_used_total` (counter, 累计 token)
+- `tb_query_duration_seconds` (histogram)
+- `tb_query_confidence` (histogram)
+- 暴露在现有 `/metrics` endpoint, 自动 Prometheus 格式
+
+**T82**: daemon op_lock 改造
+- `/v1/query` + `/v1/query/stream` 不再持 op_lock (用 _query_semaphore 限流)
+- 实测: 2 concurrent /v1/query 都成功 (之前 503)
+- `_NO_LOCK_PATHS` 加 /v1/query/log, /v1/query/cache/clear, /v1/query/stats
+- 这是 T51 设计的粗粒度 op_lock 替换为细粒度 semaphore 的关键一步
+
+**Tests**: 65 MCP roundtrip + 159 unit + 5 fallback + T79 correctness 全过
+
 ## T77 + T78 + T79 — 框架集成 + 部署验证 + 答案正确性
 
 **T77**: LangChain adapter — `src/semantic_browser/integrations/langchain_adapter.py`

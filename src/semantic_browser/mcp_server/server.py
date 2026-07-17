@@ -17,6 +17,13 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
+try:
+    import httpx  # T80: daemon proxy
+    HAS_HTTPX = True
+except ImportError:
+    httpx = None
+    HAS_HTTPX = False
 from typing import Any, Optional
 
 from semantic_browser.engine import SemanticBrowser
@@ -79,6 +86,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
      "inputSchema": _schema({})},
     # T70.2: query 缓存清空 — 运维工具
     {"name": "sb_query_clear_cache", "description": "清空 SemanticQuery 内存缓存. 用于强制刷新或测试.",
+     "inputSchema": _schema({})},
+    # T80: query_log 监控 — 看最近 N 条 query 元数据
+    {"name": "sb_query_log", "description": "返回 daemon 最近 N 条 query log (audit/debug/metrics).",
+     "inputSchema": _schema({
+         "limit": {"type": "integer", "description": "返回条数 (1-100, 默认 50)"},
+     })},
+    # T80: clear log (运维)
+    {"name": "sb_query_log_clear", "description": "清空 query log (不影响 cache, 只清 audit log).",
      "inputSchema": _schema({})},
     # T37: 高级 agent 工具 — 让 MCP 客户端 (Claude Desktop 等) 直接用 agent 能力
     {"name": "sb_agent_run", "description": "LLM-driven autonomous loop: 给个 goal, agent 自主完成.",
@@ -451,6 +466,25 @@ class MCPServer:
                 from semantic_browser.query import SemanticQuery
                 self._shared_sq = SemanticQuery()
             return self._shared_sq.clear_cache()
+        # T80: query log 监控 — 通过 daemon HTTP 代理 (若 daemon_url 设了)
+        if name == "sb_query_log":
+            if self._daemon_url:
+                # 走 daemon HTTP 拿 (共享 cache, 真生产数据)
+                limit = args.get("limit", 50)
+                if not HAS_HTTPX:
+                    return {"_error": "httpx not installed"}
+                try:
+                    with httpx.Client(timeout=5) as cli:
+                        r = cli.get(f"{self._daemon_url}/v1/query/log", params={"limit": limit})
+                    return r.json()
+                except Exception as e:
+                    return {"_error": f"daemon unreachable: {e}"}
+            # 无 daemon: 返空 list
+            return {"limit": limit, "count": 0, "entries": [],
+                    "note": "MCP server 没连 daemon (sb_query_log 需要 daemon_url); 用 sb_query_stats 看本地 cache"}
+        # T80: clear log (本地) — 真的只是 MCP 本地 log, 大概率是空
+        if name == "sb_query_log_clear":
+            return {"cleared": 0, "note": "MCP server 本地无 query log; daemon log 通过 sb_query_log (需 daemon_url) 读"}
         # T37: 高级 agent 工具
         if name == "sb_agent_run":
             from semantic_browser.agent import GoalAgent

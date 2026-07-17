@@ -40,6 +40,8 @@ _LLM_DRIVEN = frozenset({
     "sb_query",
     # T70.2: 需要 SemanticQuery 实例 (会调 LLMService.is_available), 跳过
     "sb_query_stats", "sb_query_clear_cache",
+    # T80: query log 监控 — daemon proxy (无 daemon_url 时降级, 不需要 LLM)
+    "sb_query_log", "sb_query_log_clear",
 })
 
 # 每个非 LLM 工具的最小合法 args (按 inputSchema 必填)

@@ -25,18 +25,26 @@ def detect_provider(env: Optional[dict[str, str]] = None) -> str:
 
     优先级:
       1. LLM_PROVIDER 显式
-      2. 看哪个 API key 存在 (LLM_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)
+      2. 看哪个 API key/base URL 存在:
+         - ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN → anthropic
+         - GEMINI_API_KEY / GOOGLE_API_KEY → gemini
+         - LLM_API_KEY + LLM_BASE_URL → openai
       3. fallback openai-compat (默认 DeepSeek)
+
+    兼容 Claude Code 命名: ANTHROPIC_AUTH_TOKEN 跟 ANTHROPIC_API_KEY 等价.
     """
     env = env or os.environ
     explicit = env.get("LLM_PROVIDER", "").strip().lower()
     if explicit in PROVIDER_NAMES:
         return explicit
-    if env.get("ANTHROPIC_API_KEY"):
+    # T86: 兼容 Claude Code 的 ANTHROPIC_AUTH_TOKEN 命名
+    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
         return "anthropic"
     if env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY"):
         return "gemini"
-    if env.get("LLM_BASE_URL", "").lower().endswith(":11434/v1"):
+    # Ollama 默认端口检测
+    if (env.get("LLM_BASE_URL", "").lower().endswith(":11434/v1")
+            or env.get("ANTHROPIC_BASE_URL", "").lower().endswith(":11434/v1")):
         return "ollama"
     return "openai"
 

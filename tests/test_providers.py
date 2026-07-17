@@ -82,10 +82,25 @@ def test_detect_provider_from_anthropic_key(monkeypatch):
     assert detect_provider() == "anthropic"
 
 
+def test_detect_provider_anthropic_via_auth_token(monkeypatch):
+    """T86: Claude Code 用 ANTHROPIC_AUTH_TOKEN (非标准 ANTHROPIC_API_KEY),
+    detect_provider 必须也能识别."""
+    from semantic_browser.llm.providers import detect_provider
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "fake-claude-code-token")
+    assert detect_provider() == "anthropic"
+
+
 def test_detect_provider_from_gemini_key(monkeypatch):
     from semantic_browser.llm.providers import detect_provider
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     assert detect_provider() == "gemini"
 
@@ -94,6 +109,8 @@ def test_detect_provider_ollama_via_base_url(monkeypatch):
     from semantic_browser.llm.providers import detect_provider
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
@@ -104,6 +121,8 @@ def test_detect_provider_fallback_openai(monkeypatch):
     from semantic_browser.llm.providers import detect_provider
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BASE_URL", raising=False)

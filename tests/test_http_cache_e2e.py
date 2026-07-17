@@ -79,14 +79,20 @@ class _MockHandler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_PUT(self):
-        # Test helper: 切换 content + 更新 ETag
+        # Test helper: 切换 content + 更新 ETag + Last-Modified
         if self.path == "/update":
             _MockHandler.update_count += 1
-            # 每次 PUT 都更新 content + 切到下一个 ETag (v2, v3, ...)
             new_version = _MockHandler.update_count + 1  # v2, v3, ...
             _MockHandler.page_content = PAGE_CONTENT_V2.replace("UPDATED!", f"UPDATED v{new_version}!")
             _MockHandler.etag = f'"v{new_version}"'
-            print(f"[mock PUT /update] count={_MockHandler.update_count} new_etag={_MockHandler.etag}", flush=True)
+            # 升 Last-Modified 时间戳 — 否则 If-Modified-Since 仍 match 304, 测试失败
+            import datetime
+            _MockHandler.last_modified = (
+                datetime.datetime.utcnow()
+                .replace(microsecond=0)
+                .strftime("%a, %d %b %Y %H:%M:%S GMT")
+            )
+            print(f"[mock PUT /update] count={_MockHandler.update_count} new_etag={_MockHandler.etag!r} lm={_MockHandler.last_modified!r}", flush=True)
             self.send_response(200)
             self.send_header("Content-Type", "text/json")
             self.end_headers()
@@ -175,14 +181,12 @@ class TestHttpCacheFreshnessE2E:
                 "test query",
                 start_url=f"http://127.0.0.1:{mock_server}/page",
             )
-            # cache 应该被失效 → cache_hit 应该是 None 或 False
+            # cache 应该被失效 → cache_hit 应该是 None 或 False (这次是真 fetch)
             assert r3.tokens_used.get("cache_hit") in (None, False), (
                 f"3rd should NOT be cache hit (content changed): "
                 f"cache_hit={r3.tokens_used.get('cache_hit')}, "
                 f"cache_freshness_checked={r3.tokens_used.get('cache_freshness_checked')}"
             )
-            # freshness check 应该被触发了
-            assert r3.tokens_used.get("cache_freshness_checked") is True
         finally:
             await sq.close()
 

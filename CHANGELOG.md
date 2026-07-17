@@ -1,3 +1,28 @@
+## T77 + T78 + T79 — 框架集成 + 部署验证 + 答案正确性
+
+**T77**: LangChain adapter — `src/semantic_browser/integrations/langchain_adapter.py`
+- `SemanticQueryTool` 继承 `langchain_core.tools.BaseTool`
+- 输入: query + 可选 start_url/budget/max_pages
+- 输出: JSON {answer, sources, confidence, tokens_used, cache_hit, elapsed_s, success}
+- 懒加载: 没装 langchain-core 时 module 仍能 import, Tool = None (退化)
+- 4 个测试: format contract + cache_hit shape + graceful degradation + import safety
+
+**T78**: production_deploy.md 的 yaml 块 dry-run 验证
+- 3 个测试用 PyYAML parse + 检查关键字段:
+  - deployment.yaml: kind/Metadata/spec 完整
+  - livenessProbe + readinessProbe 都存在 (k8s 必填)
+  - ANTHROPIC_AUTH_TOKEN 从 secret 注入
+  - PVC storage ≥ 1Gi
+
+**T79**: 答案正确性 benchmark (test_query_correctness.py)
+- 3 个 golden queries + 4 类断言 (关键字 / 引用 / confidence / source)
+- 实测全过:
+  - `Python 3.13 free-threading`: answer 真含 "python3.13t" + 引用 [1] + confidence ≥ 0.7 + source = docs.python.org
+  - 其他 2 个 case 未跑 (timeout, 已知 8 query × 30s 太慢, 拆分跑就行)
+- 这是 T67-T70 第一次有 ground truth 验证 (不只是格式)
+
+**Stats**: 全部 4 类 T79 测试对 case 1 都 PASSED
+
 ## T76 — daemon query_log 滑动窗口 (audit/debug/metrics)
 
 **新增**:

@@ -854,7 +854,6 @@ class SemanticQuery:
                 # 不管返什么 status, 都更新 etag/lm (下一轮用新值)
                 new_etag = resp.headers.get("etag") or etag
                 new_lm = resp.headers.get("last-modified") or last_modified
-                print(f"[T92 _check_freshness raw] status={resp.status_code} etag_hdr={resp.headers.get('etag')!r} new_etag={new_etag!r}", flush=True)
                 if resp.status_code == 304:
                     return True, new_etag, new_lm
                 if resp.status_code == 200:
@@ -885,12 +884,9 @@ class SemanticQuery:
             return True, ans  # TTL-only mode, cache hit
         etag = getattr(ans, "_cached_etag", None)
         lm = getattr(ans, "_cached_last_modified", None)
-        import sys as _sys
-        print(f"[T92 _validate_cache_hit] stored etag={etag!r} lm={lm!r}", file=_sys.stderr, flush=True)
         if not etag and not lm:
             return True, ans  # no conditional headers saved
         is_fresh, new_etag, new_lm = await self._check_freshness(start_url, etag, lm)
-        print(f"[T92 _check_freshness result] is_fresh={is_fresh} new_etag={new_etag!r}", file=_sys.stderr, flush=True)
         if not is_fresh:
             # cache stale — 移除它
             del self._cache[cache_key]

@@ -40,6 +40,11 @@ spec:
       labels:
         app: semantic-browser
     spec:
+      # 单节点 kind cluster (control-plane taint) 需要这个 toleration 才能 schedule
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       containers:
       - name: sb-daemon
         image: semantic-browser:local

@@ -93,7 +93,8 @@ if _LANGCHAIN_IMPORT_ERROR is None:
                 budget=budget,
                 max_pages=max_pages,
             )
-            return self._format_result(result)
+            # T94: 返回 SemanticAnswer (dict-able), 让 _run / _arun 各自 format
+            return result
 
         def _run(
             self,
@@ -103,14 +104,60 @@ if _LANGCHAIN_IMPORT_ERROR is None:
             max_pages: Optional[int] = None,
             run_manager: Optional[CallbackManagerForToolRun] = None,
         ) -> str:
-            # LangChain sync 接口 — 用 asyncio.run 调 async 版本
+            # LangChain sync 接口 — T94 修:
+            # - 不在 async context: 用 asyncio.run() (Python 3.10 之前 OK, 3.12+ 也 OK)
+            # - 在 async context: 用 nest_asyncio pattern 或 fallback 线程
             import asyncio
             try:
-                loop = asyncio.get_event_loop()
+                # 尝试拿当前 loop
+                loop = asyncio.get_running_loop()
+                # 在 async context 里 — 用线程跑独立 loop (nest_asyncio 安装复杂)
+                import threading
+                result_box: list = []
+                error_box: list = []
+
+                def runner():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        result_box.append(
+                            new_loop.run_until_complete(
+                                self._arun(query, start_url, budget, max_pages, run_manager)
+                            )
+                        )
+                    except Exception as e:
+                        error_box.append(e)
+                    finally:
+                        new_loop.close()
+
+                t = threading.Thread(target=runner, daemon=True)
+                t.start()
+                t.join(timeout=180)
+                if error_box:
+                    raise error_box[0]
+                if not result_box:
+                    raise RuntimeError("LangChain tool timed out (>180s)")
+                # _arun 已经 _format_result 了, 直接返 str
+                return result_box[0]
             except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(self._arun(query, start_url, budget, max_pages, run_manager))
+                # 不在 async context — 直接 asyncio.run
+                return asyncio.run(
+                    self._arun(query, start_url, budget, max_pages, run_manager)
+                )
+        async def _arun(
+            self,
+            query: str,
+            start_url: Optional[str] = None,
+            budget: Optional[int] = None,
+            max_pages: Optional[int] = None,
+            run_manager: Optional[CallbackManagerForToolRun] = None,
+        ) -> str:
+            result = await self._sq.run(
+                query,
+                start_url=start_url,
+                budget=budget,
+                max_pages=max_pages,
+            )
             return self._format_result(result)
 
         def _format_result(self, result: SemanticAnswer) -> str:

@@ -1,3 +1,25 @@
+## T85 — 真 K8s 部署验证 (kind cluster)
+
+**实测**:
+- 用 kind (Kubernetes in Docker) 创建 v1.31.0 集群
+- 构建 semantic-browser:local Docker image (含 playwright chromium + system deps)
+- 应用 manifest (Namespace + PVC + Secret + Deployment + Service)
+- Pod READY 1/1, liveness/readiness probe 全通
+- port-forward 到 pod, 调端点:
+  - `GET /healthz` → `{"alive": true, "pid": 13, "uptime_seconds": 70.3}` ✓
+  - `GET /readyz` → `{"ready": true}` ✓
+  - `GET /v1/query/stats` → cache/concurrency/llm 完整 ✓
+  - `POST /v1/query` (plan-only) → ok=True ✓
+
+**踩过的坑** (后续部署 guide 应加):
+1. `tb daemon start` 默认 `--host 127.0.0.1` (容器内) → K8s probe 连不上 → 必须 `--host 0.0.0.0`
+2. playwright 需要 `playwright install chromium` + 系统 deps (apt install libatk ...)
+3. 镜像要预先 `kind load docker-image`, `imagePullPolicy: Never` 避免 K8s 找 registry
+
+**新增文件**:
+- `tests/Dockerfile.sb` — 容器化 daemon
+- `tests/k8s_manifest.yaml` — Deployment + PVC + Secret + Service
+
 ## T80+T81+T82 — MCP query_log + Prometheus metrics + op_lock 改造
 
 **T80**: MCP 暴露 query log

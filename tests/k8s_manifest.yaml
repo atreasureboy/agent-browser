@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: semantic-browser
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sb-cache-pvc
+  namespace: semantic-browser
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-secrets
+  namespace: semantic-browser
+type: Opaque
+stringData:
+  ANTHROPIC_AUTH_TOKEN: "sk-test-placeholder-do-not-use-in-production"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: semantic-browser
+  namespace: semantic-browser
+  labels:
+    app: semantic-browser
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: semantic-browser
+  template:
+    metadata:
+      labels:
+        app: semantic-browser
+    spec:
+      containers:
+      - name: sb-daemon
+        image: semantic-browser:local
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8765
+        env:
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llm-secrets
+              key: ANTHROPIC_AUTH_TOKEN
+        - name: ANTHROPIC_BASE_URL
+          value: "https://api.minimax.io/anthropic"
+        - name: ANTHROPIC_MODEL
+          value: "MiniMax-M3"
+        volumeMounts:
+        - name: cache
+          mountPath: /root/.semantic-browser
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8765
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8765
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: cache
+        persistentVolumeClaim:
+          claimName: sb-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: semantic-browser
+  namespace: semantic-browser
+spec:
+  selector:
+    app: semantic-browser
+  ports:
+  - protocol: TCP
+    port: 8765
+    targetPort: 8765

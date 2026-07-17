@@ -438,6 +438,22 @@ class MCPServer:
             return self._ensure_engine().get_memory_stats()
         # T67: semantic query — 顶层 agent 直接调; M3 驱动浏览 → 紧凑答案
         if name == "sb_query":
+            # T84: daemon_url 设了 → 走 daemon HTTP (共享 cache + 多 agent 复用)
+            if self._daemon_url:
+                if not HAS_HTTPX:
+                    return {"_error": "httpx not installed; cannot proxy to daemon"}
+                try:
+                    body = {k: v for k, v in args.items() if v is not None}
+                    async with httpx.AsyncClient(timeout=180) as cli:
+                        r = await cli.post(f"{self._daemon_url}/v1/query", json=body)
+                        data = r.json()
+                    if data.get("ok"):
+                        # daemon 返的是 {request_id, answer: {...}}; 拆出 answer 给 MCP 客户端
+                        return data["data"].get("answer", data["data"])
+                    return {"_error": data.get("error")}
+                except Exception as e:
+                    return {"_error": f"daemon unreachable: {e}"}
+            # 本地路径
             from semantic_browser.query import SemanticQuery
             sq = SemanticQuery()
             try:

@@ -820,7 +820,10 @@ class TransparentBrowserDaemon:
     _NO_LOCK_PATHS = frozenset({
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
         "/admin/drain", "/admin/drain/cancel", "/admin/degrade", "/admin/restore",
-        "/v1/query/log", "/v1/query/cache/clear", "/v1/query/stats",  # T82: query-related 用 semaphore
+        "/v1/query/log", "/v1/query/cache/clear", "/v1/query/stats",
+        # T91: /v1/query 类长操作也走 semaphore 限流, 不再持 op_lock —
+        #      让多 agent 真并发 (op_lock 是粗粒度串行, 长 query 占着会让其他 op 都 503)
+        "/v1/query", "/v1/query/stream",
     })
 
     # T56: 降级检查触发点 — 写 op 在 L3+ 被拒, 全 op 在 L4 被拒
@@ -1146,10 +1149,6 @@ class TransparentBrowserDaemon:
                 path = v1_path
         query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
         needs_lock = path not in self._NO_LOCK_PATHS
-        # T82: /v1/query 类长操作不持 op_lock (用 _query_semaphore 限流) — 让多 agent 真并发
-        #        op_lock 是粗粒度串行, 长 query 占着会让其他 op (read health/stats) 都 503
-        if path in ("/v1/query", "/v1/query/stream"):
-            needs_lock = False
         started_at = _time.time()
         final_status = 200  # 假设成功, 异常分支会改
         final_code = ""     # T52: 失败时的 error.code

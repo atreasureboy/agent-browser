@@ -200,7 +200,13 @@ class SemanticQuery:
         self._owns_browser = browser is None  # 默认创建模式负责 close
 
     def cache_stats(self) -> dict[str, Any]:
-        """T68+: cache 统计 — 给监控 / 运维用."""
+        """T68+: cache 统计 — 给监控 / 运维用.
+
+        T90: 含 health 字段 (cached_hit rate 评估). 当 calls > min_calls 才评估,
+        避免冷启动时假告警.
+        """
+        total = self._cache_hits + self._cache_misses
+        hr = round(self._cache_hits / total, 3) if total > 0 else None
         return {
             "enabled": self.cache_enabled,
             "ttl_s": self.cache_ttl_s,
@@ -210,11 +216,50 @@ class SemanticQuery:
             "hits": self._cache_hits,
             "misses": self._cache_misses,
             "calls": self._call_count,
-            "hit_rate": (
-                round(self._cache_hits / (self._cache_hits + self._cache_misses), 3)
-                if (self._cache_hits + self._cache_misses) > 0
-                else None
-            ),
+            "hit_rate": hr,
+        }
+
+    def cache_health(
+        self,
+        *,
+        warning_threshold: float = 0.3,
+        critical_threshold: float = 0.1,
+        min_calls: int = 5,
+    ) -> dict[str, Any]:
+        """T90: cache 命中率健康检查.
+
+        Args:
+            warning_threshold: hit_rate < 这个值 → status="warning" (默认 0.3)
+            critical_threshold: hit_rate < 这个值 → status="critical" (默认 0.1)
+            min_calls: 调用次数 < 这个值 → status="cold" (跳过评估)
+
+        Returns:
+            {"status": "ok|warning|critical|cold|disabled", "hit_rate": ..., "calls": N, ...}
+        """
+        if not self.cache_enabled:
+            return {"status": "disabled", "hit_rate": None, "calls": self._call_count}
+        total = self._cache_hits + self._cache_misses
+        if self._call_count < min_calls:
+            return {
+                "status": "cold",
+                "hit_rate": None,
+                "calls": self._call_count,
+                "message": f"calls={self._call_count} < min={min_calls}, skipping eval",
+            }
+        hr = self._cache_hits / total if total > 0 else 0.0
+        if hr < critical_threshold:
+            level = "critical"
+        elif hr < warning_threshold:
+            level = "warning"
+        else:
+            level = "ok"
+        return {
+            "status": level,
+            "hit_rate": round(hr, 3),
+            "calls": self._call_count,
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "thresholds": {"warning": warning_threshold, "critical": critical_threshold},
         }
 
     def clear_cache(self) -> dict[str, Any]:

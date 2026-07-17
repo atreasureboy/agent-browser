@@ -3369,9 +3369,12 @@ class TransparentBrowserDaemon:
             llm_stats = {}
         # T69: 共享 SemanticQuery 的 cache_stats 现在是 daemon 进程级
         cache_stats = {}
+        cache_health = {}
         if self._semantic_query is not None:
             try:
                 cache_stats = self._semantic_query.cache_stats()
+                # T90: cache health (warning / critical / ok / cold)
+                cache_health = self._semantic_query.cache_health()
             except Exception:
                 pass
         # T69: 并发 semaphore 状态
@@ -3382,6 +3385,7 @@ class TransparentBrowserDaemon:
         return {
             "llm": llm_stats,
             "cache": cache_stats,
+            "cache_health": cache_health,  # T90: warning/critical/ok/cold/disabled
             "concurrency": semaphore_info,
             "cache_persist_path": getattr(self, '_query_cache_path', None),
             "query_log_summary": {

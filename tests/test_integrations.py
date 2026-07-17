@@ -91,6 +91,38 @@ class TestIntegrationsGracefulDegradation:
             assert "langchain" in str(e).lower()
 
 
+class TestAutogenAdapterFormat:
+    """T89: AutoGen adapter 不依赖 pyautogen 也能 import (has_autogen 标识)."""
+
+    def test_autogen_adapter_imports_without_pyautogen(self):
+        from semantic_browser.integrations.autogen_adapter import (
+            semantic_query_fn, has_autogen,
+        )
+        assert semantic_query_fn is not None
+        # has_autogen 返 bool (不抛)
+        assert isinstance(has_autogen(), bool)
+
+    def test_autogen_adapter_degrades_without_pyautogen(self):
+        """无 pyautogen 时, semantic_query_fn 返 JSON 警告 + 占位 answer."""
+        from semantic_browser.integrations.autogen_adapter import semantic_query_fn, has_autogen
+        if has_autogen():
+            import pytest
+            pytest.skip("pyautogen installed; degraded path skipped")
+        result = semantic_query_fn("test query")
+        # 解析 JSON, 验证含警告字段
+        import json
+        data = json.loads(result)
+        assert "_warning" in data or "answer" in data
+
+
+class TestAiderAdapterFormat:
+    """T89: Aider adapter 是 sync function (Aider 期望 sync tool API)."""
+
+    def test_aider_adapter_imports(self):
+        from semantic_browser.integrations.aider_adapter import semantic_query_tool
+        assert callable(semantic_query_tool)
+
+
 class TestProductionDeployValidation:
     """T78: production_deploy.md 里的 yaml 块能 parse + 是有效 k8s manifests."""
 

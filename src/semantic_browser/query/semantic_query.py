@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import time
+
+import httpx  # T73: at module level so tests can monkeypatch
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -156,6 +158,7 @@ class SemanticQuery:
         cache_ttl_s: float = DEFAULT_CACHE_TTL_S,
         cache_persist_path: Optional[str] = None,  # T68: 持久化到磁盘
         cache_max_size: int = DEFAULT_CACHE_MAX_SIZE,  # T69: 可配置 LRU 上限
+        cache_freshness_check: bool = False,  # T73: opt-in HTTP HEAD/304 检查
         on_phase: "Optional[callable]" = None,  # T67+: async/sync callable(phase_dict)
     ):
         self.llm = llm or LLMService()
@@ -175,6 +178,7 @@ class SemanticQuery:
         self.cache_ttl_s = cache_ttl_s
         self.cache_persist_path = cache_persist_path  # T68
         self.cache_max_size = cache_max_size  # T69
+        self.cache_freshness_check = cache_freshness_check  # T73: opt-in HTTP HEAD 304
         self.on_phase = on_phase  # SSE 流式回调: 每步 (plan / browse / relevance / synth) 触发
 
         # 子模块: 都复用 self.llm
@@ -283,24 +287,26 @@ class SemanticQuery:
             >>> r = await sq.run("Need URL first")  # plan-only
         """
         # Cache 命中检查: 相同 (query, start_url) 在 TTL 内直接复用
+        # T73: opt-in HTTP HEAD 304 检查 (默认关闭 — 多 1 个 round-trip)
         if self.cache_enabled and start_url is not None:
-            cache_key = (query.strip().lower(), start_url)
-            cached = self._cache.get(cache_key)
-            if cached:
-                ts, ans = cached
-                if (time.time() - ts) < self.cache_ttl_s:
-                    logger.info("query cache HIT")
-                    import copy
-                    hit = copy.deepcopy(ans)
-                    hit.tokens_used = {
-                        **hit.tokens_used,
-                        "cache_hit": True,
-                        "cache_age_s": round(time.time() - ts, 1),
-                    }
-                    hit.steps = [{"phase": "cache_hit", "ts": time.time(),
-                                 "original_ts": ts}] if self.include_steps else []
-                    self._cache_hits += 1
-                    return hit
+            cache_fresh, ans = await self._validate_cache_hit(query, start_url)
+            if cache_fresh and ans is not None:
+                logger.info("query cache HIT")
+                import copy
+                hit = copy.deepcopy(ans)
+                # 取 ans 缓存时间 — 在 _validate_cache_hit 里查 cache_key
+                # (为简单起见, 这里再查一次)
+                cache_key = (query.strip().lower(), start_url)
+                cached_ts = self._cache.get(cache_key, (0,))[0] if cache_key in self._cache else 0
+                hit.tokens_used = {
+                    **hit.tokens_used,
+                    "cache_hit": True,
+                    "cache_age_s": round(time.time() - cached_ts, 1),
+                }
+                hit.steps = [{"phase": "cache_hit", "ts": time.time(),
+                             "original_ts": cached_ts}] if self.include_steps else []
+                self._cache_hits += 1
+                return hit
             self._cache_misses += 1
 
         result = SemanticAnswer(query=query)
@@ -689,15 +695,22 @@ class SemanticQuery:
     def _save_cache(self, path) -> None:
         """把内存 cache 序列化到磁盘 (JSON).
 
-        格式: {cache_key_str: {"ts": ..., "answer": {...}}}
-        失败不抛 (持久化是 best-effort).
+        T73: 格式 {cache_key_str: {"ts": ..., "answer": {...}, "etag": ..., "last_modified": ...}}
         """
         try:
             from pathlib import Path
             data = {}
             for (q, url), (ts, ans) in self._cache.items():
                 key = f"{q}|||{url}"
-                data[key] = {"ts": ts, "answer": ans.to_dict()}
+                entry = {"ts": ts, "answer": ans.to_dict()}
+                # T73: 存 ETag/Last-Modified (从 _check_freshness 写入)
+                etag = getattr(ans, "_cached_etag", None)
+                lm = getattr(ans, "_cached_last_modified", None)
+                if etag:
+                    entry["etag"] = etag
+                if lm:
+                    entry["last_modified"] = lm
+                data[key] = entry
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
@@ -707,7 +720,10 @@ class SemanticQuery:
             logger.warning("failed to save query cache: %s", e)
 
     def _load_cache(self, path) -> None:
-        """从磁盘加载 cache 到内存. 失败不抛."""
+        """从磁盘加载 cache 到内存. 失败不抛.
+
+        T73: 加载时同时恢复 ETag/Last-Modified (作为 cache freshness 元数据).
+        """
         try:
             from pathlib import Path
             p = Path(path)
@@ -737,10 +753,81 @@ class SemanticQuery:
                 ts = float(entry["ts"])
                 if (time.time() - ts) > 30 * 86400:
                     continue
+                # T73: 恢复 ETag/Last-Modified 到 SemanticAnswer 上 (供 _check_freshness 用)
+                if entry.get("etag"):
+                    ans._cached_etag = entry["etag"]
+                if entry.get("last_modified"):
+                    ans._cached_last_modified = entry["last_modified"]
                 self._cache[(q, url)] = (ts, ans)
             logger.info("loaded %d query cache entries from %s", len(self._cache), path)
         except Exception as e:
             logger.warning("failed to load query cache: %s", e)
+
+    # ── T73: HTTP conditional cache (ETag / Last-Modified) ─────
+
+    async def _check_freshness(self, url: str, etag: str | None, last_modified: str | None) -> bool:
+        """T73: HEAD 检查 url 是否变化.
+
+        Returns:
+            True = 304 Not Modified (cache 还新鲜) 或 HEAD 失败 (默认返 fresh, 不刷)
+            False = 200 OK (cache 失效, 应 re-fetch)
+
+        Args:
+            url: 要检查的 URL.
+            etag: 之前缓存的 ETag.
+            last_modified: 之前缓存的 Last-Modified.
+
+        Note: 这是 best-effort — 网络错/超时/ssl 错都返 True (不刷, 避免误判).
+        """
+        if not etag and not last_modified:
+            # 没条件头, 没法查 — 假设 fresh
+            return True
+        try:
+            headers = {}
+            if etag:
+                headers["If-None-Match"] = etag
+            if last_modified:
+                headers["If-Modified-Since"] = last_modified
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+                resp = await client.head(url, headers=headers)
+                if resp.status_code == 304:
+                    return True  # 304 Not Modified
+                if resp.status_code == 200:
+                    return False  # 资源变了
+                # 405 Method Not Allowed 等 — 假设 fresh (避免误刷)
+                return True
+        except Exception as e:
+            # 网络错 — 假设 fresh (不要因 freshness check 把 cache 误刷)
+            logger.debug("T73 freshness check failed for %s: %s", url, e)
+            return True
+
+    async def _validate_cache_hit(self, query: str, start_url: str) -> tuple[bool, SemanticAnswer | None]:
+        """T73: cache hit 验证 — 如果有 ETag/Last-Modified, HEAD 304 检查.
+
+        Returns:
+            (is_fresh, answer): is_fresh=True 时 answer 不为 None (cache 可用).
+        """
+        cache_key = (query.strip().lower(), start_url)
+        cached = self._cache.get(cache_key)
+        if not cached:
+            return False, None
+        ts, ans = cached
+        # TTL check first (cheap)
+        if (time.time() - ts) >= self.cache_ttl_s:
+            return False, None
+        # ETag / Last-Modified check (network, only if enabled + present)
+        if not self.cache_freshness_check:
+            return True, ans  # TTL-only mode, cache hit
+        etag = getattr(ans, "_cached_etag", None)
+        lm = getattr(ans, "_cached_last_modified", None)
+        if not etag and not lm:
+            return True, ans  # no conditional headers saved
+        is_fresh = await self._check_freshness(start_url, etag, lm)
+        if not is_fresh:
+            # cache stale — 移除它
+            del self._cache[cache_key]
+            return False, None
+        return True, ans
 
 
 async def run_query(

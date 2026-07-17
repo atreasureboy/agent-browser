@@ -534,7 +534,75 @@ def semantic_query(query, start_url, budget, max_pages, cache_persist_path, clea
         finally:
             await sq.close()
 
-    _run_async(_run())
+
+@cli.command("query-log")
+@click.option("--limit", type=int, default=50, help="返回条数 (1-100)")
+@click.option("--json-out", is_flag=True, help="输出 JSON")
+@click.option("--daemon-base", default=None,
+              help="daemon HTTP base URL (默认读 SMOKE_PORT 或 localhost:8765)")
+def query_log(limit, json_out, daemon_base):
+    """T83: 查看 daemon 最近 N 条 query log (audit/debug)."""
+    import urllib.request
+    import urllib.error
+    import json as _json
+    base = daemon_base or os.environ.get(
+        "SB_DAEMON_BASE", f"http://127.0.0.1:{os.environ.get('SMOKE_PORT', '8765')}")
+    try:
+        with urllib.request.urlopen(f"{base}/v1/query/log?limit={limit}", timeout=5) as r:
+            data = _json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        click.echo(f"daemon 返 {e.code}: {e.read().decode()[:200]}", err=True)
+        sys.exit(2)
+    except Exception as e:
+        click.echo(f"daemon 不可达 ({base}): {type(e).__name__}: {e}", err=True)
+        sys.exit(2)
+    if json_out:
+        click.echo(_json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    entries = data.get("entries", [])
+    click.echo(f"=== 最近 {len(entries)} 条 query (limit={data.get('limit')}, total_logged={data.get('count')}) ===")
+    for i, e in enumerate(entries, 1):
+        ts = e.get("started_at", 0)
+        from datetime import datetime
+        time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+        click.echo(
+            f"  [{i}] {time_str} {e.get('status','?')[:8]:<8} "
+            f"tokens={e.get('tokens_used', 0):>5} "
+            f"cache_hit={str(e.get('cache_hit', False))[:5]:<5} "
+            f"q={e.get('query','')[:60]}"
+        )
+
+
+@cli.command("query-stats")
+@click.option("--json-out", is_flag=True, help="输出 JSON")
+@click.option("--daemon-base", default=None,
+              help="daemon HTTP base URL (默认 localhost:8765)")
+def query_stats(json_out, daemon_base):
+    """T83: 查看 daemon query stats (cache + concurrency + LLM)."""
+    import urllib.request
+    import urllib.error
+    import json as _json
+    base = daemon_base or os.environ.get(
+        "SB_DAEMON_BASE", f"http://127.0.0.1:{os.environ.get('SMOKE_PORT', '8765')}")
+    try:
+        with urllib.request.urlopen(f"{base}/v1/query/stats", timeout=5) as r:
+            data = _json.loads(r.read())["data"]
+    except Exception as e:
+        click.echo(f"daemon 不可达 ({base}): {type(e).__name__}: {e}", err=True)
+        sys.exit(2)
+    if json_out:
+        click.echo(_json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    cache = data.get("cache", {})
+    conc = data.get("concurrency", {})
+    log_sum = data.get("query_log_summary", {})
+    llm = data.get("llm", {})
+    click.echo(f"=== daemon query stats ({base}) ===")
+    click.echo(f"  cache:  hits={cache.get('hits')} misses={cache.get('misses')} hit_rate={cache.get('hit_rate')} size={cache.get('size')}/{cache.get('max_size')}")
+    click.echo(f"  conc:   limit={conc.get('concurrency_limit')} available={conc.get('available_now')}")
+    click.echo(f"  llm:    {llm.get('provider')} calls={llm.get('call_counts')}")
+    if log_sum:
+        click.echo(f"  log:    total={log_sum.get('total_logged')} success={log_sum.get('recent_success')}/{log_sum.get('recent_total')}")
 
 
 @cli.command()

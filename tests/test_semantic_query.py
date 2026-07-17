@@ -165,6 +165,93 @@ class TestSemanticAnswer:
         assert ans.elapsed_s() is None
 
 
+class TestT73ConditionalCache:
+    """T73: HTTP HEAD 304 / 200 freshness check."""
+
+    @pytest.mark.asyncio
+    async def test_check_freshness_304(self, monkeypatch):
+        """HEAD 返 304 → cache 还新鲜."""
+        import httpx
+        from semantic_browser.query import SemanticQuery
+
+        async def fake_head(url, headers=None, **kwargs):
+            class R:
+                status_code = 304
+            return R()
+
+        monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+        sq = SemanticQuery()
+        result = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_freshness_200(self, monkeypatch):
+        """HEAD 返 200 → cache 失效."""
+        from semantic_browser.query import SemanticQuery
+        import httpx
+
+        class FakeResp:
+            status_code = 200
+
+        async def fake_head(self, url, headers=None, **kwargs):
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+        sq = SemanticQuery()
+        result = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_check_freshness_no_headers_returns_true(self):
+        """没 etag/last_modified 时返 True (无法 check, 不刷 cache)."""
+        from semantic_browser.query import SemanticQuery
+        sq = SemanticQuery()
+        result = await sq._check_freshness("https://example.com/", etag=None, last_modified=None)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_freshness_405_returns_true(self, monkeypatch):
+        """HEAD 返 405 Method Not Allowed 等 → 假设 fresh (避免误刷)."""
+        from semantic_browser.query import SemanticQuery
+        import httpx
+
+        class FakeResp:
+            status_code = 405
+
+        async def fake_head(self, url, headers=None, **kwargs):
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+        sq = SemanticQuery()
+        result = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_freshness_network_error_returns_true(self, monkeypatch):
+        """HEAD 网络错 (timeout/SSL) → 返 True (best-effort, 不误刷)."""
+        from semantic_browser.query import SemanticQuery
+        import httpx
+
+        async def fake_head(self, url, headers=None, **kwargs):
+            raise httpx.ConnectError("boom")
+
+        monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+        sq = SemanticQuery()
+        result = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
+        assert result is True
+
+    def test_default_freshness_check_disabled(self):
+        """cache_freshness_check 默认 False (opt-in, 不破坏现有行为)."""
+        from semantic_browser.query import SemanticQuery
+        sq = SemanticQuery()
+        assert sq.cache_freshness_check is False
+
+    def test_freshness_check_opt_in(self):
+        from semantic_browser.query import SemanticQuery
+        sq = SemanticQuery(cache_freshness_check=True)
+        assert sq.cache_freshness_check is True
+
+
 class TestURLAutoDiscovery:
     """T71: 无 start_url 时, M3 在 plan 里给候选 URL, 系统自动逐个抓取并整合."""
 

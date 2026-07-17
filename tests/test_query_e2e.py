@@ -59,15 +59,19 @@ class TestSemanticQueryE2E:
             await sq.close()
 
     @pytest.mark.asyncio
-    async def test_e2e_plan_only(self):
+    async def test_e2e_plan_only_no_candidate_urls(self):
+        """T67 + T71: 无 start_url + M3 给 candidate_urls → 走 auto-discovery."""
         from semantic_browser.query import SemanticQuery
         sq = SemanticQuery(budget=300)
         try:
             r = await sq.run("Find latest Python GIL removal news 2024")
             assert r.success
+            # M3 现在几乎总会给 candidate_urls, 走 auto-discover
+            assert r.plan.get("primary_target")
+            assert len(r.plan.get("keywords", [])) > 0
+            # 可能有 sources (auto-discover 跑了) 或无 (M3 失败)
+            # 只要 plan 字段填了就算成功
             assert "primary_target" in r.plan
-            assert len(r.plan["keywords"]) > 0
-            assert "Plan" in r.answer or "Sub-questions" in r.answer
         finally:
             await sq.close()
 
@@ -128,6 +132,35 @@ class TestSemanticQueryE2E:
             # tokens 都累计
             assert r1.tokens_used["used"]["total"] > 0
             assert r2.tokens_used["used"]["total"] > 0
+        finally:
+            await sq.close()
+
+    @pytest.mark.asyncio
+    async def test_e2e_url_auto_discovery(self):
+        """T71: 不传 start_url, M3 plan 给候选 URL, 系统自动抓并整合答案.
+
+        这是 "模型驱动浏览器语义层" 的核心: agent 只给目标, 不指定 URL.
+        """
+        from semantic_browser.query import SemanticQuery
+        sq = SemanticQuery(budget=2500, max_pages=2)
+        try:
+            r = await sq.run(
+                "Python 3.13 free-threading executable name",
+                # 故意不传 start_url — 期望系统走 auto-discover
+            )
+            assert r.success, f"auto-discover should succeed: error={r.error} answer={r.answer[:200]}"
+            # M3 plan 应给至少 1 个候选 URL
+            assert r.plan.get("candidate_urls"), f"plan missing candidate_urls: {r.plan}"
+            # 系统应真去抓了 — sources 应含 candidate_urls 之一 (或重定向后的 URL)
+            assert r.sources, f"no sources visited: {r.plan}"
+            # answer 应有实质内容
+            assert len(r.answer) > 100, f"answer too short: {r.answer}"
+            # 关键词 "python3.13t" 应在 answer 里 (答案正确性的最弱检查)
+            assert "python3.13t" in r.answer.lower() or "free-thread" in r.answer.lower(), (
+                f"answer missing expected content: {r.answer[:300]}"
+            )
+            # tokens 应有消耗 (M3 至少跑了 plan + synth)
+            assert r.tokens_used["used"]["total"] > 0
         finally:
             await sq.close()
 

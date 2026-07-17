@@ -89,7 +89,7 @@ class Synthesizer:
         ]
 
         try:
-            resp = await self.llm.complete(
+            resp = await self.llm.complete_with_fallback(
                 messages, tier=self.tier, temperature=0.2, max_tokens=max_chars // 2,
             )
             if budget is not None:

@@ -165,6 +165,79 @@ class TestSemanticAnswer:
         assert ans.elapsed_s() is None
 
 
+class TestURLAutoDiscovery:
+    """T71: 无 start_url 时, M3 在 plan 里给候选 URL, 系统自动逐个抓取并整合."""
+
+    @pytest.mark.asyncio
+    async def test_candidate_urls_in_plan_dict(self):
+        from semantic_browser.query import QueryPlan
+        d = {
+            "primary_target": "Python 3.13 free-threading",
+            "sub_questions": ["What executable?"],
+            "keywords": ["python"],
+            "candidate_urls": [
+                "https://docs.python.org/3/whatsnew/3.13.html",
+                "https://peps.python.org/pep-0703/",
+            ],
+        }
+        plan = QueryPlan.from_dict(d)
+        assert plan.candidate_urls == [
+            "https://docs.python.org/3/whatsnew/3.13.html",
+            "https://peps.python.org/pep-0703/",
+        ]
+        assert "candidate_urls" in plan.to_dict()
+
+    @pytest.mark.asyncio
+    async def test_fallback_plan_no_candidate_urls(self):
+        """LLM 不可用时 plan.fallback 不应编候选 URL."""
+        from semantic_browser.query import QueryPlan
+        plan = QueryPlan.fallback("find Python PEP 703")
+        assert plan.candidate_urls == []
+        # plan 应仍能返 (没 candidate_urls 时上层走老路径)
+
+    @pytest.mark.asyncio
+    async def test_run_no_start_url_with_candidate_urls_uses_autodiscover(self, monkeypatch):
+        """无 start_url 但 plan.candidate_urls 非空 → _auto_discover_and_browse 被调."""
+        from semantic_browser.query import SemanticQuery, SemanticAnswer
+        sq = SemanticQuery(budget=1500, max_pages=2)
+        called = {"auto": False}
+
+        async def fake_auto(query, plan, budget_obj, *, max_pages, on_phase):
+            called["auto"] = True
+            return SemanticAnswer(
+                query=query,
+                answer="fake auto-discovered answer",
+                sources=["https://example.com/page"],
+                confidence=0.85,
+                success=True,
+            )
+
+        # monkey-patch
+        monkeypatch.setattr(sq, "_auto_discover_and_browse", fake_auto)
+
+        # 注入 candidate_urls 的 plan (绕过 M3 plan 真实调用, 用 monkeypatch 替换 planner)
+        async def fake_plan(query, budget=None):
+            from semantic_browser.query import QueryPlan
+            return QueryPlan(
+                primary_target="X",
+                sub_questions=["Q1"],
+                stop_criteria="sc",
+                expected_answer_format="markdown",
+                keywords=["x"],
+                candidate_urls=["https://example.com/"],
+            )
+        monkeypatch.setattr(sq.planner, "plan", fake_plan)
+
+        try:
+            r = await sq.run("test auto-discover")
+            assert called["auto"], "auto_discover not invoked"
+            assert r.answer == "fake auto-discovered answer"
+            assert r.success is True
+            assert r.sources == ["https://example.com/page"]
+        finally:
+            await sq.close()
+
+
 class TestSemanticQueryEdgeCases:
     """T70.15: 边界条件 — budget=0, max_pages=0, 超长 query 等."""
 

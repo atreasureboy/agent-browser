@@ -345,6 +345,125 @@ def test_llm_service_stats_includes_provider():
     assert "call_counts" in stats
 
 
+class TestT72FallbackChain:
+    """T72: complete_with_fallback / complete_json_with_fallback"""
+
+    def _make_svc(self):
+        """建一个可注入 mocked provider 的 LLMService."""
+        from semantic_browser.llm.service import LLMService, LLMResponse
+        from semantic_browser.llm.providers import LLMProvider
+
+        class StubProvider(LLMProvider):
+            name = "stub"
+
+            def __init__(self):
+                self.calls = []
+                self._available = True
+                # 每次 call 之前, 若 raises 队列非空, 弹出一个抛
+                self._pending_exceptions: list[Exception] = []
+
+            def is_available(self) -> bool:
+                return self._available
+
+            def queue_exception(self, exc: Exception) -> None:
+                """下一 call 时抛这个 exc (FIFO)."""
+                self._pending_exceptions.append(exc)
+
+            async def call(self, messages, *, model, temperature, max_tokens, json_mode):
+                self.calls.append({"model": model, "json_mode": json_mode})
+                if self._pending_exceptions:
+                    raise self._pending_exceptions.pop(0)
+                return LLMResponse(
+                    content='{"ok": true}',
+                    model=model,
+                    tier="",
+                    usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+                    raw={},
+                )
+
+        # 直接 construct + 注入 _provider (绕过 __init__ 的 provider string 检测)
+        svc = LLMService(provider="openai", model_cheap="cheap-model",
+                        model_medium="medium-model", model_smart="smart-model")
+        svc._provider = StubProvider()
+        return svc, svc._provider
+
+    @pytest.mark.asyncio
+    async def test_first_tier_succeeds_no_fallback(self):
+        svc, p = self._make_svc()
+        resp = await svc.complete_with_fallback(
+            [{"role": "user", "content": "hi"}], tier="cheap",
+        )
+        # 只调一次
+        assert len(p.calls) == 1
+        assert p.calls[0]["model"] == "cheap-model"
+        assert resp.model == "cheap-model"
+
+    @pytest.mark.asyncio
+    async def test_first_tier_fails_second_succeeds(self):
+        import httpx
+        svc, p = self._make_svc()
+        # 第 1 次 (cheap) 失败, 之后 OK
+        mock_resp = httpx.Response(529, request=httpx.Request("POST", "http://x"))
+        p.queue_exception(httpx.HTTPStatusError(
+            "529 Server Overloaded", request=mock_resp.request, response=mock_resp))
+        resp = await svc.complete_with_fallback(
+            [{"role": "user", "content": "hi"}], tier="cheap",
+        )
+        # 应调了 2 次 (cheap fail + medium ok)
+        assert len(p.calls) == 2
+        assert p.calls[0]["model"] == "cheap-model"
+        assert p.calls[1]["model"] == "medium-model"
+        assert resp.model == "medium-model"
+
+    @pytest.mark.asyncio
+    async def test_all_tiers_fail_raises(self):
+        import httpx
+        svc, p = self._make_svc()
+        # 全失败 (3 个 tier 都排上异常)
+        for _ in range(3):
+            mock_resp = httpx.Response(500, request=httpx.Request("POST", "http://x"))
+            p.queue_exception(httpx.HTTPStatusError(
+                "500 fail", request=mock_resp.request, response=mock_resp))
+        with pytest.raises(httpx.HTTPStatusError):
+            await svc.complete_with_fallback(
+                [{"role": "user", "content": "hi"}], tier="cheap",
+            )
+        # 应调了 3 次 (cheap, medium, smart)
+        assert len(p.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_llm_unavailable_does_not_retry(self):
+        """LLMUnavailableError 应直接抛, 不浪费 retry."""
+        from semantic_browser.llm.types import LLMUnavailableError
+        from semantic_browser.llm.service import LLMService
+        from semantic_browser.llm.providers import LLMProvider
+
+        class NoKeyProvider(LLMProvider):
+            name = "nokey"
+
+            def is_available(self) -> bool:
+                return True  # is_available check 过, 进 call 才抛
+
+            async def call(self, messages, *, model, temperature, max_tokens, json_mode):
+                raise LLMUnavailableError("no api key")
+
+        svc = LLMService(provider="openai", model_cheap="c",
+                        model_medium="m", model_smart="s")
+        svc._provider = NoKeyProvider()
+        with pytest.raises(LLMUnavailableError):
+            await svc.complete_with_fallback(
+                [{"role": "user", "content": "hi"}], tier="cheap",
+            )
+
+    @pytest.mark.asyncio
+    async def test_complete_json_with_fallback_parses(self):
+        svc, p = self._make_svc()
+        result = await svc.complete_json_with_fallback(
+            [{"role": "user", "content": "hi"}], tier="cheap",
+        )
+        assert result == {"ok": True}
+
+
 def test_llm_service_unavailable_message_mentions_provider():
     from semantic_browser.llm import LLMService
     svc = LLMService(provider="gemini", api_key="", base_url="")

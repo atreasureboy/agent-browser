@@ -1,3 +1,52 @@
+## T76 — daemon query_log 滑动窗口 (audit/debug/metrics)
+
+**新增**:
+- `daemon._query_log` deque(maxlen=100), 每次 /v1/query 记录元数据
+- `GET /v1/query/log?limit=N` 返最近 N 条 (默认 50, 上限 100)
+- `/v1/query/stats` 加 `query_log_summary` 字段
+
+**实测**:
+- 单 query → log 1 条含 query/start_url/tokens/confidence/cache_hit/elapsed_s
+- 验证 `test_v1_query_log_endpoint` PASSED
+
+**记录字段**:
+- request_id / query (截断 200) / start_url / budget / max_pages
+- started_at / status (success/failed) / confidence
+- tokens_used / cache_hit / sources (top 5) / elapsed_s
+
+## T73 — HTTP conditional cache (skipped) + T74 英文 README + T75 真并发压测
+
+**T73** (deferred): HTTP ETag/Last-Modified cache invalidation 需要 HEAD round-trip
++ 持久化 + 多文件类型支持, 是更大重构. 当前先做更简单的 TTL 缓存.
+
+**T74**: README 顶部加英文 Quickstart 章节 (Python/CLI/HTTP/MCP 示例).
+海外 agent 用户现在能直接看懂 top-level 用法.
+
+**T75**: 真并发压测 2 个 query 同时跑 → 发现 daemon op_lock (T51) 设计上是单 OP 串行化.
+- 单 query 实测: 701 tokens, confidence=1.0, success=True (45s)
+- 2 并发: 第 2 个 503 (op_lock 30s 超时, 浏览器 browse 慢)
+- 2 串行: 都成功, cache 跨调用命中 (q1 miss → cache, q3 hit)
+- **结论**: 当前 daemon 不支持真并发 query. 要支持得:
+  1. 拆 op_lock 到更细粒度 (per-session/per-query)
+  2. 用 _query_semaphore (T69 加的) 而非全局 op_lock
+- 这超出 "修复已有差距" 范围, 记入 P3 backlog.
+
+## T71 — URL 自动发现 + T72 fallback 链
+
+**T71**: agent 只给目标, M3 plan 阶段选 1-3 个候选 URL, 系统自动抓+整合.
+- `QueryPlan.candidate_urls` 字段
+- `SemanticQuery._auto_discover_and_browse` 串行抓 (避免争抢 browser 上下文)
+- 修: `_extract_sections` 加 `@staticmethod` (之前漏掉, self 报 TypeError)
+- e2e: 不传 start_url, 真 M3 + 真 Chromium 50.29s 跑通
+
+**T72**: `LLMService.complete_with_fallback` / `complete_json_with_fallback`
+- 默认链 cheap → medium → smart
+- 5xx / timeout / network error 升级 tier
+- LLMUnavailableError 直接抛 (没 key 重试无意义)
+- planner/relevance/synthesizer 全部走 fallback 版
+
+**Tests**: 5 fallback 单测 (mock httpx error) + 1 auto-discover e2e + 1 plan-only fallback e2e
+
 ## T70.17 — daemon param clamp 测试
 
 **新增测试**:

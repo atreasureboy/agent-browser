@@ -337,7 +337,24 @@ class SemanticQuery:
             _record_step("plan_done", plan=plan.to_dict(), tokens=budget_obj.usage.to_dict())
 
             if not start_url:
-                # 没 start_url 时本次 query 没法浏览, 仅返回 plan (高层 agent 自己定位 URL)
+                # T71: URL 自动发现 — 让 M3 在 plan 里给候选 URL, 并行抓
+                if plan.candidate_urls:
+                    _record_step("auto_discover_start", candidate_urls=plan.candidate_urls)
+                    discovered = await self._auto_discover_and_browse(
+                        query, plan, budget_obj,
+                        max_pages=max_p,
+                        on_phase=_record_step,
+                    )
+                    result.sources = list(dict.fromkeys(discovered.sources))
+                    result.confidence = discovered.confidence
+                    result.answer = discovered.answer
+                    result.tokens_used = budget_obj.to_dict()
+                    result.steps = steps if self.include_steps else []
+                    result.success = True
+                    _record_step("auto_discover_done", pages_visited=len(discovered.sources))
+                    return result
+
+                # 没 start_url + 没候选 URL, 仅返回 plan (让 agent 自己定位 URL)
                 result.success = True
                 result.confidence = 0.0
                 result.answer = (
@@ -518,6 +535,97 @@ class SemanticQuery:
             result.steps = steps if self.include_steps else []
 
         return result
+
+    async def _auto_discover_and_browse(
+        self,
+        query: str,
+        plan: "QueryPlan",
+        budget_obj: "TokenBudget",
+        *,
+        max_pages: int,
+        on_phase,
+    ) -> "SemanticAnswer":
+        """T71: URL 自动发现 + 并行抓取 + 整合.
+
+        当 start_url 缺失但 plan.candidate_urls 非空时, 串行抓每个候选 URL
+        (并行会争抢同一 browser 上下文, 串行更稳). 每个 URL 跑一遍 mini 流程:
+        browse → relevance → 累积 excerpts. 最后调一次 synth 整合.
+
+        Args:
+            query: 原始查询.
+            plan: M3 拆出的 plan (含 candidate_urls).
+            budget_obj: 共享 token budget.
+            max_pages: 上限 (实际是 max_urls, 1-3).
+            on_phase: phase 回调.
+
+        Returns:
+            SemanticAnswer (含 answer / sources / confidence).
+        """
+        # 用一个 mini SemanticQuery 跑每个 URL (避免重写流程)
+        browser = await self._ensure_browser()
+        all_excerpts: list[dict[str, Any]] = []
+        all_sources: list[str] = []
+        per_page_confidence: list[float] = []
+
+        # 用 candidate_urls 限制, 不要全跑 (max_pages 上限保护)
+        urls_to_try = plan.candidate_urls[:max(1, min(max_pages, len(plan.candidate_urls)))]
+
+        for url in urls_to_try:
+            if budget_obj.exhausted():
+                on_phase({"phase": "auto_discover_budget_stop", "url": url})
+                break
+            on_phase({"phase": "auto_discover_visit", "url": url})
+            try:
+                browse_result = await browser.browse(url)
+            except Exception as e:
+                on_phase({"phase": "auto_discover_visit_failed", "url": url, "error": str(e)[:200]})
+                continue
+
+            final_url = browse_result.snapshot.url
+            all_sources.append(final_url)
+            sections = self._extract_sections(browse_result)
+            if not sections:
+                continue
+
+            rel = await self.relevance.score(query, sections, budget=budget_obj)
+            kept = rel.kept(self.relevance_threshold)
+            for kept_idx in kept:
+                sec = sections[kept_idx]
+                all_excerpts.append({
+                    "heading": sec.heading,
+                    "text": sec.excerpt,
+                    "source_idx": len(all_sources),
+                    "url": final_url,
+                })
+            per_page_confidence.append(rel.overall)
+            if rel.overall >= self.sufficiency_threshold:
+                on_phase({"phase": "auto_discover_sufficient", "url": final_url, "overall": rel.overall})
+                break
+
+        if not all_excerpts:
+            return SemanticAnswer(
+                query=query,
+                answer="_(URL auto-discovery: no relevant content found in candidate URLs)_",
+                sources=all_sources,
+                confidence=0.0,
+                success=True,
+            )
+
+        # 整合所有 URL 的 excerpts
+        answer = await self.synthesizer.synthesize(
+            query, all_excerpts, all_sources,
+            max_chars=self.answer_max_chars,
+            answer_format=plan.expected_answer_format,
+            budget=budget_obj,
+        )
+        confidence = max(per_page_confidence) if per_page_confidence else 0.0
+        return SemanticAnswer(
+            query=query,
+            answer=answer,
+            sources=all_sources,
+            confidence=confidence,
+            success=True,
+        )
 
     @staticmethod
     def _extract_sections(browse_result) -> list[SectionInput]:

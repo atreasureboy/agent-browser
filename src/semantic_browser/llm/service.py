@@ -171,13 +171,80 @@ class LLMService:
         temperature: float = 0.1,
         max_tokens: int = 500,
     ) -> dict[str, Any]:
-        """便捷: 调用并 parse JSON. 自动剥 ```json ... ``` 包裹."""
-        resp = await self.complete(
-            messages, tier=tier, temperature=temperature, max_tokens=max_tokens,
-            json_mode=True,
+        # 部分 API 不严格遵守 json_mode, 兜底再剥一次
+        if "```" in content:
+            m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
+            if m:
+                content = m.group(1).strip()
+        return json.loads(content)
+
+    # ── T72: fallback chain ───────────────────────────────────
+
+    async def complete_with_fallback(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tier: Tier = "cheap",
+        temperature: float = 0.2,
+        max_tokens: int = 500,
+        json_mode: bool = False,
+        fallback_chain: tuple[Tier, ...] | None = None,
+    ) -> "LLMResponse":
+        """T72: 失败自动升级 tier 重试.
+
+        默认链: cheap → medium → smart. 5xx/超时/network error 升级 tier 重试.
+        LLMUnavailableError (key 缺失) 不会因升级而修好, 直接抛.
+
+        Returns:
+            LLMResponse (含实际用的 tier).
+        """
+        import httpx
+
+        chain = fallback_chain or ("cheap", "medium", "smart")
+        last_exc: Exception | None = None
+        for current_tier in chain:
+            try:
+                resp = await self.complete(
+                    messages,
+                    tier=current_tier,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                )
+                if current_tier != tier:
+                    logger.info(
+                        "T72 fallback: tier %s failed, succeeded on %s",
+                        tier, current_tier,
+                    )
+                return resp
+            except (httpx.HTTPStatusError, httpx.RequestError, httpx.TimeoutException) as e:
+                last_exc = e
+                logger.warning(
+                    "T72 fallback: tier %s failed (%s), trying next",
+                    current_tier, type(e).__name__,
+                )
+                continue
+            except LLMUnavailableError:
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("complete_with_fallback: empty chain")
+
+    async def complete_json_with_fallback(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tier: Tier = "cheap",
+        temperature: float = 0.1,
+        max_tokens: int = 500,
+        fallback_chain: tuple[Tier, ...] | None = None,
+    ) -> dict[str, Any]:
+        """T72: complete_json + 自动 fallback chain."""
+        resp = await self.complete_with_fallback(
+            messages, tier=tier, temperature=temperature,
+            max_tokens=max_tokens, json_mode=True, fallback_chain=fallback_chain,
         )
         content = resp.content
-        # 部分 API 不严格遵守 json_mode, 兜底再剥一次
         if "```" in content:
             m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
             if m:

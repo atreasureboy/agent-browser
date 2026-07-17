@@ -217,6 +217,26 @@ class TestDaemonLifecycle:
         # daemon clamp 到 5, query 仍能返回 (单页就够可能 break 早)
         assert r["ok"] is True, f"max_pages=100 should clamp to 5: {r}"
 
+    def test_v1_query_log_endpoint(self, daemon):
+        """T76: GET /v1/query/log 返滑动窗口 + stats 含 summary."""
+        # 先跑一次 query 让 log 有内容
+        _http("POST", f"{daemon}/v1/query", {"query": "T76 log test", "budget": 200})
+        # 拉 log
+        r = _http("GET", f"{daemon}/v1/query/log?limit=10")
+        assert r["ok"] is True
+        d = r["data"]
+        assert "entries" in d
+        assert "count" in d
+        assert d["count"] >= 1, f"log should have entries, got {d}"
+        assert d["limit"] == 10
+        # 最近 entry 应含 query 字段
+        last = d["entries"][-1]
+        assert "T76 log test" in last.get("query", "")
+        # stats 应含 query_log_summary
+        rs = _http("GET", f"{daemon}/v1/query/stats")
+        assert rs["ok"] is True
+        assert "query_log_summary" in rs["data"]
+
 
 class TestDaemonV1QueryStreamEndpoint:
     """T68+: /v1/query/stream SSE 端点 (无需真实 LLM, 用 plan-only)."""

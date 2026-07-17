@@ -529,6 +529,10 @@ class TransparentBrowserDaemon:
         # T69: 并发限制 — 同一时刻最大 N 个 query 在跑 (避免浏览器/内存过载)
         import asyncio as _asyncio
         self._query_semaphore = _asyncio.Semaphore(query_concurrency)
+        # T76: 滑动窗口 query log (audit/debug/metrics) — 最近 100 条
+        from collections import deque
+        self._query_log = deque(maxlen=100)
+        self._query_log_lock = _asyncio.Lock()
         # T65.7: Lease/Fence — 多 agent 共享 daemon 所有权原语 (设计 §2)
         from semantic_browser.daemon.lease import LeaseManager
         self.lease_manager = LeaseManager(leases_db, heartbeat_ttl_s=lease_heartbeat_ttl_s)
@@ -1113,7 +1117,7 @@ class TransparentBrowserDaemon:
             v1_routes = {
                 "/healthz", "/readyz", "/capacity", "/events",
                 "/sessions",  # POST 创建 + GET 列表
-                "/query", "/query/stream", "/query/stats", "/query/cache/clear",  # T67+T68+T69
+                "/query", "/query/stream", "/query/stats", "/query/cache/clear", "/query/log",  # T67+T68+T69+T76
             }
             # /v1/sessions/{id}/... (GET 详情 + DELETE + lease CRUD)
             if v1_path == "/healthz":
@@ -1132,6 +1136,8 @@ class TransparentBrowserDaemon:
                 path = "/v1/query/stream"
             elif v1_path == "/query/stats":
                 path = "/v1/query/stats"
+            elif v1_path == "/query/log":
+                path = "/v1/query/log"
             elif v1_path == "/query/cache/clear":
                 path = "/v1/query/cache/clear"
             elif v1_path.startswith("/sessions/"):
@@ -1971,6 +1977,10 @@ class TransparentBrowserDaemon:
         # T68: /v1/query/stats — 监控 endpoint
         if method == "GET" and path == "/v1/query/stats":
             return self.owner.run(self._run_query_stats())
+        # T76: GET /v1/query/log — 最近 N 条 query log
+        if method == "GET" and path == "/v1/query/log":
+            limit = int(args.get("limit", 50)) if str(args.get("limit", "")).isdigit() else 50
+            return self._run_query_log(limit=limit)
         # T69: POST /v1/query/cache/clear — 清空共享 SemanticQuery cache
         if method == "POST" and path == "/v1/query/cache/clear":
             if self._semantic_query is not None:
@@ -3281,6 +3291,18 @@ class TransparentBrowserDaemon:
         # T69: 共享 daemon-wide SemanticQuery (cache 跨请求持久)
         sq = self._semantic_query if self._semantic_query is not None else SemanticQuery()
         own_sq = self._semantic_query is None
+        # T76: 记录 query 元数据 (滑动窗口, 100 条)
+        request_id = _new_request_id()
+        import time as _time
+        log_entry: dict[str, Any] = {
+            "request_id": request_id,
+            "query": query_text[:200],  # 截断防止 log 太大
+            "start_url": (args.get("start_url") or "")[:200],
+            "budget": budget_int,
+            "max_pages": max_pages_int,
+            "started_at": _time.time(),
+            "status": "running",
+        }
         try:
             # T69: 并发 semaphore
             async with self._query_semaphore:
@@ -3290,6 +3312,12 @@ class TransparentBrowserDaemon:
                     budget=budget_int,
                     max_pages=max_pages_int,
                 )
+            log_entry["status"] = "success" if answer.success else "failed"
+            log_entry["confidence"] = answer.confidence
+            log_entry["tokens_used"] = answer.tokens_used.get("used", {}).get("total", 0)
+            log_entry["cache_hit"] = answer.tokens_used.get("cache_hit", False)
+            log_entry["sources"] = list(answer.sources)[:5]
+            log_entry["elapsed_s"] = answer.elapsed_s()
             # daemon 的 _dispatch 把返回值再包一层 Result envelope;
             # 这里返 inner 数据, 让外层包装成 {ok:True, data:{...answer...}}
             return {
@@ -3300,6 +3328,12 @@ class TransparentBrowserDaemon:
             logger.exception("/v1/query failed")
             raise RuntimeError(f"QUERY_FAILED: {type(e).__name__}: {e}")[:300]
         finally:
+            # T76: 记录到滑动窗口 (即使失败也记)
+            try:
+                async with self._query_log_lock:
+                    self._query_log.append(log_entry)
+            except Exception:
+                pass
             # 只有当 sq 不是共享实例时才关 (避免把 daemon-wide 的 browser 也关了)
             if own_sq:
                 try:
@@ -3331,6 +3365,22 @@ class TransparentBrowserDaemon:
             "cache": cache_stats,
             "concurrency": semaphore_info,
             "cache_persist_path": getattr(self, '_query_cache_path', None),
+            "query_log_summary": {
+                "total_logged": len(self._query_log),
+                "recent_total": len(self._query_log),
+            },
+        }
+
+    def _run_query_log(self, limit: int = 50) -> dict[str, Any]:
+        """T76: 返最近 N 条 query log (滑动窗口, 默认 50, 上限 100)."""
+        try:
+            limit_int = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit_int = 50
+        return {
+            "limit": limit_int,
+            "count": len(self._query_log),
+            "entries": list(self._query_log)[-limit_int:],
         }
 
     def _stream_discover(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:

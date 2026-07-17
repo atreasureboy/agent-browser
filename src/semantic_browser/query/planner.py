@@ -29,13 +29,21 @@ Respond with JSON only:
   "sub_questions": ["sub-question 1", "sub-question 2", ...],
   "stop_criteria": "how to know when enough information has been collected",
   "expected_answer_format": "markdown|list|json",
-  "keywords": ["keyword1", "keyword2", ...]   // used for relevance scoring
+  "keywords": ["keyword1", "keyword2", ...],   // used for relevance scoring
+  "candidate_urls": [                              // T71: URL auto-discovery
+    "https://example.com/page1",
+    "https://docs.example.com/topic"
+  ]
 }
 
 Rules:
 - 2-5 sub_questions max
 - sub_questions should be answerable from a single web page
 - keywords should be short (1-3 words), used for filtering
+- candidate_urls: 1-3 URLs that LIKELY contain the answer.
+  * Prefer canonical sources (official docs, primary sites, wikipedia, GitHub README)
+  * Only include URLs you have HIGH confidence are relevant
+  * Empty array [] if you don't know (top agent can fall back to manual URL)
 - Be concise
 """
 
@@ -48,6 +56,7 @@ class QueryPlan:
     stop_criteria: str = ""
     expected_answer_format: str = "markdown"
     keywords: list[str] = field(default_factory=list)
+    candidate_urls: list[str] = field(default_factory=list)  # T71: URL auto-discovery
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +65,7 @@ class QueryPlan:
             "stop_criteria": self.stop_criteria,
             "expected_answer_format": self.expected_answer_format,
             "keywords": list(self.keywords),
+            "candidate_urls": list(self.candidate_urls),
         }
 
     @classmethod
@@ -66,6 +76,7 @@ class QueryPlan:
             stop_criteria=d.get("stop_criteria", "") or "",
             expected_answer_format=d.get("expected_answer_format", "markdown") or "markdown",
             keywords=list(d.get("keywords", []) or []),
+            candidate_urls=list(d.get("candidate_urls", []) or []),
         )
 
     @classmethod
@@ -78,6 +89,7 @@ class QueryPlan:
             stop_criteria="at least one sub-question answered",
             expected_answer_format="markdown",
             keywords=words,
+            candidate_urls=[],  # 无 LLM 无法猜 URL
         )
 
 
@@ -100,7 +112,7 @@ class QueryPlanner:
         ]
 
         try:
-            resp = await self.llm.complete_json(
+            resp = await self.llm.complete_json_with_fallback(
                 messages, tier=self.tier, temperature=0.3, max_tokens=500,
             )
             if budget is not None:

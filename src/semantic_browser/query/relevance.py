@@ -123,7 +123,7 @@ class RelevanceFilter:
                 {"role": "user", "content": user_prompt},
             ]
             try:
-                resp = await self.llm.complete_json(
+                resp = await self.llm.complete_json_with_fallback(
                     messages, tier=self.tier, temperature=0.1, max_tokens=1500,
                 )
                 if budget is not None:

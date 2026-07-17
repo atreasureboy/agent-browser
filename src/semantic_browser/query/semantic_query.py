@@ -854,6 +854,7 @@ class SemanticQuery:
                 # 不管返什么 status, 都更新 etag/lm (下一轮用新值)
                 new_etag = resp.headers.get("etag") or etag
                 new_lm = resp.headers.get("last-modified") or last_modified
+                print(f"[T92 _check_freshness raw] status={resp.status_code} etag_hdr={resp.headers.get('etag')!r} new_etag={new_etag!r}", flush=True)
                 if resp.status_code == 304:
                     return True, new_etag, new_lm
                 if resp.status_code == 200:
@@ -884,18 +885,25 @@ class SemanticQuery:
             return True, ans  # TTL-only mode, cache hit
         etag = getattr(ans, "_cached_etag", None)
         lm = getattr(ans, "_cached_last_modified", None)
+        import sys as _sys
+        print(f"[T92 _validate_cache_hit] stored etag={etag!r} lm={lm!r}", file=_sys.stderr, flush=True)
         if not etag and not lm:
             return True, ans  # no conditional headers saved
         is_fresh, new_etag, new_lm = await self._check_freshness(start_url, etag, lm)
+        print(f"[T92 _check_freshness result] is_fresh={is_fresh} new_etag={new_etag!r}", file=_sys.stderr, flush=True)
         if not is_fresh:
             # cache stale — 移除它
             del self._cache[cache_key]
             return False, None
-        # T73: 把新 etag/lm 存回 ans 供下次 + 持久化用
+        # T73: 把新 etag/lm 存回 self._cache (ans 是 cache entry 的引用, 不要改)
+        # 注: 这里 ans 就是 self._cache[cache_key][1] 引用, 直接改它会改 cache entry
+        # 但 return 时还会 deep-copy, 所以 cache entry 里的 etag 也得对
         if new_etag:
             ans._cached_etag = new_etag
         if new_lm:
             ans._cached_last_modified = new_lm
+        # 关键修复: 更新 cache entry 里 ans 自身的 etag (不是返回的 deep copy)
+        # 直接写 self._cache 也行, 因为 ans 就是 entry 里的对象
         return True, ans
 
 

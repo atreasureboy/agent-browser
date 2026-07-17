@@ -321,6 +321,60 @@ def open(ctx, url):
     _print(_request("POST", "/open", {"url": url}, base=ctx.obj["base"]))
 
 
+# T88: tb query 是 sb query 的 daemon proxy 别名 — agent 用统一入口
+@tb.command("query")
+@click.argument("query_text")
+@click.option("--start-url", default=None,
+              help="入口 URL (省略时只返 plan + keywords)")
+@click.option("--budget", type=int, default=None, help="LLM token 预算 (默认 2000)")
+@click.option("--max-pages", type=int, default=None, help="最大浏览页数 (默认 1)")
+@click.option("--json-out", is_flag=True, help="输出完整 JSON")
+@click.option("--quiet", "-q", is_flag=True, help="只输出 answer markdown")
+@click.option("--base", default=None, help="daemon base URL (覆盖 --base)")
+@click.pass_context
+def query_cmd(ctx, query_text, start_url, budget, max_pages, json_out, quiet, base):
+    """T88: Model-driven semantic query — 经 daemon 调 /v1/query.
+
+    这跟 `tb agent` 不同:
+    - tb query: 一次调用返精炼 markdown 答案 (token 经济, 单 API)
+    - tb agent:  step-by-step 自主循环 (适复杂多步任务)
+
+    大多数 agent 任务应该用 `tb query`.
+    """
+    actual_base = base or ctx.obj["base"]
+    body: dict = {"query": query_text}
+    if start_url:
+        body["start_url"] = start_url
+    if budget is not None:
+        body["budget"] = budget
+    if max_pages is not None:
+        body["max_pages"] = max_pages
+    # _request() 返 inner data; _request 内部已 raise 当 daemon error.
+    # data shape: {request_id, answer: {query, answer, success, ...}}
+    resp = _request("POST", "/v1/query", body, base=actual_base)
+    if json_out:
+        _print(resp, json_out=True)
+        return
+    ans_block = resp.get("answer", {})
+    answer = ans_block.get("answer", "") if isinstance(ans_block, dict) else ""
+    if quiet:
+        click.echo(answer)
+        return
+    tu = ans_block.get("tokens_used", {}) if isinstance(ans_block, dict) else {}
+    click.echo("=" * 60)
+    click.echo(f"Query: {query_text}")
+    click.echo("=" * 60)
+    click.echo(answer)
+    click.echo("-" * 60)
+    used = tu.get("used", {}) if isinstance(tu, dict) else {}
+    click.echo(
+        f"[confidence={ans_block.get('confidence', 0):.2f}  "
+        f"tokens={used.get('total', 0)}/{tu.get('max_total', 0)}  "
+        f"sources={len(ans_block.get('sources', []))}  "
+        f"request_id={resp.get('request_id', 'n/a')}]"
+    )
+
+
 @tb.command()
 @click.option("--json-out", is_flag=True)
 @click.pass_context

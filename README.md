@@ -17,9 +17,9 @@ SemanticQuery — M3 编排 (cheap)
 顶级 agent 消费, 做最终决策
 ```
 
-### 三种顶层 API
+### 四种顶层 API (T88: tb query 加 daemon proxy 别名)
 
-**Python**:
+**Python** (进程内):
 ```python
 from semantic_browser.query import run_query
 result = await run_query(
@@ -49,6 +49,11 @@ curl -N -X POST localhost:8765/v1/query/stream \
 - `sb_query({query, start_url, budget, max_pages})` — 主查询
 - `sb_query_stats()` — cache 命中率 + LLM 服务状态
 - `sb_query_clear_cache()` — 清空内存 cache (运维)
+
+**CLI 一句话指南 (T88)**:
+- `tb query "..."` — 一次返精炼 markdown (token 经济, 大多数场景) **← 首选**
+- `tb agent "..."` — step-by-step 自主循环 (复杂多步任务)
+- `sb query "..."` — `tb query` 同语义, 但本地起 Chromium (无 daemon)
 
 完整文档与配置见 [T67+T68 README 节](#t67t68-模型驱动的浏览器语义层semanticquery).
 

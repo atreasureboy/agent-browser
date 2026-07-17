@@ -302,6 +302,7 @@ class SemanticQuery:
                     **hit.tokens_used,
                     "cache_hit": True,
                     "cache_age_s": round(time.time() - cached_ts, 1),
+                    "cache_freshness_checked": self.cache_freshness_check,  # T73
                 }
                 hit.steps = [{"phase": "cache_hit", "ts": time.time(),
                              "original_ts": cached_ts}] if self.include_steps else []
@@ -520,6 +521,18 @@ class SemanticQuery:
                         self._cache.clear()
                         break
                     del self._cache[oldest_key]
+                # T73: 如果启用 freshness check, 抓 etag/lm 存到 entry 供下次验证
+                if self.cache_freshness_check:
+                    try:
+                        _, etag, lm = await self._check_freshness(
+                            start_url, etag=None, last_modified=None,
+                        )
+                        if etag:
+                            result._cached_etag = etag
+                        if lm:
+                            result._cached_last_modified = lm
+                    except Exception:
+                        pass
                 self._cache[cache_key] = (time.time(), result)
                 # T68: 同步到磁盘 (异步 fire-and-forget)
                 if self.cache_persist_path:
@@ -765,23 +778,26 @@ class SemanticQuery:
 
     # ── T73: HTTP conditional cache (ETag / Last-Modified) ─────
 
-    async def _check_freshness(self, url: str, etag: str | None, last_modified: str | None) -> bool:
+    async def _check_freshness(self, url: str, etag: str | None, last_modified: str | None) -> tuple[bool, str | None, str | None]:
         """T73: HEAD 检查 url 是否变化.
 
         Returns:
-            True = 304 Not Modified (cache 还新鲜) 或 HEAD 失败 (默认返 fresh, 不刷)
-            False = 200 OK (cache 失效, 应 re-fetch)
+            (is_fresh, new_etag, new_lm)
+            - is_fresh=True: cache 还可用 (304 或网络错 best-effort)
+            - new_etag/new_lm: HEAD response 的最新值, 供下次 conditional 检查用
 
-        Args:
-            url: 要检查的 URL.
-            etag: 之前缓存的 ETag.
-            last_modified: 之前缓存的 Last-Modified.
-
-        Note: 这是 best-effort — 网络错/超时/ssl 错都返 True (不刷, 避免误判).
+        Note: 网络错/超时/ssl 错都返 True (不刷, 避免误判).
         """
         if not etag and not last_modified:
-            # 没条件头, 没法查 — 假设 fresh
-            return True
+            # 没条件头, 没法查 — 假设 fresh; 但顺便抓新 ETag/LM 供下次用
+            try:
+                async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+                    resp = await client.head(url)
+                    if resp.status_code in (200, 304):
+                        return True, resp.headers.get("etag"), resp.headers.get("last-modified")
+            except Exception:
+                pass
+            return True, None, None
         try:
             headers = {}
             if etag:
@@ -790,16 +806,19 @@ class SemanticQuery:
                 headers["If-Modified-Since"] = last_modified
             async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
                 resp = await client.head(url, headers=headers)
+                # 不管返什么 status, 都更新 etag/lm (下一轮用新值)
+                new_etag = resp.headers.get("etag") or etag
+                new_lm = resp.headers.get("last-modified") or last_modified
                 if resp.status_code == 304:
-                    return True  # 304 Not Modified
+                    return True, new_etag, new_lm
                 if resp.status_code == 200:
-                    return False  # 资源变了
+                    return False, new_etag, new_lm
                 # 405 Method Not Allowed 等 — 假设 fresh (避免误刷)
-                return True
+                return True, new_etag, new_lm
         except Exception as e:
             # 网络错 — 假设 fresh (不要因 freshness check 把 cache 误刷)
             logger.debug("T73 freshness check failed for %s: %s", url, e)
-            return True
+            return True, etag, last_modified
 
     async def _validate_cache_hit(self, query: str, start_url: str) -> tuple[bool, SemanticAnswer | None]:
         """T73: cache hit 验证 — 如果有 ETag/Last-Modified, HEAD 304 检查.
@@ -822,11 +841,16 @@ class SemanticQuery:
         lm = getattr(ans, "_cached_last_modified", None)
         if not etag and not lm:
             return True, ans  # no conditional headers saved
-        is_fresh = await self._check_freshness(start_url, etag, lm)
+        is_fresh, new_etag, new_lm = await self._check_freshness(start_url, etag, lm)
         if not is_fresh:
             # cache stale — 移除它
             del self._cache[cache_key]
             return False, None
+        # T73: 把新 etag/lm 存回 ans 供下次 + 持久化用
+        if new_etag:
+            ans._cached_etag = new_etag
+        if new_lm:
+            ans._cached_last_modified = new_lm
         return True, ans
 
 

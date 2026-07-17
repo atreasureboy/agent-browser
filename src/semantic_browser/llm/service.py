@@ -171,7 +171,13 @@ class LLMService:
         temperature: float = 0.1,
         max_tokens: int = 500,
     ) -> dict[str, Any]:
-        # 部分 API 不严格遵守 json_mode, 兜底再剥一次
+        # 调 complete 拿 content
+        resp = await self.complete(
+            messages, tier=tier, temperature=temperature, max_tokens=max_tokens,
+            json_mode=True,
+        )
+        content = resp.content
+        # 部分 API 不严格遵守 json_mode, 兜底再剥一次 ```json ... ``` 包裹
         if "```" in content:
             m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
             if m:

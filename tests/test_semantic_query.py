@@ -39,6 +39,7 @@ class TestQueryPlan:
             "stop_criteria": "sc",
             "expected_answer_format": "list",
             "keywords": ["k1"],
+            "candidate_urls": [],
         }
         plan = QueryPlan.from_dict(d)
         assert plan.to_dict() == d
@@ -177,37 +178,42 @@ class TestT73ConditionalCache:
         async def fake_head(url, headers=None, **kwargs):
             class R:
                 status_code = 304
+                headers = {}
             return R()
 
         monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
         sq = SemanticQuery()
-        result = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
-        assert result is True
+        is_fresh, etag, lm = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
+        assert is_fresh is True
 
     @pytest.mark.asyncio
     async def test_check_freshness_200(self, monkeypatch):
-        """HEAD 返 200 → cache 失效."""
+        """HEAD 返 200 → cache 失效 (T73 真修后 _check_freshness 返 (is_fresh, etag, lm) tuple)."""
         from semantic_browser.query import SemanticQuery
         import httpx
 
         class FakeResp:
             status_code = 200
+            headers = {}
 
         async def fake_head(self, url, headers=None, **kwargs):
             return FakeResp()
 
         monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
         sq = SemanticQuery()
-        result = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
-        assert result is False
+        is_fresh, etag, lm = await sq._check_freshness("https://example.com/", etag="abc", last_modified=None)
+        assert is_fresh is False
+        assert etag == "abc"  # fallback to old etag when no header
 
     @pytest.mark.asyncio
     async def test_check_freshness_no_headers_returns_true(self):
         """没 etag/last_modified 时返 True (无法 check, 不刷 cache)."""
         from semantic_browser.query import SemanticQuery
         sq = SemanticQuery()
-        result = await sq._check_freshness("https://example.com/", etag=None, last_modified=None)
-        assert result is True
+        is_fresh, etag, lm = await sq._check_freshness("https://example.com/", etag=None, last_modified=None)
+        assert is_fresh is True
+        # 没条件头时 etag/lm 应该返回 None (best-effort HEAD 不发)
+        # 实际上 HEAD 是真发了, 可能拿到 server 的 etag/lm → 仍可能是 None
 
     @pytest.mark.asyncio
     async def test_check_freshness_405_returns_true(self, monkeypatch):
@@ -217,14 +223,15 @@ class TestT73ConditionalCache:
 
         class FakeResp:
             status_code = 405
+            headers = {}
 
         async def fake_head(self, url, headers=None, **kwargs):
             return FakeResp()
 
         monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
         sq = SemanticQuery()
-        result = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
-        assert result is True
+        is_fresh, etag, lm = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
+        assert is_fresh is True
 
     @pytest.mark.asyncio
     async def test_check_freshness_network_error_returns_true(self, monkeypatch):
@@ -237,8 +244,8 @@ class TestT73ConditionalCache:
 
         monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
         sq = SemanticQuery()
-        result = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
-        assert result is True
+        is_fresh, etag, lm = await sq._check_freshness("https://example.com/", etag="x", last_modified=None)
+        assert is_fresh is True
 
     def test_default_freshness_check_disabled(self):
         """cache_freshness_check 默认 False (opt-in, 不破坏现有行为)."""
@@ -389,15 +396,17 @@ class TestSemanticQueryNoStartUrl:
 
     @pytest.mark.asyncio
     async def test_no_start_url_returns_plan_only(self):
-        # 用真实 LLM (env 已配), 但只走 plan 路径, 不开浏览器
+        # 没 start_url 时:
+        # - LLM 没给 candidate_urls → plan-only 模板 (含 "Primary target")
+        # - LLM 给了 candidate_urls → auto-discover 跑, 返真实答案
+        # 两种情况都应: success=True + plan 字段填
         sq = SemanticQuery(budget=500, max_pages=0)
-        # max_pages=0 → 不浏览, 但 run 需要 start_url 才走 plan 路径
         result = await sq.run("find Python 3.13 release notes", start_url=None)
         assert result.success is True
-        # plan 字段应填了
-        assert "primary_target" in result.plan
-        assert result.answer  # 含 plan
-        assert "Primary target" in result.answer
+        # plan 字段必填
+        assert "primary_target" in result.plan, f"plan missing primary_target: {result.plan}"
+        assert result.answer, "answer should not be empty"
+        # tokens_used 字段存在
         assert result.tokens_used.get("used", {}).get("total", 0) >= 0
         await sq.close()
 

@@ -596,10 +596,7 @@ class SemanticQuery:
                 self._cache[cache_key] = (time.time(), result)
                 # T68: 同步到磁盘 (异步 fire-and-forget)
                 if self.cache_persist_path:
-                    print(f"[T97 DEBUG] _save_cache called path={self.cache_persist_path}", flush=True)
                     self._save_cache(self.cache_persist_path)
-                else:
-                    print(f"[T97 DEBUG] cache_persist_path is None, skip save", flush=True)
 
         except BudgetExceeded as e:
             logger.warning("token budget exhausted during query")
@@ -792,10 +789,6 @@ class SemanticQuery:
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False))
             tmp.replace(p)
-            print(f"[T97 _save_cache] wrote {len(data)} entries to {path}", flush=True)
-        except Exception as e:
-            print(f"[T97 _save_cache] FAILED: {type(e).__name__}: {e}", flush=True)
-            logger.warning("failed to save query cache: %s", e)
         except Exception as e:
             logger.warning("failed to save query cache: %s", e)
 

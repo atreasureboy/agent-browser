@@ -24,10 +24,16 @@ from typing import Any, Optional
 
 _AUTOGEN_IMPORT_ERROR: str | None = None
 try:
-    # AutoGen 0.2+ 用 pyautogen package
-    import autogen  # noqa: F401
+    # AutoGen 0.4+ 包名是 pyautogen; 0.7+ 是 autogen_agentchat (autogen 是 wrapper)
+    import pyautogen as autogen  # noqa: F401
     HAS_AUTOGEN = True
 except ImportError:
+    # 0.7+ 的新名字
+    try:
+        import autogen_agentchat as autogen  # noqa: F401
+        HAS_AUTOGEN = True
+    except ImportError:
+        HAS_AUTOGEN = False
     HAS_AUTOGEN = False
 
 
@@ -58,22 +64,40 @@ def semantic_query_fn(
                            "answer": "autogen integration requires pyautogen package"}, ensure_ascii=False)
     from semantic_browser.query import run_query
 
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # T98: 跟 LangChain adapter 一样 — 独立线程跑新 loop, 避免 'event loop already running'
+    import threading
+    result_box: list = []
+    error_box: list = []
 
-    result = loop.run_until_complete(
-        run_query(
-            query=query,
-            start_url=start_url,
-            budget=budget,
-            max_pages=max_pages,
-            cache_persist_path=cache_persist_path,
-            cache_ttl_s=cache_ttl_s,
-        )
-    )
+    def runner():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result_box.append(
+                loop.run_until_complete(
+                    run_query(
+                        query=query,
+                        start_url=start_url,
+                        budget=budget,
+                        max_pages=max_pages,
+                        cache_persist_path=cache_persist_path,
+                        cache_ttl_s=cache_ttl_s,
+                    )
+                )
+            )
+        except Exception as e:
+            error_box.append(e)
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=180)
+    if error_box:
+        raise error_box[0]
+    if not result_box:
+        raise RuntimeError("AutoGen semantic_query_fn timed out (>180s)")
+    result = result_box[0]
     return json.dumps({
         "answer": result.answer,
         "sources": list(result.sources),

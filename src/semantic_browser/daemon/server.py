@@ -3315,6 +3315,9 @@ class TransparentBrowserDaemon:
                     start_url=args.get("start_url") or None,
                     budget=budget_int,
                     max_pages=max_pages_int,
+                    cache_persist_path=args.get("cache_persist_path"),
+                    cache_ttl_s=args.get("cache_ttl_s", 600.0),
+                    clear_cache=bool(args.get("clear_cache", False)),
                 )
             log_entry["status"] = "success" if answer.success else "failed"
             log_entry["confidence"] = answer.confidence
@@ -3344,7 +3347,7 @@ class TransparentBrowserDaemon:
             }
         except Exception as e:
             logger.exception("/v1/query failed")
-            raise RuntimeError(f"QUERY_FAILED: {type(e).__name__}: {e}")[:300]
+            raise RuntimeError(f"QUERY_FAILED: {type(e).__name__}: {e}"[:300])
         finally:
             # T76: 记录到滑动窗口 (即使失败也记)
             try:

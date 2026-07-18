@@ -298,6 +298,9 @@ class SemanticQuery:
         start_url: Optional[str] = None,
         budget: Optional[int] = None,
         max_pages: Optional[int] = None,
+        cache_persist_path: Optional[str] = None,
+        cache_ttl_s: float = DEFAULT_CACHE_TTL_S,
+        clear_cache: bool = False,
     ) -> SemanticAnswer:
         """主入口 — 顶层 agent 调用这一个方法就拿回所有需要的.
 
@@ -358,6 +361,18 @@ class SemanticQuery:
         result = SemanticAnswer(query=query)
         budget_obj = TokenBudget(budget or self.default_budget)
         max_p = max_pages if max_pages is not None else self.max_pages
+        # T97: 允许 run() 级 cache_persist_path / cache_ttl_s / clear_cache 覆盖
+        if cache_persist_path is not None:
+            self.cache_persist_path = cache_persist_path
+            if self._cache:
+                # 已加载旧 cache → 不动; 首次调用 _save_cache 时会写到新路径
+                pass
+        if cache_ttl_s is not None and cache_ttl_s != self.DEFAULT_CACHE_TTL_S:
+            self.cache_ttl_s = cache_ttl_s
+        if clear_cache:
+            self._cache.clear()
+            self._cache_hits = 0
+            self._cache_misses = 0
         self._call_count += 1
         steps: list[dict[str, Any]] = []
 
@@ -581,7 +596,10 @@ class SemanticQuery:
                 self._cache[cache_key] = (time.time(), result)
                 # T68: 同步到磁盘 (异步 fire-and-forget)
                 if self.cache_persist_path:
+                    print(f"[T97 DEBUG] _save_cache called path={self.cache_persist_path}", flush=True)
                     self._save_cache(self.cache_persist_path)
+                else:
+                    print(f"[T97 DEBUG] cache_persist_path is None, skip save", flush=True)
 
         except BudgetExceeded as e:
             logger.warning("token budget exhausted during query")
@@ -774,6 +792,10 @@ class SemanticQuery:
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False))
             tmp.replace(p)
+            print(f"[T97 _save_cache] wrote {len(data)} entries to {path}", flush=True)
+        except Exception as e:
+            print(f"[T97 _save_cache] FAILED: {type(e).__name__}: {e}", flush=True)
+            logger.warning("failed to save query cache: %s", e)
         except Exception as e:
             logger.warning("failed to save query cache: %s", e)
 

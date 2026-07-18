@@ -36,8 +36,13 @@ def semantic_query_fn(
     start_url: Optional[str] = None,
     budget: int = 2000,
     max_pages: int = 1,
+    cache_persist_path: Optional[str] = None,
+    cache_ttl_s: float = 600.0,
 ) -> str:
     """Sync wrapper for AutoGen (AutoGen 默认是 sync tool API).
+
+    T96 修: 加 cache_persist_path / cache_ttl_s 参数 (跟 LangChain 一致,
+    让 AutoGen 用户也能跨进程共享 cache).
 
     Returns:
         JSON 字符串 含 answer / sources / confidence / tokens_used / cache_hit / elapsed_s.
@@ -45,7 +50,8 @@ def semantic_query_fn(
     Example:
         >>> semantic_query_fn("Python 3.13 free-threading",
         ...                    start_url="https://docs.python.org/3/whatsnew/3.13.html",
-        ...                    budget=1500)
+        ...                    budget=1500,
+        ...                    cache_persist_path="/tmp/agent_cache.json")
     """
     if not HAS_AUTOGEN:
         return json.dumps({"_warning": "pyautogen not installed; install to enable AutoGen integration",
@@ -64,6 +70,8 @@ def semantic_query_fn(
             start_url=start_url,
             budget=budget,
             max_pages=max_pages,
+            cache_persist_path=cache_persist_path,
+            cache_ttl_s=cache_ttl_s,
         )
     )
     return json.dumps({

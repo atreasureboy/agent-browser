@@ -328,11 +328,15 @@ def open(ctx, url):
               help="入口 URL (省略时只返 plan + keywords)")
 @click.option("--budget", type=int, default=None, help="LLM token 预算 (默认 2000)")
 @click.option("--max-pages", type=int, default=None, help="最大浏览页数 (默认 1)")
+@click.option("--cache-persist-path", default=None,
+              help="T97: 持久化 cache 路径 (跨进程 daemon 共享)")
+@click.option("--clear-cache", is_flag=True, help="T97: 清空 cache 后再跑")
 @click.option("--json-out", is_flag=True, help="输出完整 JSON")
 @click.option("--quiet", "-q", is_flag=True, help="只输出 answer markdown")
+@click.option("--verbose", "-v", is_flag=True, help="T97: 显示 cache stats + steps 详情")
 @click.option("--base", default=None, help="daemon base URL (覆盖 --base)")
 @click.pass_context
-def query_cmd(ctx, query_text, start_url, budget, max_pages, json_out, quiet, base):
+def query_cmd(ctx, query_text, start_url, budget, max_pages, cache_persist_path, clear_cache, json_out, quiet, verbose, base):
     """T88: Model-driven semantic query — 经 daemon 调 /v1/query.
 
     这跟 `tb agent` 不同:
@@ -349,6 +353,10 @@ def query_cmd(ctx, query_text, start_url, budget, max_pages, json_out, quiet, ba
         body["budget"] = budget
     if max_pages is not None:
         body["max_pages"] = max_pages
+    if cache_persist_path:
+        body["cache_persist_path"] = cache_persist_path
+    if clear_cache:
+        body["clear_cache"] = clear_cache
     # _request() 返 inner data; _request 内部已 raise 当 daemon error.
     # data shape: {request_id, answer: {query, answer, success, ...}}
     resp = _request("POST", "/v1/query", body, base=actual_base)

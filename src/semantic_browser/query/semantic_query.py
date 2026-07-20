@@ -334,6 +334,20 @@ class SemanticQuery:
             >>> r = await sq.run("Same query", start_url="https://docs.python.org/3/whatsnew/3.13.html")
             >>> r = await sq.run("Need URL first")  # plan-only
         """
+        # T101: per-call 局部变量提前到 cache hit check 之前
+        # (否则 run_cache_ttl 在 cache hit path 是 UnboundLocalError)
+        run_cache_ttl = (
+            cache_ttl_s if cache_ttl_s is not None
+            else self.cache_ttl_s
+        )
+        save_path = cache_persist_path if cache_persist_path is not None else self.cache_persist_path
+        if clear_cache:
+            # 清理只影响本次 run — 但 cache 是共享 instance 的, clear 会影响其他 in-flight.
+            # TODO: 加 cache lock 让 clear 原子 (但目前 daemon 用 semaphore 隔离, 影响小)
+            self._cache.clear()
+            self._cache_hits = 0
+            self._cache_misses = 0
+
         # Cache 命中检查: 相同 (query, start_url) 在 TTL 内直接复用
         # T73: opt-in HTTP HEAD 304 检查 (默认关闭 — 多 1 个 round-trip)
         # T101: per-call TTL override via run_cache_ttl

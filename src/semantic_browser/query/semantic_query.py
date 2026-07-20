@@ -367,7 +367,7 @@ class SemanticQuery:
             if self._cache:
                 # 已加载旧 cache → 不动; 首次调用 _save_cache 时会写到新路径
                 pass
-        if cache_ttl_s is not None and cache_ttl_s != self.DEFAULT_CACHE_TTL_S:
+        if cache_ttl_s is not None:  # T100 audit fix: drop != DEFAULT guard, let explicit override work
             self.cache_ttl_s = cache_ttl_s
         if clear_cache:
             self._cache.clear()
@@ -649,7 +649,19 @@ class SemanticQuery:
         # 用 candidate_urls 限制, 不要全跑 (max_pages 上限保护)
         urls_to_try = plan.candidate_urls[:max(1, min(max_pages, len(plan.candidate_urls)))]
 
+        # T100 audit fix: candidate_urls 来自 LLM 输出, 必须先 SSRF 检查
+        # — 否则 agent 通过 prompt injection 可以把 M3 引到 169.254.169.254 之类
+        from semantic_browser.safety.ssrf import check_url, SSRFBlockedError
+        safe_urls: list[str] = []
         for url in urls_to_try:
+            try:
+                canonical = check_url(url, allowlist=())
+                safe_urls.append(canonical)
+            except SSRFBlockedError as e:
+                on_phase({"phase": "auto_discover_ssrf_blocked", "url": url, "reason": str(e)[:200]})
+                continue
+
+        for url in safe_urls:
             if budget_obj.exhausted():
                 on_phase({"phase": "auto_discover_budget_stop", "url": url})
                 break

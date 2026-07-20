@@ -36,20 +36,39 @@ def semantic_query_tool(
     """
     from semantic_browser.query import run_query
 
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # T99: 跟 langchain / autogen 一样 — 独立 thread 跑新 event loop,
+    # 避免 'This event loop is already running' (Python 3.10+ 在 async context 调会崩)
+    import threading
+    result_box: list = []
+    error_box: list = []
 
-    result = loop.run_until_complete(
-        run_query(
-            query=query,
-            start_url=start_url,
-            budget=budget,
-            max_pages=max_pages,
-        )
-    )
+    def runner():
+        try:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            result_box.append(
+                new_loop.run_until_complete(
+                    run_query(
+                        query=query,
+                        start_url=start_url,
+                        budget=budget,
+                        max_pages=max_pages,
+                    )
+                )
+            )
+        except Exception as e:
+            error_box.append(e)
+        finally:
+            new_loop.close()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=180)
+    if error_box:
+        raise error_box[0]
+    if not result_box:
+        raise RuntimeError("Aider semantic_query_tool timed out (>180s)")
+    result = result_box[0]
     return {
         "answer": result.answer,
         "sources": list(result.sources),

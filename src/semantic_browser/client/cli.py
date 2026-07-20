@@ -1896,11 +1896,8 @@ def bench_cmd(ctx, tasks_file, tier, max_steps, json_out):
         click.echo(f"  {mark} {r.task.name} (steps={r.actual_steps}, {r.duration_sec:.1f}s)")
         if not r.success:
             click.echo(f"      reason: {r.failure_reason[:80]}")
-    click.echo(data.get("tree_text", "(empty)"))
-    if data.get("llm_summary"):
-        click.echo("")
-        click.echo("--- LLM summary (for agent) ---")
-        click.echo(data["llm_summary"])
+    # T100 audit fix: 之前这里 `data` 是 undefined (paste 残留 from discover_cmd).
+    # bench 不返回 tree_text / llm_summary, 只返回 report 对象. 删掉 dangling 4 行.
 
 
 def main():

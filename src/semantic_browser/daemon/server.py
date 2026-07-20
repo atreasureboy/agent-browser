@@ -528,6 +528,7 @@ class TransparentBrowserDaemon:
             self._query_cache_path = None
         # T69: 并发限制 — 同一时刻最大 N 个 query 在跑 (避免浏览器/内存过载)
         import asyncio as _asyncio
+        self._query_concurrency = query_concurrency  # T100 audit fix: stats 端点之前漏存
         self._query_semaphore = _asyncio.Semaphore(query_concurrency)
         # T76: 滑动窗口 query log (audit/debug/metrics) — 最近 100 条
         from collections import deque
@@ -1687,10 +1688,11 @@ class TransparentBrowserDaemon:
             action_name = args["action"]
             action_args = args.get("args", {})
             max_retries = int(args.get("max_retries", 2))
+            # T99 (audit fix): SSRF guard 对所有可能含 url 的 action 生效
+            # — 不只 open. click(type) 也可能带 url 字段 (e.g. 跳转到外部链接)
             # T66.8: SSRF guard — action=open 时 url 也在 SSRF 黑名单兜底.
-            # 修前 with-retry(open 分支) 直接 ctrl.open(args["url"]) 不 check.
-            if action_name == "open" and "url" in action_args:
-                self._check_url(action_args["url"], where="with_retry.open")
+            if "url" in action_args:
+                self._check_url(action_args["url"], where=f"with_retry.{action_name}")
             return self.owner.run(self._with_retry(action_name, action_args, max_retries))
         if method == "POST" and path == "/set-files":
             return self.owner.run(self._set_files(args["ref"], args["paths"]))

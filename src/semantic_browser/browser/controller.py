@@ -398,10 +398,11 @@ class BrowserController:
         ref 元素可能在 viewport 外但仍可交互)。"""
         target = await self._active_page_or_frame()
         selector = self._ref_to_selector(ref)
+        # T100 audit fix: 之前 line 404 引用 undefined `page` (NameError). 用 `target` 修.
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
         while asyncio.get_event_loop().time() < deadline:
             try:
-                count = await page.locator(selector).count()
+                count = await target.locator(selector).count()
                 if count > 0:
                     return True
             except Exception:

@@ -105,6 +105,10 @@ class _AsyncOwner:
         self.thread.start()
         # T51: 浏览器操作串行化锁 (放在 owner 上, _acquire_op_lock_or_503 直接拿)
         self.op_lock = _threading.Lock()
+        # T101 audit fix: 跨 HTTP 线程 + loop 线程共享 _session_last_used/_session_meta
+        # 之前没锁保护 (虽然 GIL 大部分场景安全, 但 list_sessions_for_tenant
+        # 用 list(self._session_meta.items()) 会 RuntimeError: dict changed size)
+        self._session_lock = _threading.Lock()
         # T65.1: per-session last_used 跟踪 — idle recycle 用
         self._session_last_used: dict[str, float] = {}
         # T65.6: tenant/agent 元数据 — 每 session 记归属, 按 tenant 过滤 session 列表.
@@ -116,7 +120,8 @@ class _AsyncOwner:
         self.run(self.pool.start())
         # 预创建 default session — 保留 .browser 兼容旧代码
         default_ctrl = self.run(self.pool.acquire(self.DEFAULT_SESSION))
-        self._session_last_used[self.DEFAULT_SESSION] = time.time()  # T65.1
+        with self._session_lock:
+            self._session_last_used[self.DEFAULT_SESSION] = time.time()  # T65.1
         # T65.6: default session 归 default tenant + agent
         self._session_meta[self.DEFAULT_SESSION] = {
             "tenant_id": self.DEFAULT_TENANT,
@@ -149,7 +154,8 @@ class _AsyncOwner:
         """
         name = name or self.DEFAULT_SESSION
         ctrl = self.run(self.pool.acquire(name))
-        self._session_last_used[name] = time.time()
+        with self._session_lock:
+            self._session_last_used[name] = time.time()
         return ctrl
 
     async def aget_controller(self, name: str | None = None) -> BrowserController:
@@ -157,16 +163,19 @@ class _AsyncOwner:
         T65.1: touch session."""
         name = name or self.DEFAULT_SESSION
         ctrl = await self.pool.acquire(name)
-        self._session_last_used[name] = time.time()
+        with self._session_lock:
+            self._session_last_used[name] = time.time()
         return ctrl
 
     def get_idle_sessions(self, idle_timeout_s: float) -> list[str]:
         """T65.1: 返回所有 idle 超过 idle_timeout_s 秒的 session 列表
-        (排除 default session — 不能被回收)."""
+        (排除 default session — 不能被回收).
+        T101: snapshot under lock — 防 dict-changed-during-iteration."""
         now = time.time()
-        return [
-            n for n, ts in self._session_last_used.items()
-            if n != self.DEFAULT_SESSION and (now - ts) >= idle_timeout_s
+        with self._session_lock:
+            return [
+                n for n, ts in self._session_last_used.items()
+                if n != self.DEFAULT_SESSION and (now - ts) >= idle_timeout_s
         ]
 
     def touch_session(self, name: str) -> None:
@@ -183,28 +192,39 @@ class _AsyncOwner:
         return self.pool.list_active()
 
     def list_sessions_for_tenant(self, tenant_id: str) -> list[str]:
-        """T65.6: 按 tenant_id 过滤 — 返回该 tenant 下的所有 session 名."""
-        return [
-            n for n, meta in self._session_meta.items()
-            if meta["tenant_id"] == tenant_id
-        ]
+        """T65.6: 按 tenant_id 过滤 — 返回该 tenant 下的所有 session 名.
+
+        T101 audit fix: snapshot dict under lock (防 dict-changed-during-iteration).
+        """
+        with self._session_lock:
+            return [
+                n for n, meta in self._session_meta.items()
+                if meta.get("tenant_id") == tenant_id
+            ]
 
     def get_session_meta(self, name: str) -> dict[str, Any] | None:
-        """T65.6: 取 session 元数据 (tenant_id / agent_id / created_at)."""
-        return self._session_meta.get(name)
+        """T65.6: 取 session 元数据 (tenant_id / agent_id / created_at).
+
+        T101 audit fix: lock 保护下 copy — 避免 caller 看到的 dict 被其他线程改.
+        """
+        with self._session_lock:
+            meta = self._session_meta.get(name)
+            return dict(meta) if meta else None
 
     def set_session_meta(self, name: str, *, tenant_id: str, agent_id: str) -> None:
         """T65.6: 给 session 写元数据 (POST /sessions 时调).
 
         T66.6.1: 镜像写到 lease_manager.sessions_index — 跨重启保留.
+        T101 audit fix: lock 保护 self._session_meta 写, 防止与 _do_idle_recycle race.
         """
-        prev = self._session_meta.get(name, {})
-        meta = {
-            "tenant_id": tenant_id,
-            "agent_id": agent_id,
-            "created_at": prev.get("created_at", time.time()),
-        }
-        self._session_meta[name] = meta
+        with self._session_lock:
+            prev = self._session_meta.get(name, {})
+            meta = {
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "created_at": prev.get("created_at", time.time()),
+            }
+            self._session_meta[name] = meta
         # 持久化到 sessions_index — 失败不抛 (内存写已生效)
         if self.lease_manager is not None:
             try:
@@ -234,8 +254,9 @@ class _AsyncOwner:
         try:
             ok = self.run(_release())
             if ok:
-                self._session_last_used.pop(name, None)
-                self._session_meta.pop(name, None)
+                with self._session_lock:
+                    self._session_last_used.pop(name, None)
+                    self._session_meta.pop(name, None)
             return ok
         except Exception:
             return False
@@ -249,8 +270,9 @@ class _AsyncOwner:
             async with self.pool._lock:
                 ok = self.pool._controllers.pop(name, None) is not None
             if ok:
-                self._session_last_used.pop(name, None)
-                self._session_meta.pop(name, None)
+                with self._session_lock:
+                    self._session_last_used.pop(name, None)
+                    self._session_meta.pop(name, None)
             return ok
         except Exception:
             return False
@@ -579,7 +601,10 @@ class TransparentBrowserDaemon:
         self._allow_data_scheme: bool = allow_data_scheme
         # T66.8: SSRF 预解析缓存 — 命中 (host+port) 后直接跳过解析, 减少 lat.
         # 也堵住 DNS rebinding 路径 (解析一次锁住 IP).
-        self._ssrf_cache: dict[str, tuple[str, frozenset[str]]] = {}
+        # T101 audit fix: 删 _ssrf_cache 死代码 (审计 [13]).
+        # 之前注释说要 "解析一次锁住 IP 防 DNS rebinding", 但代码从没用它 — 留了 5 行
+        # 死代码还增加了 cognitive load. 真要防 DNS rebinding 应在 _check_url 实现,
+        # 不应留个空 dict 在这.
         # T59: SSE pressure events — 上次发布的压力等级 (None=未发布, 'normal'/'soft'/'high'/'critical')
         self._pressure_level: str | None = None
         # T61: storage_state 自动快照 (fable §5.4)

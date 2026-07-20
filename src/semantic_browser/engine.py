@@ -175,6 +175,10 @@ class SemanticBrowser:
         """
         浏览一个 URL 的完整流程：
         打开 → 快照 → 分类 → 提取正文 → 提取接口 → 记忆。
+
+        T104 fix: Playwright 失败时 (Page crashed / net error / anti-bot 阻),
+        page 会卡在坏状态. 之前所有后续 query 都返 0. 现在 try/finally
+        失败时 reset page (goto about:blank) 解锁下一 query.
         """
         if not self._started:
             await self.start()
@@ -182,30 +186,40 @@ class SemanticBrowser:
         t0 = time.time()
         logger.info("Browsing: %s", url)
 
-        # 1. 打开页面
         page = await self.controller.open(url)
 
-        # 2. 语义快照
-        snap_engine = SnapshotEngine(page)
-        snapshot = await snap_engine.capture(base_url=url)
+        try:
+            # 2. 语义快照
+            snap_engine = SnapshotEngine(page)
+            snapshot = await snap_engine.capture(base_url=url)
 
-        # 3. 页面分类（LLM 增强分类器是 async）
-        if hasattr(self.classifier, '_llm_classify'):
-            classification = await self.classifier.classify(snapshot)
-        else:
-            classification = self.classifier.classify(snapshot)
-        snapshot.page_type = classification.page_type
+            # 3. 页面分类（LLM 增强分类器是 async）
+            if hasattr(self.classifier, '_llm_classify'):
+                classification = await self.classifier.classify(snapshot)
+            else:
+                classification = self.classifier.classify(snapshot)
+            snapshot.page_type = classification.page_type
 
-        # 4. 内容提取（如果是文章/文档类）
-        article = None
-        interfaces = None
-        if extract_content:
-            extractor = ContentExtractor(page)
-            if classification.page_type in ("article", "docs", "unknown"):
-                article = await extractor.extract_article()
-            interfaces = await extractor.extract_interfaces()
-
-        elapsed = time.time() - t0
+            # 4. 内容提取（如果是文章/文档类）
+            article = None
+            interfaces = None
+            if extract_content:
+                extractor = ContentExtractor(page)
+                if classification.page_type in ("article", "docs", "unknown"):
+                    article = await extractor.extract_article()
+                interfaces = await extractor.extract_interfaces()
+        except Exception as e:
+            # T104 fix: page 卡坏状态. 失败时 reset page 到 about:blank
+            # 否则后续 query 全污染 (实测: 1 个 Amazon 查询后, 后续 5+ 个
+            # 站都返 0 sources 因为共享 browser 处于半坏状态)
+            logger.warning("browse failed for %s (%s); resetting page", url, e)
+            try:
+                await page.goto("about:blank", timeout=5)
+            except Exception:
+                pass  # page 死了, 下一 query 拿新 controller
+            raise
+        finally:
+            elapsed = time.time() - t0
 
         # 5. 存入记忆
         self._record_to_memory(url, snapshot, classification, page.url)

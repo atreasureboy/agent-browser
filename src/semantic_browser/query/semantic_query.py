@@ -336,8 +336,11 @@ class SemanticQuery:
         """
         # Cache 命中检查: 相同 (query, start_url) 在 TTL 内直接复用
         # T73: opt-in HTTP HEAD 304 检查 (默认关闭 — 多 1 个 round-trip)
+        # T101: per-call TTL override via run_cache_ttl
         if self.cache_enabled and start_url is not None:
-            cache_fresh, ans = await self._validate_cache_hit(query, start_url)
+            cache_fresh, ans = await self._validate_cache_hit(
+                query, start_url, cache_ttl_s=run_cache_ttl,
+            )
             if cache_fresh and ans is not None:
                 logger.info("query cache HIT")
                 import copy
@@ -361,15 +364,17 @@ class SemanticQuery:
         result = SemanticAnswer(query=query)
         budget_obj = TokenBudget(budget or self.default_budget)
         max_p = max_pages if max_pages is not None else self.max_pages
-        # T97: 允许 run() 级 cache_persist_path / cache_ttl_s / clear_cache 覆盖
-        if cache_persist_path is not None:
-            self.cache_persist_path = cache_persist_path
-            if self._cache:
-                # 已加载旧 cache → 不动; 首次调用 _save_cache 时会写到新路径
-                pass
-        if cache_ttl_s is not None:  # T100 audit fix: drop != DEFAULT guard, let explicit override work
-            self.cache_ttl_s = cache_ttl_s
+        # T101 audit fix: 不再 mutate self.* (共享 instance 多 run() race).
+        # 改用 per-call 局部变量; _validate_cache_hit 用 self.cache_ttl_s (构造时固定),
+        # _save_cache 用 per-call save_path.
+        run_cache_ttl = (
+            cache_ttl_s if cache_ttl_s is not None
+            else self.cache_ttl_s
+        )
+        save_path = cache_persist_path if cache_persist_path is not None else self.cache_persist_path
         if clear_cache:
+            # 清理只影响本次 run — 但 cache 是共享 instance 的, clear 会影响其他 in-flight.
+            # TODO: 加 cache lock 让 clear 原子 (但目前 daemon 用 semaphore 隔离, 影响小)
             self._cache.clear()
             self._cache_hits = 0
             self._cache_misses = 0
@@ -596,7 +601,7 @@ class SemanticQuery:
                 self._cache[cache_key] = (time.time(), result)
                 # T68: 同步到磁盘 (异步 fire-and-forget)
                 if self.cache_persist_path:
-                    self._save_cache(self.cache_persist_path)
+                    self._save_cache(save_path)
 
         except BudgetExceeded as e:
             logger.warning("token budget exhausted during query")
@@ -892,7 +897,10 @@ class SemanticQuery:
             logger.debug("T73 freshness check failed for %s: %s", url, e)
             return True, etag, last_modified
 
-    async def _validate_cache_hit(self, query: str, start_url: str) -> tuple[bool, SemanticAnswer | None]:
+    async def _validate_cache_hit(
+        self, query: str, start_url: str, *,
+        cache_ttl_s: Optional[float] = None,
+    ) -> tuple[bool, SemanticAnswer | None]:
         """T73: cache hit 验证 — 如果有 ETag/Last-Modified, HEAD 304 检查.
 
         Returns:
@@ -903,7 +911,10 @@ class SemanticQuery:
         if not cached:
             return False, None
         ts, ans = cached
-        # TTL check first (cheap)
+        # TTL check first (cheap). T101: 用 per-call cache_ttl_s (默认 self.cache_ttl_s)
+        ttl_to_use = cache_ttl_s if cache_ttl_s is not None else self.cache_ttl_s
+        if (time.time() - ts) >= ttl_to_use:
+            return False, None
         if (time.time() - ts) >= self.cache_ttl_s:
             return False, None
         # ETag / Last-Modified check (network, only if enabled + present)

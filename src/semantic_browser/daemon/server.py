@@ -248,16 +248,23 @@ class _AsyncOwner:
             return False  # default 不能释放
 
         async def _release() -> bool:
-            async with self.pool._lock:
-                return self.pool._controllers.pop(name, None) is not None
+            # T112 audit fix: 之前直接 self.pool._controllers.pop(name) 跳过
+            # 了 controller._context.close() — BrowserContext 永不释放, 直到
+            # daemon shutdown 才统一清理. 修: 走 pool.release() — 它是唯一会
+            # 关 context 的入口.
+            await self.pool.release(name)
+            return True  # pool.release 静默吞 missing-name, 我们自己判断
 
+        # 之前要看 pop 是否命中. 现在无法直接知道 (release 静默吞 missing).
+        # 加个预检: pop 之前看 dict 里有没有.
+        had = name in self.pool._controllers
         try:
-            ok = self.run(_release())
-            if ok:
+            self.run(_release())
+            if had:
                 with self._session_lock:
                     self._session_last_used.pop(name, None)
                     self._session_meta.pop(name, None)
-            return ok
+            return had
         except Exception:
             return False
 
@@ -266,14 +273,16 @@ class _AsyncOwner:
         (e.g. _sweep_idle_sessions). 不会 deadlock."""
         if name == self.DEFAULT_SESSION:
             return False
+        had = name in self.pool._controllers
         try:
-            async with self.pool._lock:
-                ok = self.pool._controllers.pop(name, None) is not None
-            if ok:
+            # T112 audit fix: 同 release_session 路径 — 必须走 pool.release
+            # 才能关 BrowserContext.
+            await self.pool.release(name)
+            if had:
                 with self._session_lock:
                     self._session_last_used.pop(name, None)
                     self._session_meta.pop(name, None)
-            return ok
+            return had
         except Exception:
             return False
 
@@ -4154,14 +4163,14 @@ class TransparentBrowserDaemon:
 
 
 def _topic_matches_pattern(pattern: str, topic: str) -> bool:
-    """T59 helper: pattern can be 'system.*' or exact 'system.pressure' or '*'."""
-    if pattern == "*":
-        return True
-    if pattern == topic:
-        return True
-    if pattern.endswith(".*"):
-        return topic.startswith(pattern[:-1])
-    return False
+    """T112 audit fix: 转发到 event_bus._topic_matches — 之前 1:1 copy-paste.
+
+    这里 thin wrapper 保留原因: 调用点多, 改 import 路径噪. 实际逻辑
+    全在 semantic_browser.event_bus._topic_matches. 改主题匹配行为时只
+    改那边一处, 这边自动跟.
+    """
+    from semantic_browser.event_bus import _topic_matches
+    return _topic_matches(pattern, topic)
 
 
 def main(argv: list[str] | None = None) -> None:

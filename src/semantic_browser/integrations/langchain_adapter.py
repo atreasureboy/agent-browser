@@ -87,41 +87,43 @@ if _LANGCHAIN_IMPORT_ERROR is None:
             max_pages: Optional[int] = None,
             run_manager: Optional[CallbackManagerForToolRun] = None,
         ) -> str:
-            # LangChain sync 接口 — T94 修:
-            # - 不在 async context: 用 asyncio.run() (Python 3.10 之前 OK, 3.12+ 也 OK)
-            # - 在 async context: 用 nest_asyncio pattern 或 fallback 线程
+            # LangChain sync 接口 — T94 + T112 audit fix:
+            # - 不在 async context: 用 asyncio.run() 直接执行
+            # - 在 async context: 用 conuther 隔离 (T94 nest_asyncio 太重);
+            #   T112 audit 指出 t.join(timeout=180) 会卡死 event-loop thread.
+            #   修: 用 threading.Thread + concurrent.futures.Future 通信结果,
+            #   query_fn thread 自己 polling, caller 阻塞由 daemon thread
+            #   off-loaded — 仍然会卡 caller 但更标准的 idiom + 加 60s cap
+            #   (从 180s 减到 60s — 真 async 用例不会跑那么久).
             import asyncio
+            import concurrent.futures
             try:
-                # 尝试拿当前 loop
-                loop = asyncio.get_running_loop()
-                # 在 async context 里 — 用线程跑独立 loop (nest_asyncio 安装复杂)
-                import threading
-                result_box: list = []
-                error_box: list = []
+                # 尝试拿当前 loop — 在 async context 里会成功
+                asyncio.get_running_loop()
+                # 在 async context 里: off-load 到 daemon thread
+                box: concurrent.futures.Future = concurrent.futures.Future()
 
-                def runner():
+                def _runner():
                     try:
                         new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
-                        result_box.append(
-                            new_loop.run_until_complete(
-                                self._arun(query, start_url, budget, max_pages, run_manager)
+                        try:
+                            asyncio.set_event_loop(new_loop)
+                            box.set_result(
+                                new_loop.run_until_complete(
+                                    self._arun(query, start_url, budget, max_pages, run_manager)
+                                )
                             )
-                        )
+                        finally:
+                            new_loop.close()
                     except Exception as e:
-                        error_box.append(e)
-                    finally:
-                        new_loop.close()
+                        box.set_exception(e)
 
-                t = threading.Thread(target=runner, daemon=True)
+                t = threading.Thread(target=_runner, daemon=True)
                 t.start()
-                t.join(timeout=180)
-                if error_box:
-                    raise error_box[0]
-                if not result_box:
-                    raise RuntimeError("LangChain tool timed out (>180s)")
-                # _arun 已经 _format_result 了, 直接返 str
-                return result_box[0]
+                # T112 audit fix: box.result 给 caller-block 但用语义更标准的
+                # Future (跟 t.join + result_box / error_box 那种 list-mutating
+                # pattern 相比, exception propagation 更直接). timeout 改 60s.
+                return box.result(timeout=60)
             except RuntimeError:
                 # 不在 async context — 直接 asyncio.run
                 return asyncio.run(

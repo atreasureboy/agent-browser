@@ -82,6 +82,9 @@ class RelevanceFilter:
         self.llm = llm
         self.tier = tier
         self.threshold = threshold
+        # T112 audit fix: 复用共享 fenced-JSON 解析 (避免本页 inline re.compile)
+        from semantic_browser.llm.json_utils import loads_json_strip_fence
+        self._loads = loads_json_strip_fence
 
     async def score(
         self,
@@ -123,14 +126,18 @@ class RelevanceFilter:
                 {"role": "user", "content": user_prompt},
             ]
             try:
-                resp = await self.llm.complete_json_with_fallback(
+                # T112 audit fix: 同 planner — 用底层 complete_with_fallback
+                # 拿真 .usage, 不要靠 dict.usage (永远空).
+                llm_resp = await self.llm.complete_with_fallback(
                     messages, tier=self.tier, temperature=0.1, max_tokens=1500,
+                    json_mode=True,
                 )
                 if budget is not None:
                     try:
-                        budget.add(getattr(resp, "usage", {}) or {})
+                        budget.add(getattr(llm_resp, "usage", None) or {})
                     except Exception:
                         pass
+                resp = self._loads(llm_resp.content)
             except Exception as e:
                 logger.warning("Relevance M3 call failed: %s; keyword fallback", e)
                 # 这一批退到 keyword fallback, 不影响其它批

@@ -32,10 +32,8 @@ Provider:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 from typing import Any, Literal, Optional
 
 from semantic_browser.llm.types import LLMResponse, LLMUnavailableError
@@ -176,13 +174,10 @@ class LLMService:
             messages, tier=tier, temperature=temperature, max_tokens=max_tokens,
             json_mode=True,
         )
-        content = resp.content
-        # 部分 API 不严格遵守 json_mode, 兜底再剥一次 ```json ... ``` 包裹
-        if "```" in content:
-            m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-            if m:
-                content = m.group(1).strip()
-        return json.loads(content)
+        # T112 audit fix: dedup — 之前 inline compile r"```(?:json)?\s*(.*?)```"
+        # 跟下面 complete_json_with_fallback + snapshot/vision.py 等 4 处同 regex.
+        from semantic_browser.llm.json_utils import loads_json_strip_fence
+        return loads_json_strip_fence(resp.content)
 
     # ── T72: fallback chain ───────────────────────────────────
 
@@ -250,12 +245,9 @@ class LLMService:
             messages, tier=tier, temperature=temperature,
             max_tokens=max_tokens, json_mode=True, fallback_chain=fallback_chain,
         )
-        content = resp.content
-        if "```" in content:
-            m = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-            if m:
-                content = m.group(1).strip()
-        return json.loads(content)
+        # T112 audit fix: dedup — 同 complete_json.
+        from semantic_browser.llm.json_utils import loads_json_strip_fence
+        return loads_json_strip_fence(resp.content)
 
     def stats(self) -> dict[str, Any]:
         """返回调用统计 (provider + cheap/medium/smart 各自次数)."""

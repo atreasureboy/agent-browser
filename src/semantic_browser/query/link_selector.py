@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from semantic_browser.llm.service import LLMService, Tier
+from semantic_browser.llm.json_utils import loads_json_strip_fence as _loads_json_strip_fence
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -95,14 +96,18 @@ class LinkSelector:
             {"role": "user", "content": user_prompt},
         ]
         try:
-            resp = await self.llm.complete_json(
+            # T112 audit fix: 同 planner/relevance — complete_json 返 dict 没
+            # .usage. 改走底层 complete_with_fallback 拿真 LLMResponse.
+            llm_resp = await self.llm.complete_with_fallback(
                 messages, tier=self.tier, temperature=0.2, max_tokens=300,
+                json_mode=True,
             )
             if budget is not None:
                 try:
-                    budget.add(getattr(resp, "usage", {}) or {})
+                    budget.add(getattr(llm_resp, "usage", None) or {})
                 except Exception:
                     pass
+            resp = _loads_json_strip_fence(llm_resp.content)
             next_url = resp.get("next_url")
             if not next_url or not isinstance(next_url, str):
                 return None

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from semantic_browser.llm.service import LLMService, Tier, LLMUnavailableError
+from semantic_browser.llm.json_utils import loads_json_strip_fence as _loads_json_strip_fence
 
 logger = logging.getLogger(__name__)
 
@@ -112,14 +113,20 @@ class QueryPlanner:
         ]
 
         try:
-            resp = await self.llm.complete_json_with_fallback(
+            # T112 audit fix: 之前 resp = complete_json_with_fallback() 返 dict.
+            # 然后 resp.usage — dict 没 .usage 属性, hasattr 永远 False,
+            # budget.add({}) → budget 永不累加. 改: 用底层的 complete_with_fallback
+            # 拿真 LLMResponse (含 .usage), 然后 json.loads 内容.
+            llm_resp = await self.llm.complete_with_fallback(
                 messages, tier=self.tier, temperature=0.3, max_tokens=500,
+                json_mode=True,
             )
             if budget is not None:
                 try:
-                    budget.add(resp.usage if hasattr(resp, "usage") else {})
+                    budget.add(getattr(llm_resp, "usage", None) or {})
                 except Exception:
                     pass
+            resp = _loads_json_strip_fence(llm_resp.content)
             return QueryPlan.from_dict(resp)
         except (LLMUnavailableError, json.JSONDecodeError, Exception) as e:
             # M3 调用失败 / JSON 解析失败 → 退化到启发式 (让上层仍能跑)

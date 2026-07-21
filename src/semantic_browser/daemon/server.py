@@ -655,8 +655,13 @@ class TransparentBrowserDaemon:
         # 不影响现有启发式-only 路径. URL → 分类结果 缓存 (256 LRU) 避免重复 LLM call.
         self._llm_classifier: Any = None
         self._llm_classifier_lock = threading.Lock()
+        # T115 audit fix: _classify_cache 之前完全无 lock — 多 HTTP 线程
+        # 同一 URL 并发 /open 会 double-call LLM, 计数 lost-update, 偶发
+        # 'dict changed size during iteration'. 加 _classify_cache_lock 守护
+        # 所有读 + 写 + 计数.
         self._classify_cache: dict[str, dict[str, Any]] = {}
         self._classify_cache_max = 256
+        self._classify_cache_lock = threading.Lock()
         # T64: 运维观测 — LLM call 成功 / 失败计数, /capacity 暴露
         self._classify_llm_calls: int = 0
         self._classify_llm_failures: int = 0
@@ -1396,11 +1401,21 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/queue":
             import time as _time
             now = _time.time()
+            # T115 audit fix: 读 self._current_op / self._op_started_at /
+            # self._op_waiters 之前完全 lockless — 跟其它线程写竞争会 torn.
+            # 加 _op_waiters_lock 守护所有读 (写端在 _handle 进锁时已经带
+            # 这个 lock; 但读端没加 — 补上). _current_op / _op_started_at
+            # 也在 op_lock 写, 真正安全要 op_lock 守护; 但 /queue 在
+            # _NO_LOCK_PATHS 不进 op_lock, 所以用 op_lock.locked() 跟
+            # 各字段 snapshot 一起返 — agent 看到 lock_held=True 就知道
+            # snapshot 可能是 mid-write 的 stale view.
+            with self._op_waiters_lock:
+                waiters_snap = self._op_waiters
             return {
                 "current_op": self._current_op,
                 "running_for_s": round(now - self._op_started_at, 2) if self._op_started_at else None,
                 "lock_held": self.owner.op_lock.locked(),
-                "waiters": self._op_waiters,
+                "waiters": waiters_snap,
                 "lock_timeout_s": _OP_LOCK_TIMEOUT_S,
             }
         if method == "GET" and path == "/state":
@@ -1415,6 +1430,10 @@ class TransparentBrowserDaemon:
             # T65.5: 内存预算走设计文档 §1.2 公式 — 用常量替代硬编码数字, 让
             # 评审 D7 (K=16) + D11 (16GB 小机 M=4/K=8) 调整时一处改动即可.
             mem_per_browser_mb, mem_total_mb, mem_high_watermark_mb = self._compute_mem_budget()
+            # T115 audit fix: 在 lock 内 snapshot cache size — 避免跟 _cache_put
+            # 竞争 torn read. 必须在 dict literal 外面.
+            with self._classify_cache_lock:
+                cache_size_snapshot = len(self._classify_cache)
             return {
                 "sessions_active": len(sessions),
                 "sessions_max": K,
@@ -1444,7 +1463,8 @@ class TransparentBrowserDaemon:
                     round(self._classify_llm_failures / max(self._classify_llm_calls, 1), 3)
                     if self._classify_llm_calls else None
                 ),
-                "classify_cache_size": len(self._classify_cache),
+                # T115 audit fix: cache size 在外面 lock 内读好了, 不会 torn read.
+                "classify_cache_size": cache_size_snapshot,
                 "classify_cache_hits": self._classify_cache_hits,
                 # T65.6: 按 tenant 分布 — 多 agent 共享 daemon 时给 ops 一眼
                 # 看出每 tenant 用了多少 slot.
@@ -3007,9 +3027,11 @@ class TransparentBrowserDaemon:
         # 1. 缓存命中 → 直接返 (按 URL 维度, agent 二次访问同 URL 秒返)
         #    force=True 时跳过 — 给 agent 强制重分类的口子
         cache_key = snap.url
-        if not force and cache_key in self._classify_cache:
-            self._classify_cache_hits += 1
-            return self._classify_cache[cache_key], "cached"
+        # T115 audit fix: 读 + 计数 + 拿值 一组操作, 全在 lock 内.
+        with self._classify_cache_lock:
+            if not force and cache_key in self._classify_cache:
+                self._classify_cache_hits += 1
+                return self._classify_cache[cache_key], "cached"
         # 2. 启发式 (同步, < 1ms)
         heur = PageClassifier().classify(snap)
         heur_dict = self._normalize_confidence(heur.to_dict())
@@ -3064,12 +3086,15 @@ class TransparentBrowserDaemon:
         """T63.2: LRU-ish 缓存 put — 超出 max 时清最早插入 (dict popitem
         在 3.7+ 是 FIFO 插入序). 实际 eviction 不严格, 只在超 cap 一步删一条,
         agent 长会话期内 cache 命中率高 (重复 /open 同一站 是常态)."""
-        if len(self._classify_cache) >= self._classify_cache_max:
-            try:
-                self._classify_cache.popitem()  # FIFO eviction
-            except KeyError:
-                pass
-        self._classify_cache[key] = value
+        # T115 audit fix: 整个 FIFO evict + insert 必须在 lock 内 — 否则
+        # 两个线程同时检查 len < max, 都成功 insert, 最终 size 翻倍超过 max.
+        with self._classify_cache_lock:
+            if len(self._classify_cache) >= self._classify_cache_max:
+                try:
+                    self._classify_cache.popitem()  # FIFO eviction
+                except KeyError:
+                    pass
+            self._classify_cache[key] = value
 
     async def _snapshot(self, detail_level: str = "normal", session: str | None = None) -> dict[str, Any]:
         ctrl = await self.owner.aget_controller(session)

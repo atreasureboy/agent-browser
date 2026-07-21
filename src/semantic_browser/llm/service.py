@@ -117,11 +117,18 @@ class LLMService:
         return self._provider
 
     def model_for(self, tier: Tier) -> str:
+        # T115 audit fix: 之前 unknown tier (e.g. "ultra" typo) 静默返 model_smart.
+        # 配上 config 把 model_smart 留空 → 空 model 字段送到 provider.
+        # 修: 不在白名单就 raise ValueError, 让 caller 早 fail.
         if tier == "cheap":
             return self.model_cheap
         if tier == "medium":
             return self.model_medium
-        return self.model_smart
+        if tier == "smart":
+            return self.model_smart
+        raise ValueError(
+            f"unknown tier: {tier!r}; expected one of {{'cheap','medium','smart'}}"
+        )
 
     # ── 主入口 ─────────────────────────────────────────────
 

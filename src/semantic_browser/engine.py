@@ -189,13 +189,13 @@ class SemanticBrowser:
         if not self._started:
             await self.start()
 
-        fallback_used = None  # T108: 记录是否走了 fallback
+        # T113 audit fix: 之前有 fallback_used = None + if fallback_used:
+        # 但 fallback_used 从未赋值, 是死代码. fallback source 在 _try_fallback_browse
+        # 里直接写到 snapshot.meta['__fallback_source']. 删掉这块.
         try:
             result = await self._browse_once(
                 url, extract_content=extract_content,
             )
-            if fallback_used:
-                result.snapshot.meta["__fallback"] = fallback_used
             return result
         except Exception as primary_err:
             # T108: 主路径 fail. 试 fallback (除非 caller 明确禁用).

@@ -372,12 +372,65 @@ class ContentExtractor:
             conf += 0.1
         article.extraction_confidence = min(conf, 1.0)
 
+        # T105 fix: Readability 对 modern SPA / wiki / forum 失败时 sections 是空.
+        # Fallback: 抓 main/article/<p> 容器里所有 paragraphs, 当 1 个 section
+        if not article.sections and article.word_count > 100:
+            fallback_sections = await self._fallback_extract_paragraphs()
+            if fallback_sections:
+                article.sections = fallback_sections
+                article.extraction_confidence = max(
+                    article.extraction_confidence, 0.4,
+                )
+                logger.info(
+                    "T105 fallback: extracted %d sections from raw <p>",
+                    len(fallback_sections),
+                )
+
         logger.info(
             "Article extracted: '%s' (%d sections, %d chars, conf=%.0f%%)",
             article.title[:50], len(article.sections),
             article.word_count, article.extraction_confidence * 100,
         )
         return article
+
+    async def _fallback_extract_paragraphs(self) -> list[dict]:
+        """T105: Readability 失败时 fallback — 抓 <main> / <article> / <p> 里所有段落.
+
+        适用场景: Wikipedia / modern SPA (React 渲染后) / HN 讨论页 / 小型文档站.
+        不需要 Readability 的 score 选最佳容器 — 简单取 main content.
+        """
+        try:
+            raw = await self.page.evaluate(r"""() => {
+                const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                // T105 debug: 多种 fallback 容器 (Wikipedia 用 role=main, 现代 SPA 用 <main>,
+                // HN/Reddit 论坛用 .comment, generic 用 body)
+                const root = document.querySelector('main')
+                    || document.querySelector('[role="main"]')
+                    || document.querySelector('article')
+                    || document.querySelector('#content, #main, .main-content, .post-content')
+                    || document.body;
+                if (!root) return { sections: [], debug: 'no root' };
+                const isNoise = (el) => !!el.closest(
+                    'nav, footer, aside, header, [role="navigation"], .sidebar, .menu, .nav, .footer, .advertisement, .ads, .noprint, .metadata'
+                );
+                const paras = Array.from(root.querySelectorAll('p'))
+                    .filter(p => !isNoise(p) && clean(p.textContent).length > 30)
+                    .map(p => clean(p.textContent));
+                const firstHeading = root.querySelector('h1, h2, h3');
+                const heading = firstHeading ? clean(firstHeading.textContent) : '';
+                return { sections: [{ heading: heading, level: 2, paragraphs: paras }], debug: `root=${root.tagName}#${root.id||''} paras=${paras.length}` };
+            }""")
+        except Exception as e:
+            logger.info("T105 fallback page.evaluate failed: %s", e)
+            return []
+        if not raw or not raw.get("sections"):
+            logger.info("T105 fallback: no sections, debug=%s", raw.get('debug') if raw else 'none')
+            return []
+        out = []
+        for s in raw["sections"]:
+            if s.get("paragraphs"):
+                out.append(s)
+        return out
 
     async def extract_interfaces(self) -> InterfaceSummary:
         """提取页面可交互接口。"""

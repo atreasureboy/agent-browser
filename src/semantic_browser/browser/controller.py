@@ -181,18 +181,28 @@ class BrowserController:
         if self._browser is not None:
             return  # 已启动
         self._playwright = await async_playwright().start()
+        # T106: 加 BROWSER_DISABLE_OPTIONS (参考 Crawl4AI) — 减分用
+        from semantic_browser.safety.stealth import BROWSER_DISABLE_OPTIONS
         self._browser = await self._playwright.chromium.launch(
             headless=self.config.headless,
+            args=BROWSER_DISABLE_OPTIONS,
         )
         await self._start_context()
 
     async def _start_context(self) -> None:
         """T33: 给当前 controller 创建独立 context. Pool 用 — 不重复启动 browser."""
         import os
+        # T106: 默认 user_agent 走 random 真 UA (减分用)
+        from semantic_browser.safety.stealth import random_user_agent
+        user_agent = self.config.user_agent or random_user_agent()
         context_kwargs = {
             "viewport": self.config.viewport,
-            "user_agent": self.config.user_agent,
+            "user_agent": user_agent,
             "locale": self.config.locale,
+            # T106: 隐藏 webdriver 标志 (关键! Playwright 默认 true 暴露 automation)
+            "extra_http_headers": {
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         }
         if self.config.storage_state_path and os.path.exists(self.config.storage_state_path):
             context_kwargs["storage_state"] = self.config.storage_state_path
@@ -323,8 +333,24 @@ class BrowserController:
         return len(remaining)
 
     async def _ensure_page(self) -> Page:
-        """确保有 current_page — 必要时建一个。"""
-        if self._page is None or self._page.is_closed():
+        """确保有 current_page — 必要时建一个。
+
+        T104 fix: 不只查 is_closed() — 也查 is_crashed() (page.goto Page crashed
+        后 is_closed=False 但 page 不可用). crashed 也当作需要重建.
+        """
+        need_new = (
+            self._page is None
+            or self._page.is_closed()
+            or self._page.evaluate("() => 1")  # 触发任何 evaluate 都会抛
+            if self._page is not None else False
+        )
+        if hasattr(self._page, "is_crashed") and self._page is not None:
+            try:
+                if self._page.is_crashed():
+                    need_new = True
+            except Exception:
+                pass
+        if self._page is None or need_new:
             if self._context is None:
                 # T33: Pool 创建的 controller 共享 browser 但 context 还没建
                 if self._browser is not None:
@@ -332,6 +358,10 @@ class BrowserController:
                 else:
                     await self.start()
             self._page = await self._context.new_page()
+            # T106: 减分用 stealth JS — 隐藏 webdriver + 模拟真人 plugins/languages
+            # 必须在 page load 前 inject. addInitScript 在每个 page 创建时跑.
+            from semantic_browser.safety.stealth import STEALTH_JS
+            await self._context.add_init_script(STEALTH_JS)
             # T40i: WebSocket 监控 (per-page, open 握手触发)
             self._page.on("websocket", self._on_websocket)
             self._active_idx = 0

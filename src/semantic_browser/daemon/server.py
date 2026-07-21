@@ -1719,6 +1719,12 @@ class TransparentBrowserDaemon:
             action_name = args["action"]
             action_args = args.get("args", {})
             max_retries = int(args.get("max_retries", 2))
+            # T111 audit fix: 上限 clamp, 防止 max_retries=999999 hold 锁超时.
+            # 默认 2, 顶 10 (操作 retry 真不需要更多 — 内部 already 在 retry).
+            if max_retries < 0:
+                max_retries = 0
+            elif max_retries > 10:
+                max_retries = 10
             # T99 (audit fix): SSRF guard 对所有可能含 url 的 action 生效
             # — 不只 open. click(type) 也可能带 url 字段 (e.g. 跳转到外部链接)
             # T66.8: SSRF guard — action=open 时 url 也在 SSRF 黑名单兜底.
@@ -1755,10 +1761,17 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/forward":
             return self.owner.run(self._forward())
         if method == "POST" and path == "/screenshot":
-            return self.owner.run(self._screenshot(args.get("path")))
+            spath = args.get("path")
+            # T111 audit fix: 路径遍历闸 — 用户给 "/etc/cron.d/x" 直接写文件.
+            if spath:
+                spath = self._safe_resolve_path(spath, where="screenshot")
+            return self.owner.run(self._screenshot(spath))
         if method == "POST" and path == "/screenshot/annotated":
-            # 返回 PNG bytes (base64) + sidecar JSON
-            return self.owner.run(self._screenshot_annotated(args.get("path")))
+            spath = args.get("path")
+            # T111 audit fix: 同上.
+            if spath:
+                spath = self._safe_resolve_path(spath, where="screenshot_annotated")
+            return self.owner.run(self._screenshot_annotated(spath))
         if method == "POST" and path == "/screenshot/sidecar":
             # 只要 sidecar (没 PNG), 给 LLM 用来 plan 操作
             return self.owner.run(self._screenshot_sidecar())
@@ -1792,6 +1805,10 @@ class TransparentBrowserDaemon:
             url = args.get("url", "")
             if not url:
                 raise ValueError("url required")
+            # T111 audit fix: SSRF coverage — /script-source 直接 httpx.get(url),
+            # 之前没 _check_url. 攻击者可拿这个 endpoint 当 /open 旁路打到
+            # 169.254.169.254 / 内网. 加闸门跟 /open 行为一致.
+            self._check_url(url, where="script_source")
             return self.owner.run(self.owner.browser.controller.fetch_script_source(url))
         # T40a: 客户端存储探针 (local/session + cookies)
         if method == "GET" and path == "/storage":
@@ -1801,12 +1818,16 @@ class TransparentBrowserDaemon:
             url = args.get("url", "")
             if not url:
                 raise ValueError("url required")
+            # T111 audit fix: get_security_headers 也走 httpx fetch — 需 SSRF.
+            self._check_url(url, where="security_headers")
             return self.owner.run(self.owner.browser.controller.get_security_headers(url))
         # T40b: Hidden paths probe (httpx 探测常见路径)
         if method == "GET" and path == "/probe-paths":
             url = args.get("url", "")
             if not url:
                 raise ValueError("url required")
+            # T111 audit fix: probe_paths 内部 httpx 发请求, SSRF.
+            self._check_url(url, where="probe_paths")
             cats_raw = args.get("categories", "")
             categories = [c for c in cats_raw.split(",") if c] if cats_raw else None
             return self.owner.run(self.owner.browser.controller.probe_paths(
@@ -1827,6 +1848,8 @@ class TransparentBrowserDaemon:
             endpoint = args.get("endpoint", "")
             if not endpoint:
                 raise ValueError("endpoint required")
+            # T111 audit fix: detect_graphql 也发 introspection POST.
+            self._check_url(endpoint, where="detect_graphql")
             return self.owner.run(
                 self.owner.browser.controller.detect_graphql(endpoint)
             )
@@ -1842,8 +1865,11 @@ class TransparentBrowserDaemon:
             return {"cleared": True}
         # T43a: 子域名枚举
         if method == "GET" and path == "/enumerate-subdomains":
+            host = args["host"]
+            # T111 audit fix: enumerate_subdomains 用 DoH + TLS SAN, 需 SSRF.
+            self._check_url(f"https://{host}", where="enumerate_subdomains")
             return self.owner.run(self.owner.browser.controller.enumerate_subdomains(
-                host=args["host"],
+                host=host,
                 include_tls_san=str(args.get("include_tls_san", "true")).lower() != "false",
             ))
         # T43b: JS secret 扫描
@@ -1860,18 +1886,29 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.find_disclosure())
         # T43f: 备份/源码/配置文件
         if method == "GET" and path == "/analyze-exposed-files":
+            base_url = args.get("base_url") or None
+            if base_url:
+                # T111 audit fix: 内部 httpx 探测 paths, SSRF.
+                self._check_url(base_url, where="analyze_exposed_files")
             return self.owner.run(self.owner.browser.controller.analyze_exposed_files(
-                base_url=args.get("base_url") or None,
+                base_url=base_url,
             ))
         # T43g: OpenAPI/Swagger 发现
         if method == "GET" and path == "/discover-api-specs":
+            base_url = args.get("base_url") or None
+            if base_url:
+                # T111 audit fix: 同上.
+                self._check_url(base_url, where="discover_api_specs")
             return self.owner.run(self.owner.browser.controller.discover_api_specs(
-                base_url=args.get("base_url") or None,
+                base_url=base_url,
             ))
         # T43h: TLS 证书 SAN
         if method == "GET" and path == "/tls-subdomains":
+            host = args["host"]
+            # T111 audit fix: 直接发起 TLS 连接 — 需 SSRF 闸.
+            self._check_url(f"https://{host}", where="tls_subdomains")
             return self.owner.run(self.owner.browser.controller.tls_subdomains(
-                host=args["host"], port=int(args.get("port", 443)),
+                host=host, port=int(args.get("port", 443)),
             ))
         # T43i: 技术栈指纹
         if method == "GET" and path == "/fingerprint-tech":
@@ -1881,18 +1918,27 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.decode_jwts())
         # T44a: DNS 记录
         if method == "GET" and path == "/dns-records":
-            return self.owner.run(self.owner.browser.controller.dns_records(host=args["host"]))
+            host = args["host"]
+            # T111 audit fix: DoH resolver 也算 SSRF 入口 (泄露内部 DNS).
+            self._check_url(f"https://{host}", where="dns_records")
+            return self.owner.run(self.owner.browser.controller.dns_records(host=host))
         # T44l 也支持 host
         if method == "GET" and path == "/check-subdomain-takeover" and "host" in args:
+            host = args["host"]
+            # T111 audit fix: 同 dns_records.
+            self._check_url(f"https://{host}", where="check_subdomain_takeover")
             subs = args.get("subdomains")
             return self.owner.run(self.owner.browser.controller.check_subdomain_takeover(
-                host=args["host"],
+                host=host,
                 subdomains=subs if isinstance(subs, list) else None,
             ))
         # T44b: Wayback Machine
         if method == "GET" and path == "/wayback-urls":
+            url = args["url"]
+            # T111 audit fix: wayback_urls 自身通过 archive.org 但 url 要过 SSRF 闸.
+            self._check_url(url, where="wayback_urls")
             return self.owner.run(self.owner.browser.controller.wayback_urls(
-                url=args["url"], limit=int(args.get("limit", 200)),
+                url=url, limit=int(args.get("limit", 200)),
             ))
         # T44c: DOM XSS sinks
         if method == "GET" and path == "/find-xss-sinks":
@@ -1911,9 +1957,13 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.find_cloud_resources())
         # T44h: HTTP methods
         if method == "GET" and path == "/probe-http-methods":
+            base_url = args.get("base_url") or None
+            if base_url:
+                # T111 audit fix: 内部 httpx send 不同 method, SSRF.
+                self._check_url(base_url, where="probe_http_methods")
             paths = args.get("paths")
             return self.owner.run(self.owner.browser.controller.probe_http_methods(
-                base_url=args.get("base_url") or None,
+                base_url=base_url,
                 paths=paths if isinstance(paths, list) else None,
             ))
         # T44i: 2FA
@@ -2061,7 +2111,12 @@ class TransparentBrowserDaemon:
         if method == "POST" and path == "/llm/find-ref":
             return self.owner.run(self._llm_find_ref(args))
         if method == "POST" and path == "/state/save":
-            return self.owner.run(self._save_state(args.get("path")))
+            spath = args.get("path")
+            # T111 audit fix: 路径遍历闸 — storage_state JSON 含 auth tokens,
+            # 写入用户给定路径会造成 token 落入攻击者路径.
+            if spath:
+                spath = self._safe_resolve_path(spath, where="state_save")
+            return self.owner.run(self._save_state(spath))
         if method == "GET" and path == "/tab/list":
             return self.owner.browser.controller.list_tabs()
         if method == "POST" and path == "/tab/new":
@@ -2132,7 +2187,11 @@ class TransparentBrowserDaemon:
         if method == "GET" and path == "/stats":
             return self.memory_store.stats()
         if method == "POST" and path == "/run-workflow":
-            return self.owner.run(self._run_workflow(args["workflow_file"]))
+            wf_path = args["workflow_file"]
+            # T111 audit fix: 路径遍历闸 — workflow_file 是 JSON, 含 "open"
+            # 步骤. 直接 read 文件 + 调 controller.open 跳 SSRF guard.
+            wf_path = self._safe_resolve_path(wf_path, where="run_workflow")
+            return self.owner.run(self._run_workflow(wf_path))
         if method == "GET" and path == "/notes":
             url = args.get("url", "")
             limit = int(args.get("limit", 50))
@@ -2673,6 +2732,35 @@ class TransparentBrowserDaemon:
             )
         except SSRFBlockedError as e:
             raise SSRFBlockedError(f"{where}() blocked: {e}") from None
+
+    def _safe_resolve_path(self, path: str, *, where: str) -> str:
+        """T111 audit fix: path-traversal 集中闸 — 任何 handler 拿用户
+        filesystem path 都应调我. 强制 resolved 路径必须在 ~/.semantic-browser/
+        或 cwd 之内. 防止攻击者传 "/etc/shadow", "/home/x/.ssh/authorized_keys",
+        "../../../proc/self/..." 之类的.
+
+        Returns: 经过 _os.path.realpath + 闸 check 的绝对路径.
+        Raises: ValueError (handler 转 400) on out-of-base.
+        """
+        import os as _os_pathcheck
+        if not path:
+            raise ValueError(f"{where}: path required")
+        # expanduser 处理 '~'; 然后 realpath 解析 '..' 等
+        expanded = _os_pathcheck.path.expanduser(path)
+        resolved = _os_pathcheck.path.realpath(expanded)
+        # 白名单 base: ~/.semantic-browser/ 或 cwd
+        sb_root = _os_pathcheck.path.realpath(
+            _os_pathcheck.path.expanduser("~/.semantic-browser")
+        )
+        cwd = _os_pathcheck.path.realpath(".")
+        in_sb = resolved == sb_root or resolved.startswith(sb_root + _os_path.sep)
+        in_cwd = resolved == cwd or resolved.startswith(cwd + _os_path.sep)
+        if not (in_sb or in_cwd):
+            raise ValueError(
+                f"{where}: path outside allowed dirs "
+                f"(~/.semantic-browser/ or cwd): {resolved}"
+            )
+        return resolved
 
     async def _open(self, url: str, session: str | None = None,
                     *, detail: str = "summary",
@@ -3267,11 +3355,18 @@ class TransparentBrowserDaemon:
 
     async def _discover(self, args: dict[str, Any]) -> dict[str, Any]:
         from semantic_browser.llm import discover, format_sitemap_for_llm
+        # T111 audit fix: 上限 clamp 防止 max_pages=999999 饿死 daemon.
+        # 默认 15, 顶 50; max_depth 顶 5. 超过就跟 /v1/query 一致 silently cap
+        # 而非 reject — caller 不至于被 break.
+        max_pages_raw = int(args.get("max_pages", 15))
+        max_pages = max(1, min(max_pages_raw, 50))
+        max_depth_raw = int(args.get("max_depth", 2))
+        max_depth = max(0, min(max_depth_raw, 5))
         result = await discover(
             self.owner.browser.controller,
             start_url=args["start_url"],
-            max_pages=int(args.get("max_pages", 15)),
-            max_depth=int(args.get("max_depth", 2)),
+            max_pages=max_pages,
+            max_depth=max_depth,
             same_domain_only=bool(args.get("same_domain_only", True)),
             delay_ms=int(args.get("delay_ms", 100)),
         )

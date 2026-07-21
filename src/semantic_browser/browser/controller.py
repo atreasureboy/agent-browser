@@ -382,11 +382,18 @@ class BrowserController:
 
     # ── 基本浏览器动作 ──────────────────────────────────────────
 
-    async def open(self, url: str) -> Page:
-        """打开 URL，等待 networkidle。"""
+    async def open(self, url: str, *, wait_until: str = "domcontentloaded", timeout_ms: int = 30_000) -> Page:
+        """打开 URL, 等到指定事件.
+
+        T108 fix: 默认从 networkidle 改成 domcontentloaded.
+        原 networkidle 在 Amazon 这种 heavy-JS / analytics-streaming
+        站永远不到, 会 30s 超时. domcontentloaded 早得多 (DOM parse 完),
+        同时给脚本一个 reasonable start window. 后续 snapshot 引擎
+        自己会 page.wait_for_function 拿实际元素.
+        """
         page = await self._ensure_page()
-        await page.goto(url, wait_until="networkidle")
-        logger.info("Opened: %s", url)
+        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        logger.info("Opened: %s (wait=%s)", url, wait_until)
         return page
 
     async def back(self) -> None:

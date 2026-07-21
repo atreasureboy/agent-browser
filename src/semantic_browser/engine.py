@@ -7,6 +7,7 @@ Semantic Browser Engine — 核心编排引擎。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -171,18 +172,47 @@ class SemanticBrowser:
 
     async def browse(
         self, url: str, extract_content: bool = True,
+        allow_fallback: bool = True,
     ) -> BrowseResult:
         """
-        浏览一个 URL 的完整流程：
-        打开 → 快照 → 分类 → 提取正文 → 提取接口 → 记忆。
+        浏览一个 URL 的完整流程:
+        打开 → 快照 → 分类 → 提取正文 → 提取接口 → 记忆.
 
         T104 fix: Playwright 失败时 (Page crashed / net error / anti-bot 阻),
         page 会卡在坏状态. 之前所有后续 query 都返 0. 现在 try/finally
         失败时 reset page (goto about:blank) 解锁下一 query.
+
+        T108 fix: 主路径失败 (timeout / antibot / crashed) 时, 试
+        archive.org wayback 拿同一 URL 的历史快照. wayback 的内容不带
+        original 的 anti-bot, 正常 extract. 失败记录在 result.meta.
         """
         if not self._started:
             await self.start()
 
+        fallback_used = None  # T108: 记录是否走了 fallback
+        try:
+            result = await self._browse_once(
+                url, extract_content=extract_content,
+            )
+            if fallback_used:
+                result.snapshot.meta["__fallback"] = fallback_used
+            return result
+        except Exception as primary_err:
+            # T108: 主路径 fail. 试 fallback (除非 caller 明确禁用).
+            if not allow_fallback:
+                raise
+            fb = await self._try_fallback_browse(
+                url, primary_err, extract_content=extract_content,
+            )
+            if fb is not None:
+                return fb
+            # 没 fallback 命中, 把原始 error 抛出
+            raise
+
+    async def _browse_once(
+        self, url: str, *, extract_content: bool,
+    ) -> BrowseResult:
+        """browse() 的内部实现 — 不带 fallback. raise any failure."""
         t0 = time.time()
         logger.info("Browsing: %s", url)
 
@@ -253,6 +283,91 @@ class SemanticBrowser:
         logger.info(
             "Browse complete: %s [%s] in %.2fs",
             url, classification.page_type, elapsed,
+        )
+        return result
+
+    async def _try_fallback_browse(
+        self, url: str, primary_err: Exception, *, extract_content: bool,
+    ) -> Optional[BrowseResult]:
+        """T108: 主路径失败时, 试 archive.org wayback.
+
+        找到 wayback snapshot 后:
+        1. 在同一 Playwright page 里 goto wayback URL (它会用 id_ modifier
+           注入原 URL 的 raw HTML, 没有原站 anti-bot)
+        2. 重跑 snapshot/classify/extract (extract_article 等对 wayback
+           HTML 全 work, 它们只看 DOM)
+
+        Returns: BrowseResult on success, None if no fallback available.
+        """
+        from semantic_browser.fetch.fallback import try_all_fallbacks
+
+        logger.warning(
+            "Primary browse failed for %s (%s); trying fallback",
+            url, primary_err,
+        )
+        try:
+            fb = await asyncio.to_thread(try_all_fallbacks, url)
+        except Exception as e:
+            logger.warning("fallback lookup failed: %s", e)
+            fb = None
+        if not fb:
+            return None
+        wayback_url, _html, source_label = fb
+        logger.info(
+            "T108 fallback: navigating to %s (source=%s)",
+            wayback_url[:120], source_label,
+        )
+        t0 = time.time()
+        try:
+            page = await self.controller._ensure_page()
+            # wayback URL 的 redirect chain 会把 final URL 设成原 URL —
+            # wait_until=domcontentloaded 比 networkidle 稳, wayback 自己也
+            # 加载 analytics 时 networkidle 永远不到.
+            await page.goto(wayback_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            logger.warning("T108 wayback navigation failed: %s", e)
+            return None
+
+        try:
+            snap_engine = SnapshotEngine(page)
+            snapshot = await snap_engine.capture(base_url=url)
+            snapshot.meta["__fallback_source"] = source_label
+            snapshot.meta["__fallback_url"] = wayback_url
+            if hasattr(self.classifier, '_llm_classify'):
+                classification = await self.classifier.classify(snapshot)
+            else:
+                classification = self.classifier.classify(snapshot)
+            snapshot.page_type = classification.page_type
+            article = None
+            interfaces = None
+            if extract_content:
+                extractor = ContentExtractor(page)
+                if classification.page_type in ("article", "docs", "unknown"):
+                    article = await extractor.extract_article()
+                interfaces = await extractor.extract_interfaces()
+        except Exception as e:
+            logger.warning("T108 fallback pipeline failed: %s", e)
+            try:
+                await page.goto("about:blank", timeout=5)
+            except Exception:
+                pass
+            return None
+
+        elapsed = time.time() - t0
+        # 把 fallback URL 也记到 memory 这样以后 audit 知道是 fallback
+        self._record_to_memory(url, snapshot, classification, page.url)
+
+        result = BrowseResult(
+            url=url,
+            snapshot=snapshot,
+            classification=classification,
+            article=article,
+            interfaces=interfaces,
+            elapsed=elapsed,
+        )
+        logger.info(
+            "T108 fallback complete: %s [%s] in %.2fs via %s",
+            url, classification.page_type, elapsed, source_label,
         )
         return result
 

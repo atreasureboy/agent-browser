@@ -34,7 +34,6 @@ except ImportError:
         HAS_AUTOGEN = True
     except ImportError:
         HAS_AUTOGEN = False
-    HAS_AUTOGEN = False
 
 
 def semantic_query_fn(

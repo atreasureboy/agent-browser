@@ -79,23 +79,6 @@ if _LANGCHAIN_IMPORT_ERROR is None:
                 cache_persist_path=self.cache_persist_path,
             )
 
-        async def _arun(
-            self,
-            query: str,
-            start_url: Optional[str] = None,
-            budget: Optional[int] = None,
-            max_pages: Optional[int] = None,
-            run_manager: Optional[CallbackManagerForToolRun] = None,
-        ) -> str:
-            result = await self._sq.run(
-                query,
-                start_url=start_url,
-                budget=budget,
-                max_pages=max_pages,
-            )
-            # T94: 返回 SemanticAnswer (dict-able), 让 _run / _arun 各自 format
-            return result
-
         def _run(
             self,
             query: str,

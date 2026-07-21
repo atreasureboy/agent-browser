@@ -579,6 +579,10 @@ class TransparentBrowserDaemon:
         self._current_op: str | None = None
         self._op_started_at: float | None = None
         self._op_waiters: int = 0
+        # T110 audit fix: _op_waiters_lock 之前通过 getattr 在 _handle 里
+        # 现场拿 — 既没在 __init__ 初始化, 也从来没 acquire(). 多线程下
+        # _op_waiters 计数有 race. 加一个 threading.Lock 守护它.
+        self._op_waiters_lock: _threading.Lock = _threading.Lock()
         # T52: metrics
         self.metrics = _MetricsRegistry()
         # T56: 单进程内 DegradationController — 不经 Prometheus 回路 (fable §5.7)
@@ -1193,7 +1197,8 @@ class TransparentBrowserDaemon:
                     lock_wait_s = _time.time() - lock_wait_start
                     self.metrics.observe("op_lock_wait", {"path": path}, lock_wait_s)
                     self._op_waiters_lock = getattr(self, "_op_waiters_lock", None)
-                    self._op_waiters += 1
+                    with self._op_waiters_lock:
+                        self._op_waiters += 1
                     try:
                         self._current_op = f"{method} {path}"
                         self._op_started_at = _time.time()
@@ -1204,7 +1209,8 @@ class TransparentBrowserDaemon:
                     finally:
                         self._current_op = None
                         self._op_started_at = None
-                        self._op_waiters -= 1
+                        with self._op_waiters_lock:
+                            self._op_waiters -= 1
             else:
                 result = self._dispatch(method, path, {**query, **body}, req)
             # T50: SSE 端点自己写了响应, _handle 不要再发
@@ -2075,6 +2081,12 @@ class TransparentBrowserDaemon:
             return self.owner.run(self.owner.browser.controller.list_frames())
         if method == "POST" and path == "/frame/switch":
             name_or_url = args["name_or_url"]
+            # T110 audit fix: name_or_url 可能是 URL 也可能是 frame 名. 当
+            # 像 URL (含 scheme:// 或 /) 时, 必须 _check_url 才能防止
+            # 攻击者拿这个 endpoint 当 /open 旁路打到 169.254.169.254
+            # 之类. frame 名字 (e.g. "main", "iframe_0") 不含 :// 直接放过.
+            if "://" in name_or_url or name_or_url.startswith("//") or name_or_url.startswith("/"):
+                self._check_url(name_or_url, where="frame_switch")
             return self.owner.run(self.owner.browser.controller.switch_frame(name_or_url))
         if method == "POST" and path == "/frame/to-top":
             self.owner.run(self.owner.browser.controller.to_top_frame())

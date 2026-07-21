@@ -337,14 +337,27 @@ class BrowserController:
 
         T104 fix: 不只查 is_closed() — 也查 is_crashed() (page.goto Page crashed
         后 is_closed=False 但 page 不可用). crashed 也当作需要重建.
+
+        T107 fix: 原来 `self._page.evaluate(...)` 漏 await, 产生
+        RuntimeWarning. 改成 await, 同时用 try/except 捕获 evaluate 抛
+        (page crashed 时 evaluate 会抛). 完全替换之前那个错误表达式.
         """
-        need_new = (
-            self._page is None
-            or self._page.is_closed()
-            or self._page.evaluate("() => 1")  # 触发任何 evaluate 都会抛
-            if self._page is not None else False
-        )
-        if hasattr(self._page, "is_crashed") and self._page is not None:
+        need_new = False
+        if self._page is None:
+            need_new = True
+        elif self._page.is_closed():
+            need_new = True
+        else:
+            # 试着 evaluate — page crashed 时会抛 (yielding coroutine 不会抛)
+            try:
+                await self._page.evaluate("() => 1")
+            except Exception:
+                need_new = True
+        if (
+            not need_new
+            and hasattr(self._page, "is_crashed")
+            and self._page is not None
+        ):
             try:
                 if self._page.is_crashed():
                     need_new = True

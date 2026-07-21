@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 # (structural patterns unique to block pages, virtually never in real content)
 _TIER1_PATTERNS = [
     # Akamai
-    (re.compile(r"Reference\s*#\s*[\d]+\.[0-9a-f]+\.\d+\.[0-9a-f]+", re.IGNORECASE),
+    (re.compile(r"Reference\s*#\s*[\d]+\.[0-9a-f]+\.\d+\.[0-9a-f]+", re.IGNORECASE)),
     # Cloudflare challenge form
     (re.compile(r'challenge-form.*?__cf_chl_f_tk=', re.IGNORECASE | re.DOTALL)),
     # Cloudflare error code spans

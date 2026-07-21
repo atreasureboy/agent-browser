@@ -193,6 +193,24 @@ class SemanticBrowser:
             snap_engine = SnapshotEngine(page)
             snapshot = await snap_engine.capture(base_url=url)
 
+            # T107: antibot fast-fail — 在分类/提取前先 detect. 阻了就 raise
+            # 不让 M3 浪费 token. 注意: page.content() 可能抛 (crashed 等),
+            # 那种情况已经被外层 try/except 兜住.
+            try:
+                html = await page.content()
+                from semantic_browser.safety.antibot import detect_antibot
+                blocked, reason = detect_antibot(html, status=200)
+                if blocked:
+                    logger.warning(
+                        "Antibot triggered for %s: %s", url, reason
+                    )
+                    raise RuntimeError(f"antibot block: {reason}")
+            except RuntimeError:
+                raise
+            except Exception:
+                # content 取不到不影响主流程
+                pass
+
             # 3. 页面分类（LLM 增强分类器是 async）
             if hasattr(self.classifier, '_llm_classify'):
                 classification = await self.classifier.classify(snapshot)

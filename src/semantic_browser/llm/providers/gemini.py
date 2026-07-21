@@ -93,12 +93,13 @@ class GeminiProvider:
         if sys_instruction is not None:
             payload["systemInstruction"] = sys_instruction
 
-        url = (
-            f"{self.base_url}/v1beta/models/{model}:generateContent"
-            f"?key={self.api_key}"
-        )
+        # T116 audit fix: 之前 api_key 拼到 URL ?key=, classify_exception 把
+        # 完整 URL 透传给 caller, 4xx 错误时 key 落 log. 改成 x-goog-api-key
+        # header (官方 SDK 用的方式), key 不会再出现在 URL / 错误对象 / 日志.
+        url = f"{self.base_url}/v1beta/models/{model}:generateContent"
+        headers = {"x-goog-api-key": self.api_key}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
         # candidates[0].content.parts[0].text

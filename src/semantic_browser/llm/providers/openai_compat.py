@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from semantic_browser.llm.types import LLMResponse, LLMUnavailableError  # T114 audit fix: 提到 module-level, 让 empty-choices 分支能用
+from semantic_browser.llm.providers.base import normalize_messages  # T116 audit fix: T114(c) 删了这个 import, 全部 OpenAI/Ollama/DeepSeek call raise NameError. 补回.
 
 logger = logging.getLogger(__name__)
 

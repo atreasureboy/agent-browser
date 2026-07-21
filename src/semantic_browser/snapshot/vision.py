@@ -203,12 +203,12 @@ async def _call_gemini_vision(
             "responseMimeType": "application/json",
         },
     }
-    url = (
-        f"{vp.base_url}/v1beta/models/{vp.model}:generateContent"
-        f"?key={vp.api_key}"
-    )
+    # T116 audit fix: 跟 gemini.py 一样 — key 改走 x-goog-api-key header
+    # 而不是 ?key=, 避免 classify_exception 透传 URL 时 key 落 log.
+    url = f"{vp.base_url}/v1beta/models/{vp.model}:generateContent"
+    headers = {"x-goog-api-key": vp.api_key}
     async with httpx.AsyncClient(timeout=vp.timeout) as client:
-        resp = await client.post(url, json=payload)
+        resp = await client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
     try:

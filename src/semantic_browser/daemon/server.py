@@ -591,7 +591,9 @@ class TransparentBrowserDaemon:
         # T110 audit fix: _op_waiters_lock 之前通过 getattr 在 _handle 里
         # 现场拿 — 既没在 __init__ 初始化, 也从来没 acquire(). 多线程下
         # _op_waiters 计数有 race. 加一个 threading.Lock 守护它.
-        self._op_waiters_lock: _threading.Lock = _threading.Lock()
+        # T116 audit fix: 之前用 _threading.Lock() 但 module-level 只有
+        # 'import threading' 没 alias — daemon 起不来 NameError. 改用真名.
+        self._op_waiters_lock: "threading.Lock" = threading.Lock()
         # T52: metrics
         self.metrics = _MetricsRegistry()
         # T56: 单进程内 DegradationController — 不经 Prometheus 回路 (fable §5.7)
@@ -1761,11 +1763,31 @@ class TransparentBrowserDaemon:
                 self._check_url(action_args["url"], where=f"with_retry.{action_name}")
             return self.owner.run(self._with_retry(action_name, action_args, max_retries))
         if method == "POST" and path == "/set-files":
-            return self.owner.run(self._set_files(args["ref"], args["paths"]))
+            # T116 audit fix: /set-files 直接把 user 路径列表给 Playwright
+            # set_input_files, 等于让 caller 读 host 文件然后 upload — 严重
+            # exfil. 修: 跟 /state/save /screenshot /run-workflow 一样
+            # _safe_resolve_path 闸. 多个 path 任何一个 fail 就整体 400.
+            raw_paths = args["paths"]
+            if not isinstance(raw_paths, list):
+                raise ValueError("paths must be a list")
+            safe_paths: list[str] = []
+            for p in raw_paths:
+                if not isinstance(p, str):
+                    raise ValueError(f"path must be a string (got {type(p).__name__})")
+                safe_paths.append(self._safe_resolve_path(p, where="set_files"))
+            return self.owner.run(self._set_files(args["ref"], safe_paths))
         if method == "POST" and path == "/download":
+            # T116 audit fix: /download 拿 user 给的 save_to 直接传给
+            # controller.download_file → Playwright 写到任意路径. 之前完全
+            # 没 _safe_resolve_path 闸, 跟 /screenshot 是不一致的漏洞.
+            save_to = args.get("save_to")
+            if save_to is not None and not isinstance(save_to, str):
+                raise ValueError("save_to must be a string")
+            if save_to:
+                save_to = self._safe_resolve_path(save_to, where="download")
             return self.owner.run(self._download(
                 args.get("trigger_ref"),
-                args.get("save_to"),
+                save_to,
                 int(args.get("timeout_ms", 30000)),
             ))
         if method == "POST" and path == "/scroll":
@@ -1823,6 +1845,10 @@ class TransparentBrowserDaemon:
             url = args.get("url", "")
             if not url:
                 raise ValueError("url required")
+            # T116 audit fix: T111 没覆盖这个 endpoint. controller 内部
+            # get_response_headers 兜底走 httpx.head(url, follow_redirects=True)
+            # — caller 可以拿 /response-headers 当 /open 旁路打到 169.254/内网.
+            self._check_url(url, where="response_headers")
             return self.owner.run(self.owner.browser.controller.get_response_headers(url))
         # T39: DOM diff — 当前 snapshot vs 传入 ref 集合
         if method == "GET" and path == "/dom-diff":
@@ -2725,8 +2751,11 @@ class TransparentBrowserDaemon:
         # T63.2 (#3 修): 优先吃 /open 已分类结果, 0 额外 I/O. /open 后立即 /state
         # 是常见模式 (agent 想知道分类确认). 无缓存 (e.g. daemon 重启) → 走
         # 启发式 fast-path (不调 LLM, /state 是高频 polling 端点, 必须轻量).
+        # T116 audit fix: T115 加了 _classify_cache_lock 但漏了这个 read site
+        # (跟 _classify_with_cache / _cache_put 不一致). 补 lock.
         try:
-            cached = self._classify_cache.get(url)
+            with self._classify_cache_lock:
+                cached = self._classify_cache.get(url)
             if cached:
                 page_type = cached["page_type"]
             else:
@@ -3051,12 +3080,17 @@ class TransparentBrowserDaemon:
                 self._cache_put(cache_key, heur_dict)
                 return heur_dict, "heuristic"
             llm_dict = self._normalize_confidence(llm_res.to_dict())
-            self._classify_llm_calls += 1
+            # T116 audit fix: counter 在 lock 内, 防止多线程 lost-update.
+            with self._classify_cache_lock:
+                self._classify_llm_calls += 1
             self._cache_put(cache_key, llm_dict)
             return llm_dict, "llm"
         except Exception as e:  # noqa: BLE001
-            self._classify_llm_failures += 1
-            logger.warning("LLM classify failed for %s: %s", snap.url, e)
+            # T116 audit fix: 跟 _classify_llm_calls 一起 lock 保护 — 同 lost
+            # # update 风险. 同时换 logger.exception 拿 traceback (audit M5).
+            with self._classify_cache_lock:
+                self._classify_llm_failures += 1
+            logger.exception("LLM classify failed for %s", snap.url)
             # T65.2: strict mode 不允许 silent fallback, 让 agent 自己决定
             if strict:
                 raise _LLMUnavailableError(

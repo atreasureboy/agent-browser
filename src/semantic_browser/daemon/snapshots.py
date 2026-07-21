@@ -94,7 +94,18 @@ class SnapshotStore:
         """T61: 抓取 controller.storage_state() → 落盘 + 索引.
 
         Returns: snapshot_id (str) or None if failed / nothing to save.
+
+        T116 audit fix: session_id 之前完全无 validation, 直接做
+        root_dir / session_id 然后 mkdir. 攻击者传 "../../etc/foo"
+        就逃出 snapshot root. 修: 强制 [A-Za-z0-9_-]+ 模式, 不合法 raise.
         """
+        import re as _re_sessionid
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        if not _re_sessionid.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+            raise ValueError(
+                f"session_id must match [A-Za-z0-9_-]{{1,128}} (got {session_id!r})"
+            )
         try:
             state = await controller._context.storage_state()
         except Exception as e:

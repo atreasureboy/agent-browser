@@ -67,6 +67,15 @@ def check_action(action: str, args: dict[str, Any],
         text = (args.get("text") or "").lower()
         for kw in _DESTRUCTIVE_KEYWORDS:
             if kw in text:
+                # T116 audit fix: 之前静默返 SafetyCheck, 0 audit log.
+                # 安全敏感事件必须有 trail — 后面 ops 才审计 "谁何时想
+                # 做什么". 注意: 不打 args.get("text") 原文 (可能含
+                # password/secret) — 只打 reason + kw 关键词.
+                logger.warning(
+                    "safety/guard: BLOCKED %s: %s (action=%s, kw=%r, ref=%s)",
+                    "type", f"text contains destructive keyword: {kw!r}",
+                    action, kw, ref_label,
+                )
                 return SafetyCheck(
                     needs_confirm=True,
                     reason=f"type() text contains destructive keyword: {kw!r}",
@@ -81,6 +90,11 @@ def check_action(action: str, args: dict[str, Any],
         label_lower = ref_label.lower()
         for kw in _DESTRUCTIVE_KEYWORDS:
             if kw in label_lower:
+                # T116 audit fix: 同 type 块 — 安全 BLOCKED 事件记 log.
+                logger.warning(
+                    "safety/guard: BLOCKED %s: target label %r contains %r",
+                    "click", ref_label, kw,
+                )
                 return SafetyCheck(
                     needs_confirm=True,
                     reason=f"click() target label {ref_label!r} contains: {kw!r}",
@@ -93,6 +107,11 @@ def check_action(action: str, args: dict[str, Any],
         to_ref = args.get("to_ref", "")
         for pat in _DANGEROUS_REF_PATTERNS:
             if pat.search(to_ref):
+                # T116 audit fix: 同 type/click — 安全 BLOCKED 事件记 log.
+                logger.warning(
+                    "safety/guard: BLOCKED %s: target ref %r matches %r",
+                    "drag", to_ref, pat.pattern,
+                )
                 return SafetyCheck(
                     needs_confirm=True,
                     reason=f"drag() target ref {to_ref!r} matches dangerous pattern: {pat.pattern}",

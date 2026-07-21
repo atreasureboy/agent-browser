@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PATH = Path.home() / ".semantic_browser" / "goal_memory.json"
+DEFAULT_PATH = Path.home() / ".semantic-browser" / "goal_memory.json"  # T117 audit fix: 跟其他 state 路径一致 (用 hyphen)
 MAX_ENTRIES = 500  # 上限, 避免无限增长
 
 

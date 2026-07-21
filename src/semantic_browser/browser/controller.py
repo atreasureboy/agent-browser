@@ -44,6 +44,49 @@ class BrowserConfig:
 
 # ── T40f: 安全头 parser 帮手 ─────────────────────────────
 
+def _redact_url_secrets(url: str) -> str:
+    """T117 audit fix: 把 URL query string 里的 ?token= / ?api_key= / ?session=
+    / ?signature= 等敏感字段 mask 成 <redacted>, 路径部分保留. 多个站 URL
+    在 INFO log 里被记录, 之前会泄 OAuth callback 的 access_token / 密码
+    重置链接里的 token / 内部 admin 链接的 signature.
+
+    不追求完美 (e.g. fragment 里的 token 我们也 mask 掉), 目标是常见
+    容易踩坑的字段, 残余泄漏通过别的方式补.
+    """
+    if not url or "?" not in url:
+        return url
+    _SENSITIVE = (
+        "token", "api_key", "apikey", "api-key", "key",
+        "password", "secret", "signature", "sig",
+        "access_token", "auth", "session", "sessionid",
+        "code", "state",  # OAuth
+    )
+    # 拆 path 和 query
+    if "#" in url:
+        url_main, frag = url.split("#", 1)
+    else:
+        url_main, frag = url, ""
+    if "?" not in url_main:
+        return url
+    base, query = url_main.split("?", 1)
+    safe_pairs = []
+    for pair in query.split("&"):
+        if not pair:
+            safe_pairs.append(pair)
+            continue
+        if "=" in pair:
+            k, _ = pair.split("=", 1)
+            key_lower = k.lower()
+            if any(s == key_lower or key_lower.endswith("_" + s) for s in _SENSITIVE):
+                safe_pairs.append(f"{k}=<redacted>")
+                continue
+        safe_pairs.append(pair)
+    out = base + "?" + "&".join(safe_pairs)
+    if frag:
+        out += "#" + frag
+    return out
+
+
 def _parse_csp(csp: str) -> dict[str, Any]:
     """Parse CSP header — 拆 directives, 标常见不安全 source."""
     directives: dict[str, list[str]] = {}
@@ -286,7 +329,8 @@ class BrowserController:
         # 新建后自动成为当前活跃 tab (Playwright 默认就是, 但 explicit set 更稳)
         self._page = page
         self._active_idx = self.active_index
-        logger.info("Opened new tab: %s", url or "(blank)")
+        # T117 audit fix: URL 里的 ?token= / ?api_key= / ?session= 不能落 INFO log.
+        logger.info("Opened new tab: %s", _redact_url_secrets(url or "(blank)"))
         return page
 
     async def switch_tab(self, index: int) -> Page:
@@ -304,7 +348,7 @@ class BrowserController:
             pass
         self._page = page
         self._active_idx = index
-        logger.info("Switched to tab %d: %s", index, page.url)
+        logger.info("Switched to tab %d: %s", index, _redact_url_secrets(page.url))
         return page
 
     async def close_tab(self, index: int | None = None) -> int:
@@ -393,7 +437,7 @@ class BrowserController:
         """
         page = await self._ensure_page()
         await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-        logger.info("Opened: %s (wait=%s)", url, wait_until)
+        logger.info("Opened: %s (wait=%s)", _redact_url_secrets(url), wait_until)
         return page
 
     async def back(self) -> None:
@@ -1820,6 +1864,17 @@ class BrowserController:
                         headers_dict[str(k).lower()] = str(v)[:500]
                     except Exception:
                         continue
+            # T117 audit fix: 之前 response_headers 完整存到 _network_requests
+            # — Authorization / Proxy-Auth / Set-Cookie 任何 caller 都能通
+            # 过 get_network_requests 拉到. 修: 敏感 header mask.
+            _REDACTED_HEADERS = {
+                "authorization", "proxy-authorization", "x-api-key",
+                "x-goog-api-key", "cookie", "set-cookie", "x-csrf-token",
+                "x-auth-token", "x-amz-security-token",
+            }
+            for k in _REDACTED_HEADERS:
+                if k in headers_dict:
+                    headers_dict[k] = "<redacted>"
         except Exception:
             return
         for entry in reversed(self._network_requests):
@@ -2207,7 +2262,7 @@ class BrowserController:
                 continue
             if (frame.name and name_or_url in frame.name) or name_or_url in frame.url:
                 self._frame = frame
-                logger.info("Switched to frame: %s (%s)", frame.name, frame.url)
+                logger.info("Switched to frame: %s (%s)", frame.name, _redact_url_secrets(frame.url))
                 return {"name": frame.name, "url": frame.url}
         raise ValueError(f"frame not found: {name_or_url!r}; try one of {[f['name'] for f in await self.list_frames()]}")
 

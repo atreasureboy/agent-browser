@@ -94,10 +94,23 @@ def _run_async(coro):
     except Exception as e:
         msg = _humanize_error(e)
         click.echo(f"Error: {msg}", err=True)
-        if os.getenv("SB_DEBUG"):
+        # T117 audit fix: 之前 `if os.getenv("SB_DEBUG"):` 是 truthy 检查,
+        # "false" / "0" 都会被当 enabled. 改成 canonical bool 解析.
+        if _env_bool("SB_DEBUG", default=False):
             import traceback
             traceback.print_exc(file=sys.stderr)
         sys.exit(1)
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    """T117 audit fix: parse env var as canonical bool — 'true'/'1'/'yes'/'on' True,
+    'false'/'0'/'no'/'off'/'' False. 之前 `bool(os.getenv(name))` 把
+    'false' 当 True, 严重 drift.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
 
 def _humanize_error(e: Exception) -> str:

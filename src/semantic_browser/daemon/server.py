@@ -3387,11 +3387,16 @@ class TransparentBrowserDaemon:
             }
             progress_log.append(entry)
             # 写到 stderr (如果 stream=True) — 不影响 HTTP 响应体
+            # T117 audit fix: 之前 print(... entry['args'] ...) 把整个 args
+            # 字典打到 stderr, type_text 的 text 字段可能含 password / API
+            # key / cookie — 全部 PII 泄漏. 修: 改用结构化 logger, 只打
+            # action / ref (安全), 完整 args 走 progress_log 进 SSE 不进 stderr.
             if args.get("stream"):
-                import sys
-                print(f"[step {record.step}] {record.action} "
-                      f"{'✓' if record.success else '✗'} {entry['args']}",
-                      file=sys.stderr, flush=True)
+                logger.info(
+                    "agent step %d: %s %s",
+                    record.step, record.action,
+                    '✓' if record.success else '✗',
+                )
         agent = GoalAgent(
             self.owner.browser.controller,
             tier=args.get("tier", "smart"),
@@ -3689,7 +3694,12 @@ class TransparentBrowserDaemon:
                 event_queue.put_nowait({"type": "_final", "result": final})
             except Exception as e:
                 logger.exception("discover/stream failed")
-                event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
+                # T117 audit fix: 之前把 f"{type(e).__name__}: {e}" 整串推到
+                # SSE client, FileNotFoundError 之类会泄绝对路径. 走
+                # _redact_message (跟 result.classify_exception 同一 helper).
+                from semantic_browser.result import _redact_message
+                err_msg = _redact_message(f"{type(e).__name__}: {e}")
+                event_queue.put_nowait({"type": "_final", "result": {"_error": err_msg}})
 
         # 在 daemon 自己的 event loop 上调度 discover
         # T114 audit fix: 之前 call_soon_threadsafe(asyncio.ensure_future, ...)
@@ -3825,7 +3835,12 @@ class TransparentBrowserDaemon:
                 event_queue.put_nowait({"type": "_final", "result": result.to_dict()})
             except Exception as e:
                 logger.exception("agent/run/stream failed")
-                event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
+                # T117 audit fix: 同 _stream_discover — SSE client 之前拿到
+                # raw exception text, 路径 / URL / token 全透传. 走
+                # _redact_message 统一脱敏.
+                from semantic_browser.result import _redact_message
+                err_msg = _redact_message(f"{type(e).__name__}: {e}")
+                event_queue.put_nowait({"type": "_final", "result": {"_error": err_msg}})
 
         # start event — 先 publish 到 bus 拿 seq, 再写 SSE 帧
         start_payload = {"type": "start", "goal": goal, "max_steps": max_steps}
@@ -4194,7 +4209,11 @@ class TransparentBrowserDaemon:
                             pass
             except Exception as e:
                 logger.exception("/v1/query/stream failed")
-                event_queue.put_nowait({"type": "_final", "answer": {"_error": f"{type(e).__name__}: {e}"}})
+                # T117 audit fix: 同 _stream_discover / _stream_agent_run —
+                # SSE client 之前拿到 raw exception text, 走 _redact_message.
+                from semantic_browser.result import _redact_message
+                err_msg = _redact_message(f"{type(e).__name__}: {e}")
+                event_queue.put_nowait({"type": "_final", "answer": {"_error": err_msg}})
 
         # schedule run_query on the daemon's loop
         future = asyncio.run_coroutine_threadsafe(run_query(), loop_ref)
@@ -4274,8 +4293,12 @@ def main(argv: list[str] | None = None) -> None:
                         help="T60: 心跳 watchdog tick 间隔秒 (0=关闭)")
     parser.add_argument("--sweep-interval", type=float, default=60.0,
                         help="T65.1: snapshot sweeper + idle recycle 周期秒 (0=关闭)")
-    parser.add_argument("--session-idle-timeout", type=float, default=300.0,
-                        help="T65.1: session idle 自动回收秒数 (0=关闭, 默认 5min)")
+    # T117 audit fix: 之前 default=300.0 让 CLI 总是传 300, env
+    # DAEMON_SESSION_IDLE_TIMEOUT_S 永远不被读 (因为 __init__ 那侧
+    # if x is not None: ... else env.get(...)). 改 default=None — CLI 不
+    # 显式 --session-idle-timeout X 就走 env / 默认 300.
+    parser.add_argument("--session-idle-timeout", type=float, default=None,
+                        help="T65.1: session idle 自动回收秒数 (0=关闭, 默认走 env DAEMON_SESSION_IDLE_TIMEOUT_S / 5min)")
     parser.add_argument("--lease-heartbeat-ttl-s", type=float, default=15.0,
                         help="T65.7: lease 默认 TTL (s), 客户端 1/3 TTL 续约一次")
     parser.add_argument("--drain-timeout", type=float, default=30.0,

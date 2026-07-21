@@ -203,12 +203,20 @@ class MemoryStore:
 
     def record_links(self, from_url: str, links: list[dict]) -> None:
         """记录页面上的链接。"""
+        # T114 audit fix: 之前 link["href"] 在 link item 是非 dict 或缺
+        # href 时抛 KeyError, 中断整个 with block → 同次调用里后续 link
+        # 也丢失. 改: 用 .get 默认空串, 静默跳过缺 href 的.
         with self._conn() as conn:
             for link in links:
+                if not isinstance(link, dict):
+                    continue
+                href = link.get("href") or ""
+                if not href:
+                    continue
                 conn.execute(
                     """INSERT OR IGNORE INTO links (from_url, to_url, text)
                        VALUES (?, ?, ?)""",
-                    (from_url, link["href"], link.get("text", "")),
+                    (from_url, href, link.get("text", "") or ""),
                 )
 
     def get_unvisited_links(self, domain: str, limit: int = 20) -> list[dict]:

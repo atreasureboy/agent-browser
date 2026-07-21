@@ -3633,8 +3633,13 @@ class TransparentBrowserDaemon:
                 event_queue.put_nowait({"type": "_final", "result": {"_error": f"{type(e).__name__}: {e}"}})
 
         # 在 daemon 自己的 event loop 上调度 discover
-        self.owner.loop.call_soon_threadsafe(
-            asyncio.ensure_future, run_with_progress()
+        # T114 audit fix: 之前 call_soon_threadsafe(asyncio.ensure_future, ...)
+        # 拿不到 Future → client 断连时无法 cancel, 后台 task 永远跑,
+        # 会跟下一 HTTP 请求争 controller. 改: 用 run_coroutine_threadsafe
+        # 拿 concurrent.futures.Future, 在 finally 里 cancel — 跟
+        # _stream_semantic_query 那个 SSE pattern 一致.
+        discover_future = asyncio.run_coroutine_threadsafe(
+            run_with_progress(), self.owner.loop,
         )
 
         # HTTP handler 线程 (当前): 从 queue 读 event, 写 SSE 帧
@@ -3682,6 +3687,12 @@ class TransparentBrowserDaemon:
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("SSE client disconnected")
+        finally:
+            # T114 audit fix: client 任何情况下退出都要 cancel 后台 task.
+            try:
+                discover_future.cancel()
+            except Exception:
+                pass
 
     def _stream_agent_run(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
         """T53: SSE 流式 agent_run — 每 step 一个 event (复用 on_step 钩子).
@@ -3767,7 +3778,9 @@ class TransparentBrowserDaemon:
         except (BrokenPipeError, ConnectionResetError):
             return
 
-        loop_ref.call_soon_threadsafe(asyncio.ensure_future, run_agent())
+        # T114 audit fix: 同 _stream_discover — 改用 run_coroutine_threadsafe
+        # 拿 Future, finally 里 cancel; client 断不再让 task 偷跑.
+        agent_future = asyncio.run_coroutine_threadsafe(run_agent(), loop_ref)
 
         try:
             final_result: dict[str, Any] | None = None
@@ -3812,6 +3825,11 @@ class TransparentBrowserDaemon:
             req.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("agent_run SSE client disconnected")
+        finally:
+            try:
+                agent_future.cancel()
+            except Exception:
+                pass
 
     def _stream_events(self, req: BaseHTTPRequestHandler, args: dict[str, Any]) -> None:
         """T59: SSE stream of EventBus events — system.pressure + 全部 daemon.* topic.

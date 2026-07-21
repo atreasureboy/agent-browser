@@ -97,6 +97,7 @@ if _LANGCHAIN_IMPORT_ERROR is None:
             #   (从 180s 减到 60s — 真 async 用例不会跑那么久).
             import asyncio
             import concurrent.futures
+            import threading  # T114 audit fix: T112 删了 import, threading.Thread 在 line 121 用, async context 会 NameError.
             try:
                 # 尝试拿当前 loop — 在 async context 里会成功
                 asyncio.get_running_loop()

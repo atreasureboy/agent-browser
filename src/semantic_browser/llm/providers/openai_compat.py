@@ -12,8 +12,7 @@ from typing import Any
 
 import httpx
 
-from semantic_browser.llm.types import LLMResponse
-from semantic_browser.llm.providers.base import LLMProvider, normalize_messages
+from semantic_browser.llm.types import LLMResponse, LLMUnavailableError  # T114 audit fix: 提到 module-level, 让 empty-choices 分支能用
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,6 @@ class OpenAICompatProvider:
         json_mode: bool = False,
     ) -> LLMResponse:
         if not self.is_available():
-            from semantic_browser.llm.service import LLMUnavailableError
             raise LLMUnavailableError("OpenAI-compat: api_key / base_url not configured")
 
         msgs = normalize_messages(messages)
@@ -64,7 +62,19 @@ class OpenAICompatProvider:
             )
             resp.raise_for_status()
             data = resp.json()
-        content = (data["choices"][0]["message"]["content"] or "").strip()
+        # T114 audit fix: 之前 data["choices"][0]["message"]["content"] 在
+        # choices=[] / choices=[{}] 时 IndexError/KeyError, propagate 成
+        # INTERNAL (500). 实际是 provider 返回了空或畸形响应 — 应该视为
+        # 临时失败 → raise LLMUnavailableError 让上层 retry / fallback.
+        choices = data.get("choices") or []
+        if not choices:
+            raise LLMUnavailableError(
+                f"openai compat: empty choices in response (model={model})"
+            )
+        first = choices[0] or {}
+        message = first.get("message") or {}
+        raw_content = message.get("content")
+        content = (raw_content or "").strip() if isinstance(raw_content, str) else ""
         usage = data.get("usage", {}) or {}
         return LLMResponse(
             content=content,

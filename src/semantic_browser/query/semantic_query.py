@@ -177,6 +177,13 @@ class SemanticQuery:
         self.cache_enabled = cache_enabled
         self.cache_ttl_s = cache_ttl_s
         self.cache_persist_path = cache_persist_path  # T68
+        # T114 audit fix: cache_max_size=0 之前会让 while-loop `len>=0` 永远
+        # True → min(empty dict) ValueError. 加边界.
+        if cache_max_size < 1:
+            raise ValueError(
+                f"cache_max_size must be >= 1 (got {cache_max_size}); "
+                "use cache_enabled=False for an effective zero-cap."
+            )
         self.cache_max_size = cache_max_size  # T69
         self.cache_freshness_check = cache_freshness_check  # T73: opt-in HTTP HEAD 304
         self.on_phase = on_phase  # SSE 流式回调: 每步 (plan / browse / relevance / synth) 触发

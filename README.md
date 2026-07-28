@@ -17,7 +17,77 @@ SemanticQuery — 性价比轻量 LLM 编排 (DeepSeek / Qwen / Ollama 等)
 顶级 agent 消费, 做最终决策
 ```
 
-### 四种顶层 API (T88: tb query 加 daemon proxy 别名)
+## ⚡ 1 分钟快速开始 (Quick Start)
+
+### 1. 安装 (Installation)
+
+```bash
+# 1.1 克隆仓库与进入目录
+git clone https://github.com/atreasureboy/agent-browser.git
+cd agent-browser
+
+# 1.2 安装 Python 包与依赖
+pip install -e .
+
+# 1.3 安装 Playwright 浏览器内核与系统依赖
+playwright install chromium
+playwright install-deps  # Linux 系统推荐
+```
+
+### 2. 配置环境变量 (Configuration)
+
+配置您偏好的 LLM Provider（支持任意 OpenAI 兼容接口、DeepSeek、Ollama 本地私有化模型、Claude 等）：
+
+```bash
+# 示例: 使用 DeepSeek (推荐，性价比极高)
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY="your-api-key-here"
+export OPENAI_BASE_URL="https://api.deepseek.com/v1"
+export OPENAI_MODEL="deepseek-chat"
+
+# 示例: 本地私有化 Ollama (0 Token 成本运行)
+# export LLM_PROVIDER=openai
+# export OPENAI_BASE_URL="http://localhost:11434/v1"
+# export OPENAI_MODEL="qwen2.5-coder"
+```
+
+### 3. 运行你的第一个语义查询 (Hello World)
+
+#### 🐍 方式 A: Python SDK 进程内调用
+```python
+import asyncio
+from semantic_browser.query import run_query
+
+async def main():
+    # 自动导航、抽取并精炼网页，返回 ~500 Tokens 的高质量 Markdown 答案与引用
+    result = await run_query(
+        "找到 Python 3.13 最主要的 3 个新特性",
+        start_url="https://docs.python.org/3/whatsnew/3.13.html"
+    )
+    print(result.to_markdown())
+
+asyncio.run(main())
+```
+
+#### 💻 方式 B: CLI 命令行单发查询
+```bash
+sb query "Python 3.13 top 3 new features" \
+    --start-url https://docs.python.org/3/whatsnew/3.13.html
+```
+
+#### 🚀 方式 C: 启动 Daemon 守护进程 (支持多 Agent 共享与 60+ MCP 工具)
+```bash
+# 1. 启动守护进程服务 (默认端口 8765)
+tb-daemon
+
+# 2. 发起查询或 SSE 流式监听
+curl -X POST localhost:8765/v1/query \
+  -d '{"query":"Python 3.13 top 3 features", "start_url":"https://docs.python.org/3/whatsnew/3.13.html"}'
+```
+
+---
+
+### 四种顶层 API 概览
 
 **Python** (进程内):
 ```python

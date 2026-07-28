@@ -6,12 +6,12 @@
 
 ## 核心理念：模型驱动的浏览器语义层
 
-**为"顶级 agent ↔ 浏览器"做 token 经济层**。传统 agent 读网页要烧 50KB+ token 解析 DOM；SemanticQuery 让便宜的小模型 (M3) 在中间层完成浏览 + 抽取 + 精炼, 顶级 agent 只看到 ~500 tokens 精炼 markdown。
+**为"顶级 agent ↔ 浏览器"做 token 经济层**。传统 agent 读网页要烧 50KB+ token 解析 DOM；SemanticQuery 让用户配置的轻量 LLM（如 DeepSeek / Qwen / Ollama / Llama 等）在中间层完成浏览 + 抽取 + 精炼，顶级 agent 只看到 ~500 tokens 精炼 markdown。
 
 ```
-顶级 agent (Claude Opus)
+顶级 agent (Claude Opus / GPT-4o)
    ↓ query("find X about Y") + budget=2000      (~50 tokens)
-SemanticQuery — M3 编排 (cheap)
+SemanticQuery — 性价比轻量 LLM 编排 (DeepSeek / Qwen / Ollama 等)
    plan → browse → relevance filter → synthesize → markdown 答案
    ↓                                              (~500-1500 tokens)
 顶级 agent 消费, 做最终决策
@@ -1557,22 +1557,30 @@ mcp_tool("sb_query", {
 | 多步 goal agent | 多次 LLM 决策 + 全 DOM | 1 次 M3 cheap 调用 + 精炼 |
 | 同 query 二次调用 | 又烧一次 token | **cache 命中, 0 token** |
 
-### 配置
+### 模型与环境变量配置 (支持任意 LLM Provider)
+
+Semantic Browser 纯粹模型中立，支持**任意 OpenAI 兼容接口**、DeepSeek、Ollama 本地部署模型、Claude 以及 MiniMax 等。用户可根据性价比自由配置中轻量 Tier 模型：
 
 ```bash
-# 默认 (Claude Code 配置: M3 via anthropic 兼容代理)
-LLM_PROVIDER=anthropic
-ANTHROPIC_AUTH_TOKEN=sk-cp-...
-ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
-ANTHROPIC_MODEL=MiniMax-M3
+# 方式 A: 推荐 - 使用 DeepSeek / OpenAI 兼容 API (DeepSeek / Qwen / SiliconFlow)
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your-api-key-here
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-chat
 
-# 或显式 OpenAI 兼容 (DeepSeek/OpenAI)
+# 方式 B: 本地私有化 Ollama 零 Token 成本运行
 # LLM_PROVIDER=openai
-# OPENAI_API_KEY=sk-...
-# OPENAI_BASE_URL=https://api.deepseek.com/v1
-# OPENAI_MODEL=deepseek-chat
+# OPENAI_API_KEY=ollama
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# OPENAI_MODEL=qwen2.5-coder
 
-# SemanticQuery tuning
+# 方式 C: Anthropic 兼容 API (Claude Haiku / Minimax)
+# LLM_PROVIDER=anthropic
+# ANTHROPIC_AUTH_TOKEN=your-api-key-here
+# ANTHROPIC_BASE_URL=https://api.anthropic.com
+# ANTHROPIC_MODEL=claude-3-5-haiku-20241022
+
+# SemanticQuery 预算与控制参数
 SEMANTIC_QUERY_DEFAULT_BUDGET=2000    # LLM token 预算
 SEMANTIC_QUERY_MAX_PAGES=3            # 多页 follow-link 上限 (1=single page)
 SEMANTIC_QUERY_CACHE_TTL_S=600        # cache TTL 秒

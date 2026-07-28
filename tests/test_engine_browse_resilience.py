@@ -20,9 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 try:
     from semantic_browser.llm import LLMService
     if not LLMService().is_available():
-        pytest.skip("no LLM key — LLM classifier path skipped")
+        pytest.skip("no LLM key — LLM classifier path skipped", allow_module_level=True)
 except Exception:
-    pytest.skip("LLM import failed")
+    pytest.skip("LLM import failed", allow_module_level=True)
 
 
 def test_browse_failure_does_not_poison_next_query():

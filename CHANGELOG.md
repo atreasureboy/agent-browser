@@ -1,3 +1,17 @@
+## T120 — Anti-Bot Mitigation & Modern SPA Content Extractor (Open Source Release)
+
+**核心特性升级**:
+- **拟人化防风控交互 (Human-like Interactions)**:
+  - 输入框支持拟人键盘按键抖动延迟 (`press_sequentially`, 40ms~90ms 随机按键延时)。
+  - 点击元素前添加鼠标悬停 (`hover`) 与 80ms~220ms 视口停留停顿。
+  - 新增 `humanlike_scroll()` 视口非等速滑动能力，平滑滚动并触发懒加载与防风控轨迹校验。
+- **Cloudflare & Anti-bot Challenge 静默感知**:
+  - 自动感知 Cloudflare Turnstile 与 *"Just a moment..."* 盾遮罩，给予最多 4 秒的静默等待让验证自动通过。
+- **重型 JS 页面死锁防护与降级 (Timeout Resilience)**:
+  - 遇到无限轮询广告/第三方追踪流时，自动退回 `wait_until="commit"` 并注入 `window.stop()` 强制截断，保 3~5 秒内迅速拿到 DOM。
+- **Modern SPA 与 Web Components 通用全节点抽取**:
+  - 升级 `ContentExtractor` 正文抽取算法，支持 `div[class*="content"]`、`span` 以及 Custom Web Components，新增 `Extracted Fallback Scan` 智能兜底扫描，彻底解决 GitHub Blog 等 SPA 站点抽取丢失问题（提取 Token 提升 1600 倍）。
+
 ## T85 — 真 K8s 部署验证 (kind cluster)
 
 **实测**:

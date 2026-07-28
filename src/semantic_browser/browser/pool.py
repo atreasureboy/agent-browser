@@ -62,8 +62,12 @@ class ControllerPool:
             return
         from semantic_browser.browser.controller import async_playwright
         self._playwright = await async_playwright().start()
+        # T118: pool-launched browser 也带 BROWSER_DISABLE_OPTIONS — 之前
+        # 只有 controller 单例带, pool 启动的反而更易被识别 (anti-bot flag 缺).
+        from semantic_browser.safety.stealth import BROWSER_DISABLE_OPTIONS
         self._browser = await self._playwright.chromium.launch(
             headless=self.config.headless,
+            args=BROWSER_DISABLE_OPTIONS,
         )
         logger.info("ControllerPool started (max_contexts=%d)", self.max_contexts)
 

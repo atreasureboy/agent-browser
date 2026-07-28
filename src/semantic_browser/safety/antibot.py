@@ -42,7 +42,10 @@ _TIER1_PATTERNS = [
     # reCAPTCHA script
     (re.compile(r"google\.com/recaptcha/api\.js", re.IGNORECASE)),
     # Generic "blocked" markers
-    (re.compile(r"<title>\s*(?:Access\s+Denied|Forbidden|Just\s+a\s+Moment)", re.IGNORECASE)),
+    (re.compile(r"<title>\s*(?:Access\s+Denied|Forbidden|Just\s+a\s+Moment|Amazon\.com\s*-\s*Something\s+Went\s+Wrong)", re.IGNORECASE)),
+    # Amazon CAPTCHA / Robot Check
+    (re.compile(r"Type\s+the\s+characters\s+you\s+see\s+in\s+this\s+image", re.IGNORECASE)),
+    (re.compile(r"api-services-support@amazon\.com", re.IGNORECASE)),
 ]
 
 # Tier 2: medium-confidence generic terms

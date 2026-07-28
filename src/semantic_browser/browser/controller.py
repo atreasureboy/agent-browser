@@ -218,6 +218,10 @@ class BrowserController:
         # T40i: WebSocket 观察 — 每个 (url, opened_at) 一条
         self._websocket_connections: list[dict[str, Any]] = []
         self._max_event_buffer = 1000  # 防无限增长
+        # T118: 当前 context 的 fingerprint profile (UA / platform / languages /
+        # plugins / sec-ch-ua). 注入到 init script, 让 STEALTH_JS 按 profile 覆盖.
+        # config.user_agent 显式给定时, _profile=None, STEALTH_JS 不覆盖.
+        self._profile = None
 
     async def start(self) -> None:
         """启动浏览器。"""
@@ -233,18 +237,39 @@ class BrowserController:
         await self._start_context()
 
     async def _start_context(self) -> None:
-        """T33: 给当前 controller 创建独立 context. Pool 用 — 不重复启动 browser."""
+        """T33: 给当前 controller 创建独立 context. Pool 用 — 不重复启动 browser.
+
+        T118: 选 profile 后所有可观察字段 (UA / platform / locale /
+        Accept-Language / Client Hints) 都从 profile 派生, 自洽.
+        config.user_agent / config.locale 仍可显式覆盖 — 此时按
+        config 走, 不选 profile.
+        """
         import os
-        # T106: 默认 user_agent 走 random 真 UA (减分用)
-        from semantic_browser.safety.stealth import random_user_agent
-        user_agent = self.config.user_agent or random_user_agent()
+        # T118: 选 profile, 让 UA / platform / Accept-Language / Client Hints
+        # 全部对齐 (减分用 — 跨字段不一致本身就是 anti-bot 信号).
+        from semantic_browser.safety.stealth import pick_profile
+        profile = pick_profile() if not self.config.user_agent else None
+        user_agent = self.config.user_agent or (profile.user_agent if profile else "Mozilla/5.0")
+        locale = self.config.locale if self.config.user_agent else (profile.locale if profile else self.config.locale)
+        accept_language = profile.accept_language if profile else "en-US,en;q=0.9"
+        # sec-ch-ua-platform 必须是带引号的 quoted-string
+        sec_ch_ua_platform = f'"{profile.platform_header}"' if profile else '"Linux"'
+        sec_ch_ua = profile.sec_ch_ua if profile else '"Chromium";v="120", "Not_A Brand";v="24"'
+        sec_ch_ua_mobile = profile.sec_ch_ua_mobile if profile else "?0"
+        # 保存 profile 给 _ensure_page 用 — 注入到 init script 让 STEALTH_JS
+        # 按 profile 字段覆盖 navigator.platform / languages / plugins
+        self._profile = profile
         context_kwargs = {
             "viewport": self.config.viewport,
             "user_agent": user_agent,
-            "locale": self.config.locale,
-            # T106: 隐藏 webdriver 标志 (关键! Playwright 默认 true 暴露 automation)
+            "locale": locale,
+            # T118: profile-coherent headers — UA / Accept-Language / Client Hints
+            # 必须三方对齐 (UA 主版本号 ↔ sec-ch-ua, locale ↔ Accept-Language ↔ languages)
             "extra_http_headers": {
-                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Language": accept_language,
+                "sec-ch-ua": sec_ch_ua,
+                "sec-ch-ua-mobile": sec_ch_ua_mobile,
+                "sec-ch-ua-platform": sec_ch_ua_platform,
             },
         }
         if self.config.storage_state_path and os.path.exists(self.config.storage_state_path):
@@ -415,10 +440,30 @@ class BrowserController:
                 else:
                     await self.start()
             self._page = await self._context.new_page()
-            # T106: 减分用 stealth JS — 隐藏 webdriver + 模拟真人 plugins/languages
-            # 必须在 page load 前 inject. addInitScript 在每个 page 创建时跑.
-            from semantic_browser.safety.stealth import STEALTH_JS
-            await self._context.add_init_script(STEALTH_JS)
+            # T118: profile-coherent stealth — 先注入 profile, 再注入 STEALTH_JS.
+            #   1) profile 写到 window.__SB_PROFILE__ (供 STEALTH_JS 读)
+            #   2) STEALTH_JS 按 profile 覆盖 navigator.platform / languages / plugins
+            # 顺序关键: profile 先 → STEALTH_JS 后, 后者在同一 microtask 内执行
+            # 时, window.__SB_PROFILE__ 已就绪. addInitScript 按调用顺序追加.
+            # config.user_agent 显式给定时, _profile=None, 不注入 profile,
+            # STEALTH_JS 静默跳过 profile-dependent 覆盖 (只覆盖 webdriver + chrome).
+            if self._profile is not None:
+                import json as _json
+                from semantic_browser.safety.stealth import STEALTH_JS
+                _profile_payload = _json.dumps({
+                    "platform": self._profile.platform,
+                    "languages": list(self._profile.languages),
+                    "plugins": list(self._profile.plugins),
+                })
+                await self._context.add_init_script(
+                    f"window.__SB_PROFILE__ = {_profile_payload};"
+                )
+                await self._context.add_init_script(STEALTH_JS)
+            else:
+                # 没有 profile (config.user_agent 显式) — 只跑 STEALTH_JS 兜底
+                # 覆盖 webdriver + chrome, 不动 platform / languages / plugins.
+                from semantic_browser.safety.stealth import STEALTH_JS
+                await self._context.add_init_script(STEALTH_JS)
             # T40i: WebSocket 监控 (per-page, open 握手触发)
             self._page.on("websocket", self._on_websocket)
             self._active_idx = 0
@@ -426,18 +471,35 @@ class BrowserController:
 
     # ── 基本浏览器动作 ──────────────────────────────────────────
 
-    async def open(self, url: str, *, wait_until: str = "domcontentloaded", timeout_ms: int = 30_000) -> Page:
-        """打开 URL, 等到指定事件.
-
-        T108 fix: 默认从 networkidle 改成 domcontentloaded.
-        原 networkidle 在 Amazon 这种 heavy-JS / analytics-streaming
-        站永远不到, 会 30s 超时. domcontentloaded 早得多 (DOM parse 完),
-        同时给脚本一个 reasonable start window. 后续 snapshot 引擎
-        自己会 page.wait_for_function 拿实际元素.
-        """
+    async def open(self, url: str, *, wait_until: str = "domcontentloaded", timeout_ms: int = 30_000, human_like_wait: bool = True) -> Page:
+        """打开 URL, 带超时降级与死锁防御。"""
         page = await self._ensure_page()
-        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        try:
+            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        except Exception as e:
+            if "Timeout" in type(e).__name__ or "timeout" in str(e).lower():
+                logger.warning("Page goto timed out with wait_until=%s for %s, retrying with commit fallback...", wait_until, _redact_url_secrets(url))
+                try:
+                    await page.goto(url, wait_until="commit", timeout=10_000)
+                    await page.evaluate("window.stop()")
+                except Exception as inner_e:
+                    logger.warning("Commit fallback failed: %s", inner_e)
+            else:
+                raise e
+
         logger.info("Opened: %s (wait=%s)", _redact_url_secrets(url), wait_until)
+
+        if human_like_wait:
+            try:
+                from semantic_browser.safety.antibot import detect_antibot
+                content = await page.content()
+                blocked, reason = detect_antibot(content)
+                if blocked and ("Just a Moment" in content or "Checking your browser" in content or "cf-error-code" in content or "challenge-form" in content):
+                    logger.info("Detected Anti-bot challenge shield (%s). Waiting gracefully up to 4s for browser verification...", reason)
+                    await asyncio.sleep(4.0)
+            except Exception as e:
+                logger.debug("Anti-bot check ignored: %s", e)
+
         return page
 
     async def back(self) -> None:
@@ -530,13 +592,20 @@ class BrowserController:
         await self._context.storage_state(path=target)
         return target
 
-    async def click(self, ref: str) -> bool:
+    async def click(self, ref: str, human_like: bool = True) -> bool:
         """通过 @ref 点击元素。"""
+        import random
         target = await self._active_page_or_frame()
         try:
             selector = self._ref_to_selector(ref)
             locator = target.locator(selector).first
             await locator.scroll_into_view_if_needed(timeout=5000)
+            if human_like:
+                try:
+                    await locator.hover(timeout=1500)
+                    await asyncio.sleep(random.uniform(0.08, 0.22))
+                except Exception:
+                    pass
             await locator.click(timeout=5000)
             logger.info("Clicked ref=%s", ref)
             return True
@@ -595,19 +664,36 @@ class BrowserController:
 
         return {"ok": False, "ref": ref, "tried": tried, "error": last_err}
 
-    async def type_text(self, ref: str, text: str) -> bool:
-        """通过 @ref 输入文本。"""
+    async def type_text(self, ref: str, text: str, human_like: bool = True) -> bool:
+        """通过 @ref 拟人化输入文本。"""
+        import random
         target = await self._active_page_or_frame()
         try:
             selector = self._ref_to_selector(ref)
             locator = target.locator(selector).first
             await locator.scroll_into_view_if_needed(timeout=5000)
-            await locator.fill(text, timeout=5000)
-            logger.info("Typed into ref=%s", ref)
+            if human_like:
+                try:
+                    await locator.focus(timeout=2000)
+                    await locator.press_sequentially(text, delay=random.randint(40, 90))
+                except Exception:
+                    await locator.fill(text, timeout=5000)
+            else:
+                await locator.fill(text, timeout=5000)
+            logger.info("Typed into ref=%s (human_like=%s)", ref, human_like)
             return True
         except Exception as e:
             logger.warning("Type failed ref=%s: %s", ref, e)
             return False
+
+    async def humanlike_scroll(self, steps: int = 3, distance: int = 350) -> None:
+        """拟人化非等速视口滑动，模仿人类浏览行为，触发懒加载与风控轨迹校验。"""
+        import random
+        page = await self._ensure_page()
+        for _ in range(steps):
+            step_dist = distance + random.randint(-40, 60)
+            await page.mouse.wheel(0, step_dist)
+            await asyncio.sleep(random.uniform(0.2, 0.45))
 
     async def type_with_healing(self, ref: str, text: str, *, heal_attempts: int = 2) -> dict[str, Any]:
         """T22: 带 self-healing 的 type_text — 失败时自动:

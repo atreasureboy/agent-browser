@@ -261,78 +261,71 @@ class ContentExtractor:
                     result.sections.push(currentSection);
                 }
             };
-            const nodes = container.querySelectorAll('h2,h3,h4,p,pre,blockquote,ul,ol,table,figure,img');
+            const nodes = container.querySelectorAll('h1,h2,h3,h4,h5,p,div[class*="content"],div[class*="text"],div[class*="post"],div[class*="body"],li,pre,blockquote,table,figure,img');
             const seen = new WeakSet();
-            for (const el of nodes) {
-                if (isNoise(el) || seen.has(el)) continue;
-                const tag = el.tagName.toLowerCase();
-                const text = cleanText(el.textContent);
-                if (tag.match(/^h[234]$/)) {
+            for (const node of nodes) {
+                if (seen.has(node) || isNoise(node)) continue;
+                seen.add(node);
+                const tag = node.tagName.toLowerCase();
+                if (/^h[1-6]$/.test(tag)) {
                     pushSection();
-                    currentSection = {heading: text, level: parseInt(tag[1]), paragraphs: [], code_blocks: [], tables: [], images: []};
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'pre') {
-                    if (text.length >= 2) {
-                        result.code_blocks.push(text);
-                        currentSection.code_blocks.push(text);
+                    currentSection = {
+                        heading: cleanText(node.textContent),
+                        level: parseInt(tag[1], 10),
+                        paragraphs: [], code_blocks: [], tables: [], images: []
+                    };
+                } else if (tag === 'pre') {
+                    const code = cleanText(node.textContent);
+                    if (code.length > 5) {
+                        currentSection.code_blocks.push(code);
+                        result.code_blocks.push(code);
                     }
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'table') {
-                    const md = tableToMarkdown(el);
+                } else if (tag === 'table') {
+                    const md = tableToMarkdown(node);
                     if (md) {
-                        result.tables.push(md);
                         currentSection.tables.push(md);
+                        result.tables.push(md);
                     }
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'img') {
-                    if (el.closest('figure')) continue;
-                    const src = el.currentSrc || el.src || el.getAttribute('src') || '';
-                    const alt = el.getAttribute('alt') || '';
-                    const caption = cleanText(el.closest('figure')?.querySelector('figcaption')?.textContent || '');
-                    if (src && (alt || caption)) {
-                        const img = {src, alt, caption};
-                        result.images.push(img);
-                        currentSection.images.push(img);
+                } else if (tag === 'img') {
+                    const src = node.getAttribute('src') || node.getAttribute('data-src') || '';
+                    const alt = node.getAttribute('alt') || node.getAttribute('title') || '';
+                    if (src && !src.includes('avatar') && !src.includes('icon')) {
+                        const imgObj = {src, alt};
+                        currentSection.images.push(imgObj);
+                        result.images.push(imgObj);
                     }
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'figure') {
-                    const imgEl = el.querySelector('img');
-                    const src = imgEl?.currentSrc || imgEl?.src || imgEl?.getAttribute('src') || '';
-                    const alt = imgEl?.getAttribute('alt') || '';
-                    const caption = cleanText(el.querySelector('figcaption')?.textContent || '');
-                    if (src && (alt || caption)) {
-                        const img = {src, alt, caption};
-                        result.images.push(img);
-                        currentSection.images.push(img);
+                } else {
+                    const text = cleanText(node.textContent);
+                    if (text.length > 25) {
+                        currentSection.paragraphs.push(text);
                     }
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'blockquote' && text.length >= 2) {
-                    currentSection.paragraphs.push('> ' + text);
-                    seen.add(el);
-                    continue;
-                }
-                if ((tag === 'ul' || tag === 'ol') && text.length >= 2) {
-                    const items = Array.from(el.querySelectorAll(':scope > li')).map(li => cleanText(li.textContent)).filter(Boolean);
-                    if (items.length) currentSection.paragraphs.push(items.map(i => `- ${i}`).join('\n'));
-                    seen.add(el);
-                    continue;
-                }
-                if (tag === 'p' && text.length >= 20) {
-                    currentSection.paragraphs.push(text);
-                    seen.add(el);
                 }
             }
             pushSection();
+
+            // Fallback: 如果抽取出的 sections 文本极短 (< 100 chars)，采用全 DOM / Web Components 通用段落兜底
+            const extractedChars = result.sections.reduce((acc, sec) => acc + (sec.paragraphs ? sec.paragraphs.join(' ').length : 0), 0);
+            if (extractedChars < 100) {
+                const fallbackParas = [];
+                const allElements = Array.from(document.body.querySelectorAll('*'));
+                for (const el of allElements) {
+                    if (isNoise(el)) continue;
+                    if (el.children.length > 2) continue;
+                    const txt = cleanText(el.textContent);
+                    if (txt.length > 25 && !fallbackParas.includes(txt)) {
+                        fallbackParas.push(txt);
+                    }
+                }
+                if (fallbackParas.length > 0) {
+                    result.sections = [{
+                        heading: result.title || 'Main Content',
+                        level: 2,
+                        paragraphs: fallbackParas.slice(0, 60),
+                        code_blocks: [], tables: [], images: []
+                    }];
+                }
+            }
+
             const allText = result.sections.flatMap(s => [s.heading, ...s.paragraphs, ...s.code_blocks]).join(' ');
             result.text_length = allText.length;
             // 真实词数: 按空白分词; 兼容 CJK (CJK 不分词所以单字计数, 跟英文混排仍可用)

@@ -63,10 +63,10 @@ jobs:
         run: |
           curl -sf -X POST "http://127.0.0.1:8765/open?url=data:text/html,<h1>smoke</h1><p>CI</p>" | python -c "import sys, json; d = json.load(sys.stdin); assert d['ok'] is True; print(f\"open OK type={d['data'].get('type')}\")"
 
-      - name: Smoke check /events SSE (3s window)
+      - name: Smoke check /events SSE (7s window)
         run: |
-          timeout 3 curl -N -sf "http://127.0.0.1:8765/events?topics=system.heartbeat" > /tmp/events.log
-          # expect ≥1 frame (id: + data:) — heartbeat 5s/帧, 3s 应该至少 0 (keepalive) 或 1 (heartbeat)
+          timeout 7 curl -N -sf "http://127.0.0.1:8765/events?topics=system.heartbeat" > /tmp/events.log || test $? -eq 124
+          grep -q "data:" /tmp/events.log
           echo "captured $(wc -l < /tmp/events.log) lines from /events"
           head -5 /tmp/events.log
 

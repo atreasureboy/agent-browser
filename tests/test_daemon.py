@@ -2932,7 +2932,8 @@ class TestT65p2StrictLLM:
         """?strict=true + LLM 不可达 → 503 + LLM_UNAVAILABLE error code."""
         # example.com 触发 heuristic < 0.5 + LLM 路径 (per llm-proxy-dev-env memory)
         # daemon_bad_llm fixture 把 OPENAI_API_BASE 指到 127.0.0.1:1, LLM 必失败
-        r = _http("POST", f"{daemon_bad_llm}/open?strict=true",
+        # force=true 确保跳过前面的 cache 命中直达 LLM 分类路径
+        r = _http("POST", f"{daemon_bad_llm}/open?strict=true&force=true",
                   {"url": "http://example.com"}, timeout=60)
         # strict 模式下 LLM 失败必须返 error envelope, 不能 silent fallback
         assert r.get("ok") is False, f"strict mode LLM 失败应返 ok=false, got {r}"

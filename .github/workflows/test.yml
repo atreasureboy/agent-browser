@@ -44,7 +44,7 @@ jobs:
 
       - name: Run pytest
         run: |
-          python -m pytest tests/ -q --timeout=180 -x -ra
+          python -m pytest tests/ -n 2 -q --timeout=180 -x -ra
 
       - name: Upload logs on failure
         if: failure()

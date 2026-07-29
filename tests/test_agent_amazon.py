@@ -34,6 +34,9 @@ def call(query_text: str, start_url: str | None = None, budget: int = 1500) -> d
 
 def test_books_toscrape_works():
     """T103: books.toscrape.com (无 anti-bot) — 工具应能正常抓 books 和 prices."""
+    import pytest
+    if not _is_daemon_up():
+        pytest.skip("daemon not running on 18801 — skip test")
     ans = call("find books with prices", start_url="https://books.toscrape.com/", budget=1500)
     assert ans["success"], f"query failed: {ans.get('error', 'unknown')}"
     assert len(ans["sources"]) > 0, f"no sources: {ans}"

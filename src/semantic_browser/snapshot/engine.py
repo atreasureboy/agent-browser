@@ -101,6 +101,17 @@ class TextBlock:
 
 
 @dataclass
+class ProductCard:
+    """T121: 结构化电商产品卡片 — 名称/价格/评分关联."""
+    name: str = ""
+    price: str = ""
+    rating: str = ""
+    review_count: str = ""
+    url: str = ""
+    image_alt: str = ""
+
+
+@dataclass
 class PageSnapshot:
     """页面语义快照 — Agent 看到的核心数据结构。"""
     url: str
@@ -120,6 +131,8 @@ class PageSnapshot:
     comments: list[str] = field(default_factory=list)
     # T42a: form 分类 + 隐藏字段全集 — agent 登录 / 提交表单 / 找 CSRF 必需.
     forms: list[FormInfo] = field(default_factory=list)
+    # T121: 结构化电商产品卡片 — 名称/价格/评分关联 (Amazon/京东/淘宝等)
+    product_cards: list[ProductCard] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -199,6 +212,7 @@ class SnapshotEngine:
 
         meta = await self._extract_meta()
         text_blocks = await self._extract_text_blocks()
+        product_cards = await self._extract_product_cards()  # T121
         links, controls, forms = await self._extract_interactive(base_url or url, detail_level)
         raw_aria = await self._get_raw_aria()
         scripts = await self._extract_scripts(detail_level)
@@ -214,6 +228,7 @@ class SnapshotEngine:
             scripts=scripts,
             comments=comments,
             forms=forms,                                 # T42a
+            product_cards=product_cards,                 # T121
             detail_level=detail_level,
             meta=meta,
             raw_aria=raw_aria,
@@ -239,14 +254,15 @@ class SnapshotEngine:
 
     async def _extract_text_blocks(self) -> list[TextBlock]:
         """提取页面中的文本块。"""
-        raw = await self.page.evaluate("""() => {
+        raw = await self.page.evaluate(r"""() => {
             const blocks = [];
-            const tags = ['h1','h2','h3','h4','h5','h6','p','li','blockquote','pre','code','dt','dd','summary','figcaption'];
+            const tags = ['h1','h2','h3','h4','h5','h6','p','li','blockquote','pre','code','dt','dd','summary','figcaption','span'];
             const seen = new WeakSet();
 
             for (const tag of tags) {
                 for (const el of document.querySelectorAll(tag)) {
-                    if (el.closest('nav, footer, header[role="banner"], aside, [role="navigation"]')) continue;
+                    // 跳过纯导航/页脚, 但保留 aside 中的内容 (Wikipedia 等站点把新闻放在 aside 里)
+                    if (el.closest('nav, footer, header[role="banner"], [role="navigation"]')) continue;
                     if (seen.has(el)) continue;
                     let parent = el.parentElement;
                     while (parent) {
@@ -255,6 +271,9 @@ class SnapshotEngine:
                     }
                     const text = el.textContent.trim();
                     if (!text) continue;
+                    // span 只取有实质内容的 (避免噪声)
+                    if (tag === 'span' && text.length < 15) continue;
+                    if (tag === 'span' && /^[\d.,\s%]+$/.test(text)) continue;  // 纯数字跳过
                     const level = tag.startsWith('h') ? parseInt(tag[1]) : 0;
                     blocks.push({tag, text: text.substring(0, 2000), level, index: blocks.length});
                     seen.add(el);
@@ -308,6 +327,90 @@ class SnapshotEngine:
             text_blocks.append(TextBlock(tag=item["tag"], text=item["text"], level=0))
 
         return text_blocks
+
+    async def _extract_product_cards(self) -> list[ProductCard]:
+        """T121: 提取结构化电商产品卡片 — 名称/价格/评分关联.
+
+        电商网站 (Amazon/京东/淘宝等) 的产品列表页, 每个产品是一个卡片容器,
+        里面包含名称、价格、评分等. 这个方法通过 DOM 结构关联这些数据,
+        而不是让 LLM 从散乱的 text_blocks 里猜.
+
+        策略: 找产品容器 (常见 class: product-card, s-result-item, etc),
+        在每个容器内找 name/price/rating 元素.
+        """
+        raw = await self.page.evaluate(r"""() => {
+            const cards = [];
+            // 产品容器选择器 (覆盖主流电商)
+            const containerSelectors = [
+                '[data-component-type="s-search-result"]',  // Amazon
+                '[class*="product-card"]', '[class*="productCard"]',
+                '[class*="product-item"]', '[class*="productItem"]',
+                '[class*="s-result-item"]',                  // Amazon alt
+                '[data-testid="product-card"]',
+                '.goods-item', '.item-card',                 // 京东/淘宝 style
+                '[class*="card"][class*="product"]',
+            ];
+            const seen = new WeakSet();
+            for (const sel of containerSelectors) {
+                for (const container of document.querySelectorAll(sel)) {
+                    if (seen.has(container)) continue;
+                    seen.add(container);
+                    // 名称: h2/a.title/[class*=title]
+                    let name = '';
+                    const nameEl = container.querySelector('h2, [class*="title" i], a[class*="name" i]');
+                    if (nameEl) name = nameEl.textContent.trim().substring(0, 200);
+                    if (!name) {
+                        // fallback: 第一个有意义的 a 标签文本
+                        const a = container.querySelector('a[href]');
+                        if (a && a.textContent.trim().length > 10) name = a.textContent.trim().substring(0, 200);
+                    }
+                    if (!name) continue;  // 没名称跳过
+                    // 价格: $XX.XX 或特定 class
+                    let price = '';
+                    const priceSelectors = [
+                        '.a-price .a-offscreen', '.a-price-whole',
+                        '[class*="price" i] [class*="offscreen"]',
+                        '[class*="price" i]', '[data-a-color="price"]'
+                    ];
+                    for (const ps of priceSelectors) {
+                        const el = container.querySelector(ps);
+                        if (el) {
+                            const t = el.textContent.trim();
+                            if (/[\$¥€£]/.test(t) && /[\d]/.test(t)) {
+                                price = t.substring(0, 50);
+                                break;
+                            }
+                        }
+                    }
+                    // 评分: X.X out of 5 stars
+                    let rating = '';
+                    let review_count = '';
+                    const ratingEls = container.querySelectorAll('[class*="rating" i], [aria-label*="stars" i], [aria-label*="out of 5" i], .a-icon-alt');
+                    for (const el of ratingEls) {
+                        const t = el.textContent.trim() || el.getAttribute('aria-label') || '';
+                        const m = t.match(/([\d.]+)\s*out of\s*[\d.]+\s*stars?/i);
+                        if (m) { rating = m[1] + ' stars'; break; }
+                    }
+                    // 评论数
+                    const reviewEls = container.querySelectorAll('[class*="review" i], [class*="rating" i]');
+                    for (const el of reviewEls) {
+                        const t = el.textContent.trim();
+                        const m = t.match(/\(?([\d,.]+[KkMm]?)\)?\s*(?:ratings?|reviews?|评价)/i);
+                        if (m) { review_count = m[1]; break; }
+                    }
+                    // URL
+                    let url = '';
+                    const linkEl = container.querySelector('a[href*="/dp/"], a[href*="product"], a[class*="title" i]');
+                    if (linkEl) url = linkEl.getAttribute('href') || '';
+                    cards.push({name, price, rating, review_count, url});
+                    if (cards.length >= 20) break;  // 上限保护
+                }
+                if (cards.length > 0) break;  // 找到就用, 不混多套选择器
+            }
+            return cards;
+        }""")
+
+        return [ProductCard(**card) for card in raw]
 
     async def _extract_interactive(self, base_url: str, detail_level: str = "normal") -> tuple[list[LinkInfo], list[ControlInfo], list[FormInfo]]:
         """提取可操作元素并写入稳定 ref。

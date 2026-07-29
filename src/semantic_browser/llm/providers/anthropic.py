@@ -37,7 +37,7 @@ class AnthropicProvider:
     name = "anthropic"
 
     def __init__(self, api_key: str, base_url: str = DEFAULT_BASE_URL,
-                 timeout: float = 30.0) -> None:
+                 timeout: float = 60.0) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout

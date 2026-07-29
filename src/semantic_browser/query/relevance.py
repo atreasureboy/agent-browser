@@ -36,6 +36,8 @@ Rules:
 - "overall" is your confidence the page contains enough info to (partially) answer the query
 - Return scores for ALL sections in order
 - Be strict: nav, footer, ads, sidebar score 0.0
+- Sections with heading "product" contain structured e-commerce data (name/price/rating).
+  Score them HIGH if the query asks about products, shopping, prices, or comparisons.
 """
 
 
@@ -129,7 +131,7 @@ class RelevanceFilter:
                 # T112 audit fix: 同 planner — 用底层 complete_with_fallback
                 # 拿真 .usage, 不要靠 dict.usage (永远空).
                 llm_resp = await self.llm.complete_with_fallback(
-                    messages, tier=self.tier, temperature=0.1, max_tokens=1500,
+                    messages, tier=self.tier, temperature=0.1, max_tokens=3000,
                     json_mode=True,
                 )
                 if budget is not None:

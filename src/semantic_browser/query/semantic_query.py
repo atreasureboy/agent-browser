@@ -483,6 +483,13 @@ class SemanticQuery:
                     current_url = None
                     continue
 
+                # T121: 拟人化滚动 — 触发懒加载, 降低反爬虫检测
+                try:
+                    ctrl = browser.controller
+                    await ctrl.humanlike_scroll(steps=2, distance=300)
+                except Exception as e:
+                    logger.debug("humanlike_scroll skipped: %s", e)
+
                 sources_visited.append(browse_result.snapshot.url)
                 final_url = browse_result.snapshot.url
                 _record_step("browse_done", url=final_url,
@@ -748,13 +755,35 @@ class SemanticQuery:
     def _extract_sections(browse_result) -> list[SectionInput]:
         """从 browse_result 提 sections 给 relevance filter.
 
-        三层 fallback:
+        四层来源 (全部合并, 不再互斥):
+          0. product_cards (电商结构化数据 — 名称/价格/评分关联)
           1. article.sections (article / docs 页)
-          2. snapshot.text_blocks (list / search / forum / dashboard 等没有 article 的页)
+          2. snapshot.text_blocks (list / search / forum / dashboard 等)
           3. snapshot.links (纯链接列表页 — HN 这种)
         """
         out: list[SectionInput] = []
         idx = 0
+
+        # 来源 0: 结构化产品卡片 (T121)
+        snap = getattr(browse_result, "snapshot", None)
+        if snap and getattr(snap, "product_cards", None):
+            for card in snap.product_cards[:10]:
+                parts = [card.name]
+                if card.price:
+                    parts.append(f"Price: {card.price}")
+                if card.rating:
+                    rating_text = f"Rating: {card.rating}"
+                    if card.review_count:
+                        rating_text += f" ({card.review_count} reviews)"
+                    parts.append(rating_text)
+                excerpt = " | ".join(parts)
+                out.append(SectionInput(
+                    index=idx,
+                    heading="product",
+                    excerpt=excerpt[:400],
+                    link_href=card.url,
+                ))
+                idx += 1
 
         # 来源 1: article 段落 (article / docs 类)
         article = getattr(browse_result, "article", None)
@@ -769,36 +798,35 @@ class SemanticQuery:
                 ))
                 idx += 1
 
-        # 来源 2 + 3: snapshot (list / search / dashboard / forum 等没有 article 的页)
-        snap = getattr(browse_result, "snapshot", None)
-        if snap:
-            # 来源 2: text_blocks
-            if not out and getattr(snap, "text_blocks", None):
-                for block in snap.text_blocks[:30]:
-                    text = (block.text or "")[:300] if hasattr(block, "text") else str(block)[:300]
-                    if not text.strip() or len(text.strip()) < 20:
-                        continue
-                    out.append(SectionInput(
-                        index=idx,
-                        heading=block.tag if hasattr(block, "tag") else "block",
-                        excerpt=text,
-                    ))
-                    idx += 1
+        # 来源 2: text_blocks (始终包含, 不再仅作为 fallback)
+        # 限制数量避免 relevance filter prompt 爆炸, 但保证足够覆盖
+        max_text_blocks = 15 if out else 50  # 有 product/article 时少取 text_blocks
+        if snap and getattr(snap, "text_blocks", None):
+            for block in snap.text_blocks[:max_text_blocks]:
+                text = (block.text or "")[:300] if hasattr(block, "text") else str(block)[:300]
+                if not text.strip() or len(text.strip()) < 20:
+                    continue
+                out.append(SectionInput(
+                    index=idx,
+                    heading=block.tag if hasattr(block, "tag") else "block",
+                    excerpt=text,
+                ))
+                idx += 1
 
-            # 来源 3: links (HN frontpage 这种纯链接列表)
-            if not out and getattr(snap, "links", None):
-                for ln in snap.links[:30]:
-                    text = (ln.text or "") if hasattr(ln, "text") else str(ln)
-                    href = (ln.href or "") if hasattr(ln, "href") else ""
-                    if not text.strip() or len(text.strip()) < 10:
-                        continue
-                    out.append(SectionInput(
-                        index=idx,
-                        heading="link",
-                        excerpt=text[:300],
-                        link_href=href,
-                    ))
-                    idx += 1
+        # 来源 3: links (HN frontpage 这种纯链接列表) — 仅在无其他来源时
+        if not out and snap and getattr(snap, "links", None):
+            for ln in snap.links[:30]:
+                text = (ln.text or "") if hasattr(ln, "text") else str(ln)
+                href = (ln.href or "") if hasattr(ln, "href") else ""
+                if not text.strip() or len(text.strip()) < 10:
+                    continue
+                out.append(SectionInput(
+                    index=idx,
+                    heading="link",
+                    excerpt=text[:300],
+                    link_href=href,
+                ))
+                idx += 1
         return out
 
     # ── 持久 cache helpers ──────────────────────────────────

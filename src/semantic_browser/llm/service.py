@@ -69,7 +69,7 @@ class LLMService:
         model_cheap: Optional[str] = None,
         model_medium: Optional[str] = None,
         model_smart: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
     ) -> None:
         # T36: 显式 provider 优先, 否则 auto-detect from env
         provider_name = (provider or detect_provider()).lower()

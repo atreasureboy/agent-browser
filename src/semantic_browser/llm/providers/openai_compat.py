@@ -23,7 +23,7 @@ class OpenAICompatProvider:
 
     name = "openai"
 
-    def __init__(self, api_key: str, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, api_key: str, base_url: str, timeout: float = 60.0) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -96,7 +96,7 @@ class OllamaProvider(OpenAICompatProvider):
     DEFAULT_BASE_URL = "http://localhost:11434/v1"
 
     def __init__(self, api_key: str = "ollama", base_url: str = "",
-                 timeout: float = 30.0) -> None:
+                 timeout: float = 60.0) -> None:
         super().__init__(
             api_key=api_key or "ollama",
             base_url=base_url or self.DEFAULT_BASE_URL,

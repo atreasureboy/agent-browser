@@ -54,7 +54,7 @@ def build_provider(
     *,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
-    timeout: float = 30.0,
+    timeout: float = 60.0,
 ) -> LLMProvider:
     """工厂 — 按 name 构建 provider. 缺省值从 env 拿.
 

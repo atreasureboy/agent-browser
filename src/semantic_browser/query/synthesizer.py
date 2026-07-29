@@ -28,6 +28,9 @@ Output rules:
 - If the excerpts are insufficient to fully answer, say so explicitly at the start:
   "Note: information may be incomplete"
 - Be concise. Prefer bullet points over long paragraphs when content is list-like
+- For product/ecommerce data: excerpts with heading "product" contain structured data
+  in format "Name | Price: $XX | Rating: X.X stars (N reviews)". Use this directly.
+- When the query asks for a list (top N, best, etc.), present results as a numbered list or table.
 """
 
 

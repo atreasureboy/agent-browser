@@ -5466,6 +5466,7 @@ class _T43Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+@pytest.mark.timeout(30)
 class TestT43aEnumerateSubdomains:
     """T43a: 子域名枚举 — crt.sh + TLS cert SAN."""
 
@@ -5913,10 +5914,10 @@ class TestT44aDnsRecords:
         asyncio.run(go())
 
 
+@pytest.mark.timeout(30)
 class TestT44bWaybackUrls:
     """T44b: Wayback Machine 历史 URL."""
 
-    @pytest.mark.timeout(30)
     def test_returns_expected_shape(self):
         from semantic_browser.browser.controller import BrowserController
         ctrl = BrowserController.__new__(BrowserController)

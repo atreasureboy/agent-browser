@@ -22,15 +22,18 @@ def _have_network() -> bool:
         from urllib.request import urlopen, Request
         req = Request("https://archive.org/wayback/available?url=example.com/")
         req.add_header("User-Agent", "pytest")
-        with urlopen(req, timeout=8) as resp:
+        with urlopen(req, timeout=5) as resp:
             return resp.status == 200
     except Exception:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _have_network(), reason="no network to archive.org"
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _have_network(), reason="no network to archive.org"
+    ),
+    pytest.mark.timeout(30),  # 每个测试最多 30s
+]
 
 
 def test_archive_returns_snapshot_for_known_site():

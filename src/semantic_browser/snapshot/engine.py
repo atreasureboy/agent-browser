@@ -264,10 +264,50 @@ class SnapshotEngine:
             return blocks;
         }""")
 
-        return [
+        text_blocks = [
             TextBlock(tag=b["tag"], text=b["text"], level=b.get("level", 0))
             for b in raw
         ]
+
+        # T121: 补充提取电商关键信息 (价格/评分/库存状态)
+        # 亚马逊等电商网站用 span 显示价格和评分，不在上面的 tags 列表里
+        ecommerce_data = await self.page.evaluate(r"""() => {
+            const items = [];
+            // 价格元素: $XX.XX 格式 或 特定 class
+            const priceSelectors = [
+                '[class*="price"]', '[class*="Price"]',
+                '[data-a-color="price"]', '.a-price .a-offscreen',
+                '.a-price-whole', '.a-price-fraction'
+            ];
+            for (const sel of priceSelectors) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const text = el.textContent.trim();
+                    if (text && (/[\$][\d,.]+/.test(text) || /[¥][\d,.]+/.test(text) || /[€][\d,.]+/.test(text) || /[£][\d,.]+/.test(text))) {
+                        items.push({tag: 'span', text: text.substring(0, 200), level: 0, type: 'price'});
+                    }
+                }
+            }
+            // 评分元素: stars/rating 或 X out of 5 stars
+            const ratingSelectors = [
+                '[class*="rating"]', '[class*="Rating"]', '[class*="review"]',
+                '[aria-label*="stars"]', '[aria-label*="out of 5"]',
+                '.a-icon-alt'
+            ];
+            for (const sel of ratingSelectors) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const text = el.textContent.trim() || el.getAttribute('aria-label') || '';
+                    if (text && (/[\d.]+ out of [\d.]+ stars?/i.test(text) || /\d+ ratings?/i.test(text))) {
+                        items.push({tag: 'span', text: text.substring(0, 200), level: 0, type: 'rating'});
+                    }
+                }
+            }
+            return items;
+        }""")
+
+        for item in ecommerce_data:
+            text_blocks.append(TextBlock(tag=item["tag"], text=item["text"], level=0))
+
+        return text_blocks
 
     async def _extract_interactive(self, base_url: str, detail_level: str = "normal") -> tuple[list[LinkInfo], list[ControlInfo], list[FormInfo]]:
         """提取可操作元素并写入稳定 ref。

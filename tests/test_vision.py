@@ -207,7 +207,7 @@ async def test_call_gemini_vision_sends_inline_data(monkeypatch):
     assert img_part["inline_data"]["data"] == "fake-b64"
     # generationConfig 强制 JSON
     assert body["generationConfig"]["responseMimeType"] == "application/json"
-    assert "key=gk" in captured["url"]
+    assert captured["kwargs"]["headers"]["x-goog-api-key"] == "gk"
 
 
 # ── 解析端到端 ──────────────────────────────────────────────

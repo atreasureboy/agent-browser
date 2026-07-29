@@ -3122,7 +3122,11 @@ class TransparentBrowserDaemon:
         agent 长会话期内 cache 命中率高 (重复 /open 同一站 是常态)."""
         # T115 audit fix: 整个 FIFO evict + insert 必须在 lock 内 — 否则
         # 两个线程同时检查 len < max, 都成功 insert, 最终 size 翻倍超过 max.
-        with self._classify_cache_lock:
+        lock = getattr(self, "_classify_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._classify_cache_lock = lock
+        with lock:
             if len(self._classify_cache) >= self._classify_cache_max:
                 try:
                     self._classify_cache.popitem()  # FIFO eviction

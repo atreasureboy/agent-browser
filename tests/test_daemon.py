@@ -2735,9 +2735,11 @@ class TestT63p2LLMAugmentAndPolish:
         # daemon fixture 实例不直接暴露 — 走 http 不易测 cache cap. 改测
         # _cache_put 直接逻辑.
         # 用临时 daemon 实例测
+        import threading
         fake = TransparentBrowserDaemon.__new__(TransparentBrowserDaemon)
         fake._classify_cache = {}
         fake._classify_cache_max = 3
+        fake._classify_cache_lock = threading.Lock()
         from semantic_browser.daemon.server import TransparentBrowserDaemon as T
         # 直接用同一 module 函数
         import semantic_browser.daemon.server as srv

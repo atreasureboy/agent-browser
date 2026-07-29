@@ -123,15 +123,18 @@ class TestAiderAdapterFormat:
 class TestProductionDeployValidation:
     """T78: production_deploy.md 里的 yaml 块能 parse + 是有效 k8s manifests."""
 
-    def test_yaml_blocks_parse(self):
-        """所有 yaml 块能安全 parse."""
-        import re
+    def _load_doc_content(self):
         from pathlib import Path
-        yaml = pytest.importorskip("yaml")
         doc_path = Path(__file__).resolve().parent.parent / "examples" / "production_deploy.md"
         if not doc_path.exists():
             pytest.skip(f"doc not found: {doc_path}")
-        content = doc_path.read_text(encoding="utf-8")
+        return doc_path.read_text(encoding="utf-8")
+
+    def test_yaml_blocks_parse(self):
+        """所有 yaml 块能安全 parse."""
+        import re
+        yaml = pytest.importorskip("yaml")
+        content = self._load_doc_content()
         blocks = re.findall(r'```yaml\n(.*?)\n```', content, re.DOTALL)
         assert len(blocks) >= 1, "no yaml blocks found in production_deploy.md"
         for i, blk in enumerate(blocks):
@@ -148,10 +151,9 @@ class TestProductionDeployValidation:
     def test_k8s_deployment_has_required_fields(self):
         """k8s Deployment manifest 必须含 kind / metadata / spec."""
         import re
-        import yaml
-        content = open('/project/semantic-browser/examples/production_deploy.md').read()
+        yaml = pytest.importorskip("yaml")
+        content = self._load_doc_content()
         blocks = re.findall(r'```yaml\n(.*?)\n```', content, re.DOTALL)
-        # 第二个 block 含 deployment
         assert len(blocks) >= 2
         cleaned = '\n'.join(
             line for line in blocks[1].split('\n') if not line.lstrip().startswith('#')
@@ -161,24 +163,21 @@ class TestProductionDeployValidation:
         assert deployment is not None, "no Deployment in second yaml block"
         assert deployment["apiVersion"] == "apps/v1"
         assert "semantic-browser" in deployment["metadata"]["name"]
-        # spec 应含 container image + port + probe
         spec = deployment["spec"]
         assert spec["replicas"] >= 1
         containers = spec["template"]["spec"]["containers"]
         assert len(containers) >= 1
         container = containers[0]
-        # 关键: liveness + readiness probe 都应存在 (k8s production 必填)
         assert "livenessProbe" in container
         assert "readinessProbe" in container
-        # 关键 env: ANTHROPIC_AUTH_TOKEN 应来自 secret
         env_names = [e["name"] for e in container.get("env", [])]
         assert "ANTHROPIC_AUTH_TOKEN" in env_names
 
     def test_pvc_has_storage_request(self):
         """PVC 应有 resources.requests.storage."""
         import re
-        import yaml
-        content = open('/project/semantic-browser/examples/production_deploy.md').read()
+        yaml = pytest.importorskip("yaml")
+        content = self._load_doc_content()
         blocks = re.findall(r'```yaml\n(.*?)\n```', content, re.DOTALL)
         cleaned = '\n'.join(
             line for line in blocks[1].split('\n') if not line.lstrip().startswith('#')
@@ -186,5 +185,4 @@ class TestProductionDeployValidation:
         docs = list(yaml.safe_load_all(cleaned))
         pvc = next((d for d in docs if d.get("kind") == "PersistentVolumeClaim"), None)
         assert pvc is not None
-        # 1Gi storage 给了
         assert "1Gi" in str(pvc["spec"]["resources"]["requests"]["storage"])

@@ -2867,6 +2867,7 @@ def daemon_bad_llm():
     env["OPENAI_BASE_URL"] = "http://127.0.0.1:1/v1"
     env["OPENAI_API_BASE"] = "http://127.0.0.1:1/v1"
     env["OPENAI_MODEL"] = "fake-model-for-strict-test"
+    env["OPENAI_API_KEY"] = "sk-fake-key-for-test"
     proc = subprocess.Popen(
         [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port),
          "--allow-data-scheme"],

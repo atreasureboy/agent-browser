@@ -1703,7 +1703,7 @@ class TransparentBrowserDaemon:
             return self.owner.run(self._open(
                 args["url"], args.get("session"),
                 detail=args.get("detail", "summary"),
-                classify_force=str(args.get("classify", "")).lower() in ("1", "true", "force"),
+                classify_force=str(args.get("classify", args.get("force", ""))).lower() in ("1", "true", "force"),
                 classify_strict=str(args.get("strict", "")).lower() in ("1", "true"),
             ))
         if method == "GET" and path == "/snapshot":

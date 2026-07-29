@@ -88,7 +88,7 @@ class _MockHandler(http.server.BaseHTTPRequestHandler):
             # 升 Last-Modified 时间戳 — 否则 If-Modified-Since 仍 match 304, 测试失败
             import datetime
             _MockHandler.last_modified = (
-                datetime.datetime.utcnow()
+                datetime.datetime.now(datetime.UTC)
                 .replace(microsecond=0)
                 .strftime("%a, %d %b %Y %H:%M:%S GMT")
             )

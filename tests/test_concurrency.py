@@ -170,7 +170,7 @@ class TestMultiSessionRace:
         ts = [threading.Thread(target=open_url, args=(i,)) for i in range(2)]
         for t in ts: t.start()
         for t in ts: t.join(timeout=90)
-        stop.append(True)
+        stop[0] = True
         poller.join(timeout=3)
         # 至少两个 op 都该成功 (一个 in-flight, 一个等待)
         # 但 waiters 也很可能看不到 (太快了), 至少 current_op 应该出现过

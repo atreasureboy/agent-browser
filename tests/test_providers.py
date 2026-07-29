@@ -313,8 +313,7 @@ async def test_gemini_provider_call_shape(monkeypatch):
         model="gemini-2.0-flash", temperature=0.3, max_tokens=200, json_mode=True,
     )
     assert resp.content == "gemini hi"
-    assert "?" in captured["url"]
-    assert "key=gkey" in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "gkey"
     assert "/v1beta/models/gemini-2.0-flash:generateContent" in captured["url"]
     body = captured["json"]
     assert body["systemInstruction"]["parts"][0]["text"] == "be brief"

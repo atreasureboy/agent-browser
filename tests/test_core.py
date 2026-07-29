@@ -5478,7 +5478,7 @@ class TestT43aEnumerateSubdomains:
             try:
                 await c.start()
                 # 真实查询 localhost — crt.sh 不可达, 应 timeout/error 但不崩
-                r = await c.enumerate_subdomains("127.0.0.1", include_tls_san=False)
+                r = await c.enumerate_subdomains("127.0.0.1", include_tls_san=False, crtsh_timeout=5.0)
                 assert r["host"] == "127.0.0.1"
                 assert isinstance(r["subdomains"], list)
                 assert "crtsh_status" in r
@@ -5916,11 +5916,12 @@ class TestT44aDnsRecords:
 class TestT44bWaybackUrls:
     """T44b: Wayback Machine 历史 URL."""
 
+    @pytest.mark.timeout(30)
     def test_returns_expected_shape(self):
         from semantic_browser.browser.controller import BrowserController
         ctrl = BrowserController.__new__(BrowserController)
         async def go():
-            r = await ctrl.wayback_urls("https://example.com/", limit=20, timeout=8.0)
+            r = await ctrl.wayback_urls("https://example.com/", limit=20, timeout=5.0)
             assert r["url"] == "https://example.com/"
             assert isinstance(r["unique_targets"], list)
             # example.com 历史悠久, 必有多个 snapshot

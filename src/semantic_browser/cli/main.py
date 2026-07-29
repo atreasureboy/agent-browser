@@ -547,6 +547,9 @@ def semantic_query(query, start_url, budget, max_pages, cache_persist_path, clea
         finally:
             await sq.close()
 
+    import asyncio
+    asyncio.run(_run())
+
 
 @cli.command("query-log")
 @click.option("--limit", type=int, default=50, help="返回条数 (1-100)")

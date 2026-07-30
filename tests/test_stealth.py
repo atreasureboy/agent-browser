@@ -279,3 +279,65 @@ def test_profile_has_chrome_version_token(profile: Profile) -> None:
     """UA 形如 'Chrome/120.0.0.0' — 必须含 'Chrome/<digits>' 或 'Edg/<digits>'."""
     ua = profile.user_agent
     assert re.search(r"(?:Chrome|Edg)/\d+\.\d+", ua), f"UA 缺版本号: {ua}"
+
+
+# ── 20. STEALTH_JS 覆盖 hardwareConcurrency / deviceMemory (T118 1b) ─
+# headless Chromium 默认 hardwareConcurrency=2, deviceMemory=0.25 — 与
+# real desktop 用户的 8/8 严重不一致, 是 CreepJS 重点检测项.
+def test_stealth_js_patches_hardware_concurrency_and_device_memory() -> None:
+    """STEALTH_JS 必须覆盖 Navigator.prototype.hardwareConcurrency 和 deviceMemory.
+    缺这俩在 headless 模式会被 fingerprint 检测直接命中.
+    """
+    assert "hardwareConcurrency" in STEALTH_JS, (
+        "STEALTH_JS 缺 hardwareConcurrency 覆盖 (headless 默认 2 太显眼)"
+    )
+    assert "deviceMemory" in STEALTH_JS, (
+        "STEALTH_JS 缺 deviceMemory 覆盖 (headless 默认 0.25 太显眼)"
+    )
+    # 必须用 Navigator.prototype 而不是直接 navigator
+    assert re.search(
+        r"Navigator\.prototype.*hardwareConcurrency", STEALTH_JS, re.DOTALL
+    ), "hardwareConcurrency 应走 Navigator.prototype 覆盖"
+    assert re.search(
+        r"Navigator\.prototype.*deviceMemory", STEALTH_JS, re.DOTALL
+    ), "deviceMemory 应走 Navigator.prototype 覆盖"
+
+
+# ── 21. STEALTH_JS 对齐 window.outerWidth / outerHeight (T118 1c) ─
+# headless 默认 window.outerWidth === 0 (因为没真窗口管理器) — CreepJS 直接读
+# outerWidth===0 判 headless. 必须 fallback 到 innerWidth.
+def test_stealth_js_aligns_window_outer_dimensions() -> None:
+    """STEALTH_JS 必须修正 headless 的 outerWidth/outerHeight=0 问题.
+    fallback 到 innerWidth/innerHeight, 再不行 fallback 到 1280/800.
+    """
+    assert "outerWidth" in STEALTH_JS, "STEALTH_JS 缺 outerWidth 修正"
+    assert "outerHeight" in STEALTH_JS, "STEALTH_JS 缺 outerHeight 修正"
+    # 必须检查 === 0 才修正 (不能无条件覆盖, 否则与真 desktop 用户不符)
+    assert "outerWidth === 0" in STEALTH_JS or "outerWidth==0" in STEALTH_JS, (
+        "outerWidth 应只在 0 时修正 (否则覆盖真 desktop 用户)"
+    )
+    assert "outerHeight === 0" in STEALTH_JS or "outerHeight==0" in STEALTH_JS, (
+        "outerHeight 应只在 0 时修正"
+    )
+    # fallback 链: innerWidth || 1280
+    assert "innerWidth" in STEALTH_JS, "outerWidth fallback 应包含 innerWidth"
+    assert "innerHeight" in STEALTH_JS, "outerHeight fallback 应包含 innerHeight"
+
+
+# ── 22. STEALTH_JS mock navigator.permissions.query (T118 1d) ─────
+# Chrome 默认 notifications permission = 'default' / 'denied' —
+# headless automation 常报告不一致. 必须包一层 query 返回 Notification.permission.
+def test_stealth_js_mocks_permissions_query_for_notifications() -> None:
+    """STEALTH_JS 必须包 navigator.permissions.query, notifications 走 Notification.permission."""
+    assert "permissions" in STEALTH_JS, "STEALTH_JS 缺 permissions mock"
+    assert "notifications" in STEALTH_JS, (
+        "permissions mock 应至少处理 notifications (CreepJS 检测项)"
+    )
+    # 必须保留原 query (非 notifications 时仍走原函数) — 不能无条件覆盖
+    assert "origQuery" in STEALTH_JS or "originalQuery" in STEALTH_JS, (
+        "permissions.query 应保留原函数引用, 只覆盖 notifications 路径"
+    )
+    # 返回值结构需与 Chrome Notification.permission 对齐
+    assert "Notification.permission" in STEALTH_JS, (
+        "notifications permission state 应读 Notification.permission"
+    )

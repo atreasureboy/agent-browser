@@ -1,3 +1,33 @@
+## T118 — Profile-Coherent Stealth Fingerprint Layer
+
+**问题**: 之前 `USER_AGENTS` 混排 Firefox / Safari / Edge / Chrome, 但底层永远是 Chromium — 风控不是看 UA 是不是"真", 而是看 UA / `navigator.platform` / `navigator.languages` / sec-ch-ua-* / plugins / `window.chrome` 跨字段是否自洽. UA 说 Firefox 但 JS 引擎是 V8 + `window.chrome` 存在 = 三方矛盾, 反而**加分**给 anti-bot.
+
+**改动**:
+
+- **`src/semantic_browser/safety/stealth.py` 重写为 profile-coherent**:
+  - `USER_AGENTS` 列表 → `PROFILES: list[Profile]` 数据结构 (12 条, 全部 Chromium-family)
+  - 删 Firefox (3 条) + Safari (2 条), 保留 Chrome Windows × 5 / Chrome macOS × 3 / Edge × 2 / Linux × 2
+  - 每个 `Profile` 是 `@dataclass(frozen=True)`, 字段: `user_agent` / `platform` / `platform_header` / `locale` / `accept_language` / `languages` / `sec_ch_ua` / `sec_ch_ua_mobile` / `plugins`
+  - 新 `pick_profile()` 一次选中, 所有可观察字段跟着对齐
+  - `random_user_agent()` 保留为薄包装, 向后兼容 `controller.py:240`
+- **`STEALTH_JS` 改 profile-driven**, 删 stale 覆盖:
+  - 删 WebGL `getParameter` 覆盖 (固定串 'Intel Inc.'/'WebKit' 熵为 0, 比裸奔更易识别)
+  - 删裸数组 plugins `[1,2,3,4]` + 假 plugin 名 'Plugin 1' — 改用真 `PluginArray.prototype` 接口 (item/namedItem/refresh) + 真实 Chrome 默认名 (PDF Viewer / Chrome PDF Viewer)
+  - 删硬编码 languages `['en-US','en']` — 改读 `window.__SB_PROFILE__.languages`
+  - 删空 `chrome = {loadTimes: () => ({})}` — 改完整 Chrome 120+ 形状 (OnInstalledReason / PlatformArch / PlatformOs / RequestUpdateCheckStatus)
+  - 新增 `navigator.platform` 覆盖 (Linux 服务器跑 Win profile 时 platform 必须被同步, 之前根本没 patch)
+  - 改走 `Navigator.prototype` 而非 `navigator` 直接赋值 (之前会被 Playwright 内部覆盖回去)
+  - 新增 hardwareConcurrency / deviceMemory / window.outerWidth / window.outerHeight / permissions.query 5 块 headless 指纹修正 (headless 默认值 2 / 0.25 / 0 极易被识别)
+- **`BROWSER_DISABLE_OPTIONS`**: 新增 `--disable-blink-features=AutomationControlled`, 直接关掉 `navigator.webdriver=true` 的 Blink 路径
+- **`src/semantic_browser/browser/controller.py`**:
+  - `_start_context` 从 `pick_profile()` 派生 UA / locale / Accept-Language / sec-ch-ua / sec-ch-ua-mobile / sec-ch-ua-platform
+  - `_ensure_page` 两层 init script: **先**写 `window.__SB_PROFILE__` (JSON 序列化) → **后**注入 `STEALTH_JS` (读 profile 字段覆盖 navigator.*)
+  - `config.user_agent` 显式给定时走降级路径 (不选 profile, 只跑 STEALTH_JS 兜底)
+- **`src/semantic_browser/browser/pool.py:65`**: pool-launched browser 之前**没传** `BROWSER_DISABLE_OPTIONS` (隐藏 bug), 现在跟 controller 对齐
+- **新增 `tests/test_stealth.py`**: 110 个测试, 22 个不变量类 — UA Chromium-only / platform-UA 一致 / Accept-Language ↔ locale ↔ languages 一致 / sec-ch-ua 与 UA 品牌一致 / STEALTH_JS 无 stale 覆盖 (注释剥离) / 用真 PluginArray 接口 / 走 Navigator.prototype / 1b/1c/1d 5 块 headless 修正全覆盖
+
+**实测**: `PYTHONPATH=src python3 -m pytest tests/test_stealth.py -v` → 110 passed in 0.12s.
+
 ## T120 — Anti-Bot Mitigation & Modern SPA Content Extractor (Open Source Release)
 
 **核心特性升级**:

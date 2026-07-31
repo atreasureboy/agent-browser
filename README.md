@@ -22,14 +22,15 @@ SemanticQuery — 性价比轻量 LLM 编排 (DeepSeek / Qwen / Ollama 等)
 ### 1. 安装 (Installation)
 
 ```bash
-# 1.1 克隆仓库与进入目录
+# 方式 A: 直接从 PyPI 安装发布包 (推荐)
+pip install agent-site-intelligence
+
+# 方式 B: 从源码本地克隆开发安装
 git clone https://github.com/atreasureboy/agent-browser.git
 cd agent-browser
-
-# 1.2 安装 Python 包与依赖
 pip install -e .
 
-# 1.3 安装 Playwright 浏览器内核与系统依赖
+# 安装 Playwright 浏览器内核与系统依赖
 playwright install chromium
 playwright install-deps  # Linux 系统推荐
 ```

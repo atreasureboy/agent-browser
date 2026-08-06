@@ -108,11 +108,11 @@ def _build_vision_provider(
     name = (override_provider or detect_provider()).lower()
     if name not in ("anthropic", "gemini"):
         # 强制找 vision-capable 的
-        # - 看 env 哪个 key 存在: ANTHROPIC_API_KEY / GEMINI_API_KEY
-        import os
-        if os.getenv("ANTHROPIC_API_KEY"):
+        # - 看 env 哪个 key 存在: ANTHROPIC_* / GEMINI_* (app_config 集中)
+        from semantic_browser import app_config
+        if app_config.anthropic_api_key():
             name = "anthropic"
-        elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        elif app_config.gemini_api_key():
             name = "gemini"
         else:
             raise LLMUnavailableError(

@@ -33,7 +33,6 @@ Provider:
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Literal, Optional
 
 from semantic_browser.llm.types import LLMResponse, LLMUnavailableError
@@ -82,22 +81,23 @@ class LLMService:
         # 三档 model id — 不显式给就按 provider 默认
         # Claude Code env 里 ANTHROPIC_MODEL 是单一全局值; 用它做兜底让 cheap/medium/smart
         # 三个 tier 都能复用同一模型 (代理通常只服务一个 model id, 比如 MiniMax-M3).
-        anthropic_default = os.getenv("ANTHROPIC_MODEL") if provider_name == "anthropic" else None
+        from semantic_browser import app_config
+        anthropic_default = app_config.anthropic_model() if provider_name == "anthropic" else None
         self.model_cheap = (
             model_cheap
-            or os.getenv("LLM_MODEL_CHEAP")
+            or app_config.llm_model_tier("cheap")
             or anthropic_default
             or default_model_for(provider_name, "cheap")
         )
         self.model_medium = (
             model_medium
-            or os.getenv("LLM_MODEL_MEDIUM")
+            or app_config.llm_model_tier("medium")
             or anthropic_default
             or default_model_for(provider_name, "medium")
         )
         self.model_smart = (
             model_smart
-            or os.getenv("LLM_MODEL_SMART")
+            or app_config.llm_model_tier("smart")
             or anthropic_default
             or default_model_for(provider_name, "smart")
         )

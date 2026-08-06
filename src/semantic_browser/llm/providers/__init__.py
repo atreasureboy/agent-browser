@@ -64,46 +64,32 @@ def build_provider(
     name = name or detect_provider()
     name = name.lower()
 
+    from semantic_browser import app_config
+
     if name == "openai":
         return OpenAICompatProvider(
-            api_key=(api_key if api_key is not None
-                     else (os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", ""))),
-            base_url=(base_url if base_url is not None
-                      else (os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL",
-                          "https://api.deepseek.com/v1"))),
+            api_key=api_key if api_key is not None else app_config.llm_api_key("openai"),
+            base_url=base_url if base_url is not None else app_config.llm_base_url("openai"),
             timeout=timeout,
         )
     if name == "anthropic":
         # Claude Code 用 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL (不是 ANTHROPIC_API_KEY);
         # 兼容 Claude Code 客户端配置. 也读 LLM_* 作通用兜底.
         return AnthropicProvider(
-            api_key=(api_key if api_key is not None
-                     else (os.getenv("LLM_API_KEY")
-                           or os.getenv("ANTHROPIC_API_KEY")
-                           or os.getenv("ANTHROPIC_AUTH_TOKEN", ""))),
-            base_url=(base_url if base_url is not None
-                      else (os.getenv("LLM_BASE_URL")
-                            or os.getenv("ANTHROPIC_BASE_URL")
-                            or "https://api.anthropic.com")),
+            api_key=api_key if api_key is not None else app_config.llm_api_key("anthropic"),
+            base_url=base_url if base_url is not None else app_config.llm_base_url("anthropic"),
             timeout=timeout,
         )
     if name == "gemini":
         return GeminiProvider(
-            api_key=(api_key if api_key is not None
-                     else (os.getenv("LLM_API_KEY")
-                           or os.getenv("GEMINI_API_KEY")
-                           or os.getenv("GOOGLE_API_KEY", ""))),
-            base_url=(base_url if base_url is not None
-                      else (os.getenv("LLM_BASE_URL")
-                            or "https://generativelanguage.googleapis.com")),
+            api_key=api_key if api_key is not None else app_config.llm_api_key("gemini"),
+            base_url=base_url if base_url is not None else app_config.llm_base_url("gemini"),
             timeout=timeout,
         )
     if name == "ollama":
         return OllamaProvider(
-            api_key=(api_key if api_key is not None
-                     else os.getenv("LLM_API_KEY", "")),
-            base_url=(base_url if base_url is not None
-                      else os.getenv("LLM_BASE_URL", "")),
+            api_key=api_key if api_key is not None else app_config.llm_api_key("ollama"),
+            base_url=base_url if base_url is not None else app_config.llm_base_url("ollama"),
             timeout=timeout,
         )
     raise ValueError(f"Unknown LLM provider: {name}")

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Optional
 
@@ -72,19 +71,16 @@ class LLMEnhancedClassifier:
         self.threshold = threshold
         self.enable_llm = enable_llm
         self.timeout = timeout
-        # model 优先用显式传入，其次读环境变量，都没有则标记不可用
-        self.model = model or os.getenv("OPENAI_MODEL")
+        # model 优先用显式传入，其次读环境变量 (app_config 集中), 都没有则标记不可用
+        from semantic_browser import app_config
+        self.model = model or app_config.openai_model()
         # 兜底用官方 endpoint；私有 endpoint 通过 OPENAI_BASE_URL 注入
         # (兼容旧名 OPENAI_API_BASE)
-        self._base_url = (
-            os.getenv("OPENAI_BASE_URL")
-            or os.getenv("OPENAI_API_BASE")
-            or "https://api.openai.com/v1"
-        )
-        self._api_key = os.getenv("OPENAI_API_KEY", "")
+        self._base_url = app_config.openai_base_url() or "https://api.openai.com/v1"
+        self._api_key = app_config.openai_api_key()
         # 也认 Claude Code 风格的 ANTHROPIC_* (让 anthropic provider 也走 LLMService)
-        self._anthropic_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN", "")
-        self._anthropic_base = os.getenv("ANTHROPIC_BASE_URL", "")
+        self._anthropic_key = app_config.anthropic_api_key()
+        self._anthropic_base = app_config.anthropic_base_url()
         self._llm_available = (
             (bool(self._api_key) and bool(self._base_url) and bool(self.model))
             or (bool(self._anthropic_key) and bool(self._anthropic_base))
@@ -166,7 +162,8 @@ class LLMEnhancedClassifier:
             svc = LLMService(timeout=self.timeout)
             if svc.is_available():
                 # 显式 model 优先, 否则用 service 解析出来的 cheap tier
-                if self.model and not os.getenv("LLM_MODEL_CHEAP"):
+                from semantic_browser import app_config
+                if self.model and not app_config.llm_model_tier("cheap"):
                     svc.model_cheap = self.model
                 result = await svc.complete_json(
                     messages, tier="cheap",

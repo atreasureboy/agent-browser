@@ -48,7 +48,8 @@ def _resolve_llm_flag(explicit: bool | None) -> bool:
     """
     if explicit is not None:
         return explicit
-    return bool(os.getenv("OPENAI_API_KEY"))
+    from semantic_browser import app_config
+    return bool(app_config.openai_api_key())
 
 
 def _install_silent_unraisable_hook():
@@ -103,14 +104,9 @@ def _run_async(coro):
 
 
 def _env_bool(name: str, *, default: bool = False) -> bool:
-    """T117 audit fix: parse env var as canonical bool — 'true'/'1'/'yes'/'on' True,
-    'false'/'0'/'no'/'off'/'' False. 之前 `bool(os.getenv(name))` 把
-    'false' 当 True, 严重 drift.
-    """
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+    """T117 audit fix: canonical bool env 解析 — 实现集中在 app_config.env_bool."""
+    from semantic_browser import app_config
+    return app_config.env_bool(name, default=default)
 
 
 def _humanize_error(e: Exception) -> str:

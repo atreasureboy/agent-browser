@@ -32,7 +32,7 @@ import os
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from semantic_browser.daemon.ulid import ulid_new, ulid_validate

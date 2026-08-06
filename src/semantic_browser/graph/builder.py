@@ -8,10 +8,9 @@ Website Graph — 站点拓扑图引擎。
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Optional
-from urllib.parse import urlparse, urljoin
+from typing import Any
+from urllib.parse import urlparse
 
 from semantic_browser.memory.store import MemoryStore
 

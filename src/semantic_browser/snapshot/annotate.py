@@ -14,7 +14,7 @@ LLM 视觉模型能直接看页面; 但仍要知道每个 ref 对应哪个元素
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
@@ -206,7 +206,6 @@ def _infer_kind(tag: str, input_type: str, role: str) -> str:
 
 async def annotate_current_page(page, *, viewport_only: bool = True) -> tuple[bytes, dict[str, Any]]:
     """便捷: 截当前页 + 标注。一次调用拿两样。"""
-    import asyncio
     png = await page.screenshot(full_page=not viewport_only)
     refs = await collect_refs_from_page(page)
     return annotate_screenshot(png, refs)

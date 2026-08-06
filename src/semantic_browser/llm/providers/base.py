@@ -13,7 +13,7 @@ max_tokens / json_mode, 返回 LLMResponse. service.py 负责调度.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional, Protocol, runtime_checkable
+from typing import Iterable, Protocol, runtime_checkable
 
 from semantic_browser.llm.service import LLMResponse
 

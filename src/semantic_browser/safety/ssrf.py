@@ -124,7 +124,7 @@ def check_url(
     if scheme == "data":
         if allow_data:
             return url
-        raise SSRFBlockedError(f"scheme 'data' blocked (default-deny; only http/https allowed)")
+        raise SSRFBlockedError("scheme 'data' blocked (default-deny; only http/https allowed)")
     if scheme not in ("http", "https"):
         raise SSRFBlockedError(f"scheme {scheme!r} blocked (default-deny; only http/https allowed)")
 

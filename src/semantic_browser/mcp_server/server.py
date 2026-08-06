@@ -27,7 +27,7 @@ except ImportError:
 from typing import Any, Optional
 
 from semantic_browser.engine import SemanticBrowser
-from semantic_browser.result import classify_exception, err
+from semantic_browser.result import classify_exception
 from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)

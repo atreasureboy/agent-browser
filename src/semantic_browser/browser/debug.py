@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 from semantic_browser.snapshot.engine import SnapshotEngine
 
@@ -188,7 +188,7 @@ class _DebugMixin:
 
         Returns [{"name", "value", "domain", "path", "expires", "httpOnly", "secure"}, ...]
         """
-        page = await self._ensure_page()
+        await self._ensure_page()
         # Playwright cookies API: 用 context 而不是 page
         cookies = await self._context.cookies(url) if url else await self._context.cookies()
         return [
@@ -361,7 +361,7 @@ class _DebugMixin:
             if req.get("url") == url and req.get("response_headers"):
                 return req["response_headers"]
         # 兜底: path 匹配 (允许只给 path, 拼上当前 origin)
-        from urllib.parse import urlparse, urljoin
+        from urllib.parse import urljoin
         page = self.current_page
         if page is not None:
             full = urljoin(page.url, url)

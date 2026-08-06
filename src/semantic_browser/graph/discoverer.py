@@ -19,7 +19,7 @@ from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
 from semantic_browser.browser.controller import BrowserController
-from semantic_browser.graph.builder import GraphNode, SiteGraph
+from semantic_browser.graph.builder import SiteGraph
 from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)

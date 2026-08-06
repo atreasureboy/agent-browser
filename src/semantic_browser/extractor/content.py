@@ -7,12 +7,9 @@ Content Extractor — 正文/接口提取层。
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass, field, asdict
-from typing import Any, Optional
-from urllib.parse import urljoin
+from typing import Any
 
 from playwright.async_api import Page
 

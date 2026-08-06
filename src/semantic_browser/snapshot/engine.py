@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field, asdict
-from typing import Any, Optional, Iterator
-from urllib.parse import urljoin, urlparse
+from typing import Any
+from urllib.parse import urlparse
 
 from playwright.async_api import Page
 

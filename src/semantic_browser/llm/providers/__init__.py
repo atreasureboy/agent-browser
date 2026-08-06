@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
-from semantic_browser.llm.types import LLMResponse, LLMUnavailableError
 from semantic_browser.llm.providers.base import (
-    LLMProvider, normalize_messages, messages_to_anthropic,
+    LLMProvider, normalize_messages,
     guess_provider_from_model, default_model_for,
 )
 from semantic_browser.llm.providers.openai_compat import OpenAICompatProvider, OllamaProvider

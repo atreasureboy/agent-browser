@@ -8,16 +8,14 @@ Semantic Browser Engine — 核心编排引擎。
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 from semantic_browser.browser.controller import BrowserController, BrowserConfig
 from semantic_browser.snapshot.engine import SnapshotEngine, PageSnapshot
-from semantic_browser.classifier.heuristic import PageClassifier, ClassificationResult
+from semantic_browser.classifier.heuristic import ClassificationResult
 from semantic_browser.classifier.llm_enhanced import LLMEnhancedClassifier
 from semantic_browser.extractor.content import ContentExtractor, ArticleContent, InterfaceSummary
 from semantic_browser.memory.store import MemoryStore

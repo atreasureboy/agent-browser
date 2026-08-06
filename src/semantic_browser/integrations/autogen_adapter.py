@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Optional
 
 _AUTOGEN_IMPORT_ERROR: str | None = None
 try:

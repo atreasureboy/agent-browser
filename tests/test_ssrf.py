@@ -173,3 +173,37 @@ class TestSSRFConfigChoices:
             check_url("FILE:///etc/passwd")
         with pytest.raises(SSRFBlockedError, match="blocked"):
             check_url("JavaScript:alert(1)")
+
+
+class TestSafePathResolve:
+    """T111 + audit fix: _safe_resolve_path 集中闸 (NameError 回归防护)."""
+
+    def _daemon(self):
+        from semantic_browser.daemon.server import TransparentBrowserDaemon
+        return TransparentBrowserDaemon.__new__(TransparentBrowserDaemon)
+
+    def test_blocks_traversal_outside_bases(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="outside allowed dirs"):
+            self._daemon()._safe_resolve_path("/etc/passwd", where="t")
+
+    def test_blocks_dotdot_escape(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="outside allowed dirs"):
+            self._daemon()._safe_resolve_path("../../../../etc/shadow", where="t")
+
+    def test_allows_cwd_subpath(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        out = self._daemon()._safe_resolve_path("./shots/a.png", where="t")
+        assert out.startswith(str(tmp_path))
+
+    def test_allows_sb_home_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        out = self._daemon()._safe_resolve_path("~/.semantic-browser/s.png", where="t")
+        assert ".semantic-browser" in out
+
+    def test_empty_path_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="path required"):
+            self._daemon()._safe_resolve_path("", where="t")

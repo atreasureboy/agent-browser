@@ -20,20 +20,17 @@ T21: LLM-driven autonomous loop — agent 在浏览器里"达成目标".
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from semantic_browser.browser.controller import BrowserController
-from semantic_browser.llm.service import LLMService, LLMUnavailableError, Tier
+from semantic_browser.llm.service import LLMService, Tier
 from semantic_browser.llm.helpers import slice_refs_for_goal, build_smart_snapshot_excerpt
 from semantic_browser.llm.diagnostics import collect_diagnostics, format_diagnostics_for_llm
 from semantic_browser.memory.goal_memory import GoalMemory
 from semantic_browser.safety.guard import check_action
-from semantic_browser.snapshot.engine import PageSnapshot, SnapshotEngine
+from semantic_browser.snapshot.engine import SnapshotEngine
 
 logger = logging.getLogger(__name__)
 

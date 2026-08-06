@@ -3,19 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import json
 import logging
-import re
 import socket
 import ssl
-import time
 from collections import Counter
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 from semantic_browser.browser._utils import (
     _version_lt,
@@ -358,7 +350,6 @@ class _SecurityToolsMixin:
         """
         import re
         from urllib.parse import urljoin
-        import httpx
 
         def _vuln_to_cve_entry(threshold: str, cve_id: str, desc: str) -> dict[str, str]:
             return {"max_vuln_version": threshold, "id": cve_id, "desc": desc}
@@ -563,7 +554,6 @@ class _SecurityToolsMixin:
 
         # T42e: 第一次先拿一个肯定不存在的 path, 用它的 body length 作 soft-404 baseline.
         baseline_size: int | None = None
-        baseline_has_404: bool = False
         try:
             async with httpx.AsyncClient(
                 timeout=timeout_ms / 1000,
@@ -572,11 +562,6 @@ class _SecurityToolsMixin:
             ) as client:
                 r = await client.get(origin + "/zzz-sb-probe-nonexistent-zzz")
                 baseline_size = len(r.content)
-                baseline_has_404 = (r.status_code == 200 and (
-                    "404" in r.text[:5000].lower() or
-                    "not found" in r.text[:5000].lower() or
-                    "page not found" in r.text[:5000].lower()
-                ))
         except Exception:
             pass
 
@@ -666,7 +651,6 @@ class _SecurityToolsMixin:
         }
         """
         import json as _json
-        import re as _re
         from urllib.request import urlopen, Request
         from urllib.error import URLError
 
@@ -1225,7 +1209,6 @@ class _SecurityToolsMixin:
           "spec_count": int,
         }
         """
-        import json as _json
         from urllib.parse import urlparse
         import httpx
 
@@ -1400,7 +1383,6 @@ class _SecurityToolsMixin:
           "signals": [{kind, name, value, hint}],
         }
         """
-        import re as _re
         page = await self._ensure_page()
         # 1) headers from current page response
         try:
@@ -1590,7 +1572,6 @@ class _SecurityToolsMixin:
           "errors":  {rtype: err, ...}  (部分失败不阻塞)
         }
         """
-        import re as _re
         import httpx
 
         async def _query(rtype: str, qname: str) -> list[dict[str, Any]]:
@@ -2034,11 +2015,6 @@ class _SecurityToolsMixin:
             r"/(\d{1,12})(?:\b|/)",
             _re.IGNORECASE,
         )
-        # 也加上常见的 API 路径
-        API_RE = _re.compile(
-            r"/api/v\d+/(users|orders|invoices|accounts)/(\d{1,12})(?:\b|/)",
-            _re.IGNORECASE,
-        )
         idor: list[dict[str, Any]] = []
         seen = set()
         for link in snap.links:
@@ -2325,7 +2301,6 @@ class _SecurityToolsMixin:
         }
         """
         import re as _re
-        import socket
         import httpx
         if not host:
             try:

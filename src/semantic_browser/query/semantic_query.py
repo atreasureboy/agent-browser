@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 
 import httpx  # T73: at module level so tests can monkeypatch

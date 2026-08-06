@@ -638,9 +638,9 @@ class TransparentBrowserDaemon(_LeaseMixin):
                     )
                 except Exception:
                     logger.exception("failed to publish lock_stuck")
-        # 检测 2: 实际活跃 browser instance
+        # 检测 2: 实际活跃 browser instance (调用本身探测存活, 结果不用)
         try:
-            sessions = self.owner.list_sessions()
+            self.owner.list_sessions()
             self._healthy_browsers = 1  # 单 pool 单 chromium — 始终视为健康
         except Exception:
             self._healthy_browsers = 0
@@ -1077,11 +1077,6 @@ class TransparentBrowserDaemon(_LeaseMixin):
         # lease acquire+renew+release+get. 其余路由回退到不带 v1 的原始 handler.
         if path.startswith("/v1/"):
             v1_path = path[3:]  # strip "/v1" → 跟原 path 等价
-            v1_routes = {
-                "/healthz", "/readyz", "/capacity", "/events",
-                "/sessions",  # POST 创建 + GET 列表
-                "/query", "/query/stream", "/query/stats", "/query/cache/clear", "/query/log",  # T67+T68+T69+T76
-            }
             # /v1/sessions/{id}/... (GET 详情 + DELETE + lease CRUD)
             if v1_path == "/healthz":
                 path = "/healthz"
@@ -1450,8 +1445,8 @@ class TransparentBrowserDaemon(_LeaseMixin):
             _os_pathcheck.path.expanduser("~/.semantic-browser")
         )
         cwd = _os_pathcheck.path.realpath(".")
-        in_sb = resolved == sb_root or resolved.startswith(sb_root + _os_path.sep)
-        in_cwd = resolved == cwd or resolved.startswith(cwd + _os_path.sep)
+        in_sb = resolved == sb_root or resolved.startswith(sb_root + _os_pathcheck.sep)
+        in_cwd = resolved == cwd or resolved.startswith(cwd + _os_pathcheck.sep)
         if not (in_sb or in_cwd):
             raise ValueError(
                 f"{where}: path outside allowed dirs "
@@ -1645,7 +1640,6 @@ class TransparentBrowserDaemon(_LeaseMixin):
         store = self.memory_store
         if domain:
             return store.get_pages_by_domain(domain, limit=limit)
-        import sqlite3
         with store._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM pages ORDER BY visited_at DESC LIMIT ?", (limit,)
@@ -1977,7 +1971,6 @@ class TransparentBrowserDaemon(_LeaseMixin):
             tenant_id = meta.get("tenant_id", _AsyncOwner.DEFAULT_TENANT)
             agent_id = meta.get("agent_id", _AsyncOwner.DEFAULT_AGENT)
         try:
-            import hashlib as _hl
             sz = 0
             try:
                 sz = os.path.getsize(saved) if saved and os.path.exists(saved) else 0

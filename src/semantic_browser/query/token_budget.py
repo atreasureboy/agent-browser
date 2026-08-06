@@ -9,7 +9,7 @@ Token Budget — 跟踪 + 强制上限 token 消耗.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 

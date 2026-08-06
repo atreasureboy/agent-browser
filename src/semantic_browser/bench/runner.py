@@ -21,13 +21,12 @@ JSON schema:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from semantic_browser.agent.loop import GoalAgent, GoalResult
 from semantic_browser.browser.controller import BrowserController, BrowserConfig

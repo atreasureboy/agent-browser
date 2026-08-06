@@ -11,7 +11,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from semantic_browser.llm.service import LLMService, Tier
 

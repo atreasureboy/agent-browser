@@ -22,10 +22,8 @@ from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.json import JSON as RichJSON
 from rich.panel import Panel
 from rich.table import Table
-from rich.tree import Tree
 
 console = Console()
 
@@ -405,7 +403,7 @@ def crawl(url, max_pages, max_depth, no_same_domain, json_out, llm):
         if json_out:
             _emit_json(result.to_dict())
         else:
-            console.print(f"\n[green]✓ Crawl complete[/green]")
+            console.print("\n[green]✓ Crawl complete[/green]")
             console.print(f"   Visited: {len(result.visited_urls)} pages")
             console.print(f"   Failed:  {len(result.failed_urls)} pages")
             if result.stats:
@@ -635,7 +633,6 @@ def extract_topic(url, keyword, max_chars, as_md, json_out, llm):
             data = await sb.extract_topic(url, keyword, max_chars=max_chars)
             if as_md and data.get("found"):
                 # 重新渲染为 markdown 方便直接阅读
-                from semantic_browser.extractor.content import ArticleContent
                 result = await sb.browse(url)
                 if result.article:
                     _emit(result.article.to_topic_markdown(keyword, max_chars=max_chars))
@@ -661,7 +658,7 @@ def _emit(text: str) -> None:
 def interactive(url, no_headless):
     """打开页面并进入交互式 REPL。可选起始 URL。"""
     from semantic_browser.browser.controller import BrowserController, BrowserConfig
-    from semantic_browser.cli.repl import REPLSession, parse_command
+    from semantic_browser.cli.repl import REPLSession
 
     async def _run():
         config = BrowserConfig(headless=not no_headless)
@@ -686,7 +683,6 @@ def interactive(url, no_headless):
 
 def _print_browse_result(result):
     """Rich 格式打印浏览结果。"""
-    from semantic_browser.classifier.heuristic import ClassificationResult
 
     snap = result.snapshot
     cls = result.classification

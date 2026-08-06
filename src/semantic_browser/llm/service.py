@@ -39,7 +39,6 @@ from semantic_browser.llm.types import LLMResponse, LLMUnavailableError
 from semantic_browser.llm.providers import (
     build_provider,
     detect_provider,
-    guess_provider_from_model,
     default_model_for,
 )
 

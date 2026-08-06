@@ -153,7 +153,8 @@ def handle_admin_drain(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 def handle_admin_drain_cancel(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     """POST /admin/drain/cancel — cancel drain."""
-    import logging, time
+    import logging
+    import time
     was_draining = daemon._draining
     daemon._draining = False
     daemon._drain_started_at = None
@@ -174,7 +175,6 @@ def handle_admin_drain_cancel(daemon: Any, args: dict[str, Any], req: Any) -> An
 
 def handle_sessions_list(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     """GET /sessions — list sessions (+ tenant filter + detail mode)."""
-    import time, logging
     tenant_filter = args.get("tenant_id")
     if tenant_filter:
         sessions = daemon.owner.list_sessions_for_tenant(tenant_filter)
@@ -223,7 +223,8 @@ def handle_sessions_list(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 def handle_sessions_create(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     """POST /sessions — create a new session."""
-    import time, logging
+    import time
+    import logging
     from semantic_browser.daemon.routers import DEFAULT_TENANT, DEFAULT_AGENT, SessionError
     name = args.get("name") or f"agent-{len(daemon.owner.list_sessions()) + 1}"
     requested_tenant = args.get("tenant_id") or DEFAULT_TENANT

@@ -66,7 +66,8 @@ def handle_storage_state(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 def handle_session_delete(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     """DELETE /sessions/{name} — release a session."""
-    import time, logging
+    import time
+    import logging
     from semantic_browser.daemon.routers import DEFAULT_TENANT, DEFAULT_AGENT, DEFAULT_SESSION, SessionError
     path = args.get("_dispatch_path", "")
     name = path[len("/sessions/"):]

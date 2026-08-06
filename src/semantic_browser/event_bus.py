@@ -25,7 +25,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, AsyncIterator
+from typing import Any
 
 from semantic_browser.daemon.ulid import ulid_new
 

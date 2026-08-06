@@ -15,7 +15,7 @@ T25: 失败自动 dump — agent 失败时自动收集诊断信息.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from semantic_browser.browser.controller import BrowserController
 from semantic_browser.snapshot.engine import SnapshotEngine

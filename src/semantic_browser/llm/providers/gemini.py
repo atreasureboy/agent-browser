@@ -22,7 +22,7 @@ import httpx
 
 from semantic_browser.llm.types import LLMResponse
 from semantic_browser.llm.providers.base import (
-    LLMProvider, normalize_messages, messages_to_anthropic,
+    normalize_messages, messages_to_anthropic,
 )
 
 logger = logging.getLogger(__name__)

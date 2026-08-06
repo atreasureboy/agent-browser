@@ -13,12 +13,32 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-timeout>=2.2", "PyYAML>=6.0", "pytest-xdist>=3.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-timeout>=2.2",
+    "PyYAML>=6.0",
+    "pytest-xdist>=3.0",
+    "ruff>=0.4",
+]
 
 [project.scripts]
 sb = "semantic_browser.cli:main"
 tb = "semantic_browser.client.cli:main"
 tb-daemon = "semantic_browser.daemon.server:main"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # long lines are common in CJK docstrings; style-only, not enforced
+    "E741",   # single-letter 'l'-style names tolerated in math-heavy spots
+    "E402",   # deliberate mid-file imports: circular-import break + optional deps
+    "E702",   # a few compact one-liners (l = max(0, l); t = max(0, t))
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

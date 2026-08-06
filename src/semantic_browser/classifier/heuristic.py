@@ -68,7 +68,6 @@ class PageClassifier:
         """收集所有信号。返回 signal_name -> bool。"""
         url_lower = s.url.lower()
         title_lower = s.title.lower()
-        meta_desc = s.meta.get("description", "").lower()
         meta_og_type = s.meta.get("og:type", "").lower()
 
         # URL 信号
@@ -85,10 +84,8 @@ class PageClassifier:
         has_dashboard_url = bool(re.search(r"/(dashboard|admin|panel|console|settings)", url_lower))
         has_video_url = "watch" in url_lower or "/video/" in url_lower or "youtube" in s.domain
 
-        # 内容信号
-        text_combined = " ".join(b.text.lower() for b in s.text_blocks[:50])
-
-        # 仅取前 5 个文本块做 "主要信号" 判断, 避免埋在代码示例 / 长正文里的词污染分类
+        # 内容信号 — 仅取前 5 个文本块做 "主要信号" 判断,
+        # 避免埋在代码示例 / 长正文里的词污染分类
         headline_text = " ".join(b.text.lower() for b in s.text_blocks[:5])
         has_article_content = any(
             b.tag in ("h1", "h2") for b in s.text_blocks

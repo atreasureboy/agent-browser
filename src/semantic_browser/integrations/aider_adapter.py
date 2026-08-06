@@ -16,7 +16,6 @@ Aider 通过其 function calling API 注册工具; 我们提供一个简单的 t
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any, Optional
 
 

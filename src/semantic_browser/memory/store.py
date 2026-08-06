@@ -14,7 +14,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 

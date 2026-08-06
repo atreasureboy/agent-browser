@@ -59,13 +59,21 @@ def _path_to_pattern(path: str) -> str:
     return "^" + result + "$"
 
 
-def build_route_table() -> dict[tuple[str, str], HandlerFn]:
-    """Lazy-build the dispatch table from registered routes.
+_ROUTE_TABLE_CACHE: dict[tuple[str, str], HandlerFn] | None = None
 
-    Paths with bracket placeholders (``{name}``, ``{lease_id}``) are added
-    to the dynamic-pattern list instead of the exact-match table.
+
+def build_route_table() -> dict[tuple[str, str], HandlerFn]:
+    """Lazy-build (and cache) the dispatch table from registered routes.
+
+    Only rebuilds on the first call; subsequent calls return the cached
+    table.  Paths with bracket placeholders (``{name}``, ``{lease_id}``)
+    are added to the dynamic-pattern list instead of the exact-match table.
     """
-    # Import submodules to trigger their _register calls
+    global _ROUTE_TABLE_CACHE
+    if _ROUTE_TABLE_CACHE is not None:
+        return _ROUTE_TABLE_CACHE
+
+    # Import submodules to trigger their _register calls (cached by Python)
     from semantic_browser.daemon.routers import _admin      # noqa: F401
     from semantic_browser.daemon.routers import _events     # noqa: F401
     from semantic_browser.daemon.routers import _sessions   # noqa: F401
@@ -84,6 +92,7 @@ def build_route_table() -> dict[tuple[str, str], HandlerFn]:
             )
         else:
             table[(method, path)] = handler
+    _ROUTE_TABLE_CACHE = table
     return table
 
 

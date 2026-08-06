@@ -39,7 +39,7 @@ def handle_snapshot_vision(daemon: Any, args: dict[str, Any], req: Any) -> Any:
         goal=args.get("goal", ""),
         provider=args.get("provider"),
         model=args.get("model"),
-        full_page=bool(args.get("full_page", True)),
+        full_page=str(args.get("full_page", "true")).lower() in ("1", "true"),
         session=args.get("session"),
     ))
 
@@ -195,9 +195,11 @@ def handle_screenshot(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     T111 audit fix: path is resolved through _safe_resolve_path to prevent
     arbitrary file writes.
     """
-    spath = args.get("path")
+    spath: str | None = args.get("path")
     if spath:
         spath = daemon._safe_resolve_path(spath, where="screenshot")
+    else:
+        spath = None
     return daemon.owner.run(daemon._screenshot(spath))
 
 
@@ -206,9 +208,11 @@ def handle_screenshot_annotated(daemon: Any, args: dict[str, Any], req: Any) -> 
 
     T111 audit fix: path is resolved through _safe_resolve_path.
     """
-    spath = args.get("path")
+    spath: str | None = args.get("path")
     if spath:
         spath = daemon._safe_resolve_path(spath, where="screenshot_annotated")
+    else:
+        spath = None
     return daemon.owner.run(daemon._screenshot_annotated(spath))
 
 
@@ -413,14 +417,11 @@ def handle_cookies_clear(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 
 def handle_storage(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """GET /storage — read browser storage (localStorage or sessionStorage).
+    """[DEAD CODE — kept for reference]
 
-    Note: in the original dispatch there are two GET /storage handlers (T40a probe
-    calling get_storage() at line 1791, and T17 read_storage at line 1989).
-    The second (T17, line 1989) was dead code in the sequential if-chain because
-    the first match always returned. In the route-table dispatch, the last
-    registered handler wins. This handler implements the T17 read_storage variant
-    with kind filtering.
+    T17 read_storage with kind filtering. GET /storage is claimed by
+    _security.py's handle_get_storage (T40a probe) which matches first in
+    the original sequential dispatch and wins in the route table too.
     """
     kind = args.get("kind", "local")
     return daemon.owner.run(daemon.owner.browser.controller.read_storage(kind=kind))
@@ -515,9 +516,11 @@ def handle_state_save(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     T111 audit fix: path is resolved through _safe_resolve_path to prevent
     writing auth tokens to attacker-controlled paths.
     """
-    spath = args.get("path")
+    spath: str | None = args.get("path")
     if spath:
         spath = daemon._safe_resolve_path(spath, where="state_save")
+    else:
+        spath = None
     return daemon.owner.run(daemon._save_state(spath))
 
 
@@ -591,7 +594,7 @@ _register("GET", "/cookies", handle_cookies)
 _register("POST", "/cookies/set", handle_cookies_set)
 _register("POST", "/cookies/delete", handle_cookies_delete)
 _register("POST", "/cookies/clear", handle_cookies_clear)
-_register("GET", "/storage", handle_storage)
+# GET /storage is registered by _security.py (T40a probe) — see handle_storage docstring
 _register("POST", "/storage/set", handle_storage_set)
 _register("POST", "/storage/clear", handle_storage_clear)
 

@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import queue
-import re
 import sys
 import threading
 import time
@@ -24,7 +23,6 @@ from typing import Any
 from semantic_browser.result import classify_exception, err, ok
 from urllib.parse import parse_qs, urlparse
 
-from semantic_browser.engine import SemanticBrowser
 from semantic_browser.snapshot.engine import SnapshotEngine
 from semantic_browser.browser.controller import BrowserConfig, BrowserController
 from semantic_browser.browser.pool import ControllerPool
@@ -379,6 +377,10 @@ _STATUS_BY_CODE: dict[str, int] = {
 }
 
 
+# Mid-file imports to avoid circular dependency: routers/__init__.py imports
+# submodules that reference SessionError, and _lease.py references routers
+# constants.  These must be placed after the _STATUS_BY_CODE dict and before
+# any class that uses them.
 from semantic_browser.daemon.routers import SessionError as _SessionError  # noqa: F401
 
 
@@ -1317,8 +1319,6 @@ class TransparentBrowserDaemon(_LeaseMixin):
             return result
 
         raise ValueError(f"unknown endpoint: {method} {path}")
-
-    # ── T65.7: Lease/Fence HTTP handlers ──────────────────────────
 
     # ── T66.5: Probes ────────────────────────────────────────────
 

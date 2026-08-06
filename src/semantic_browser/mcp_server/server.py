@@ -63,8 +63,8 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "sb_browse", "description": "打开 URL 并返回完整语义浏览结果。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
     {"name": "sb_snapshot", "description": "打开 URL 并返回语义快照。", "inputSchema": _schema({"url": {"type": "string"}}, ["url"])},
-    {"name": "sb_click", "description": "通过 eN ref 点击元素。", "inputSchema": _schema({"ref": {"type": "string"}}, ["ref"])},
-    {"name": "sb_type", "description": "通过 eN ref 输入文本。", "inputSchema": _schema({"ref": {"type": "string"}, "text": {"type": "string"}}, ["ref", "text"])},
+    {"name": "sb_click", "description": "通过 eN ref 点击元素。危险目标 (delete/remove/submit) 会返 CONFIRM_REQUIRED, 需 confirm_destructive=true 重试。", "inputSchema": _schema({"ref": {"type": "string"}, "confirm_destructive": {"type": "boolean"}}, ["ref"])},
+    {"name": "sb_type", "description": "通过 eN ref 输入文本。含破坏性关键词 (delete/drop/rm -rf) 会返 CONFIRM_REQUIRED, 需 confirm_destructive=true 重试。", "inputSchema": _schema({"ref": {"type": "string"}, "text": {"type": "string"}, "confirm_destructive": {"type": "boolean"}}, ["ref", "text"])},
     {"name": "sb_scroll", "description": "滚动页面。", "inputSchema": _schema({"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}})},
     {"name": "sb_back", "description": "浏览器后退。", "inputSchema": _schema({})},
     {"name": "sb_forward", "description": "浏览器前进。", "inputSchema": _schema({})},
@@ -318,6 +318,30 @@ class MCPServer:
         return self._extract_daemon_result(body)
 
     @staticmethod
+    async def _safety_guard(engine: Any, action: str, args: dict[str, Any]) -> None:
+        """Destructive-action guard for local-engine tools (mirrors daemon guard).
+
+        Raises SafetyGuardError (→ CONFIRM_REQUIRED) unless the caller passed
+        confirm_destructive=true.
+        """
+        if args.get("confirm_destructive"):
+            return
+        from semantic_browser.safety import SafetyGuardError, check_action
+        ref_label = None
+        if args.get("ref"):
+            try:
+                ref_label = await engine.controller.get_ref_label(args["ref"]) or None
+            except Exception:
+                ref_label = None
+        check = check_action(action, args, ref_label=ref_label)
+        if check.needs_confirm:
+            logger.warning(
+                "mcp safety-guard: %s blocked (risk=%s): %s",
+                action, check.risk_level, check.reason,
+            )
+            raise SafetyGuardError(check.reason)
+
+    @staticmethod
     def _extract_daemon_result(body: dict[str, Any]) -> Any:
         """T57: 解 daemon envelope — ok:false 时抛 _DaemonProxyError 保留 code/level."""
         if not body.get("ok"):
@@ -399,10 +423,12 @@ class MCPServer:
             return (await SnapshotEngine(page).capture(base_url=args["url"])).to_dict()
         if name == "sb_click":
             engine = await self._ensure_started()
+            await self._safety_guard(engine, "click", args)
             ok = await engine.controller.click(args["ref"])
             return {"ref": args["ref"], "success": ok, "url": await engine.controller.get_url()}
         if name == "sb_type":
             engine = await self._ensure_started()
+            await self._safety_guard(engine, "type", args)
             ok = await engine.controller.type_text(args["ref"], args["text"])
             return {"ref": args["ref"], "success": ok, "text_length": len(args["text"])}
         if name == "sb_scroll":

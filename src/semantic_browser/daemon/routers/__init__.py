@@ -49,7 +49,7 @@ def _register(method: str, path: str, handler: HandlerFn) -> HandlerFn:
 
 
 def _path_to_pattern(path: str) -> str:
-    """Convert a path with ``{name}`` / ``{id}`` placeholders to a regex pattern.
+    """Convert a path with ``{name}`` / ``{lease_id}`` placeholders to a regex pattern.
 
     ``{name}`` and ``{lease_id}`` → ``([^/]+)`` (single path segment).
     """

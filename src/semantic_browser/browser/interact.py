@@ -16,6 +16,34 @@ logger = logging.getLogger(__name__)
 class _InteractMixin:
     """Click/type/drag/hover/heal-click and frame operations — mixed into BrowserController."""
 
+    async def get_ref_label(self, ref: str) -> str:
+        """Best-effort accessible label of a data-sb-ref element.
+
+        Used by the safety guard to judge whether a click target is
+        destructive (delete/remove/submit...). Returns "" when the ref
+        does not exist or the page is gone — callers must treat "" as
+        "unknown", never as "safe by definition".
+        """
+        try:
+            target = await self._active_page_or_frame()
+            selector = self._ref_to_selector(ref)
+            locator = target.locator(selector).first
+            label = await locator.evaluate(
+                """el => {
+                    return el.getAttribute('aria-label')
+                        || el.getAttribute('title')
+                        || el.getAttribute('alt')
+                        || el.getAttribute('placeholder')
+                        || el.getAttribute('value')
+                        || (el.innerText || '').trim().slice(0, 80)
+                        || '';
+                }""",
+                timeout=3000,
+            )
+            return (label or "").strip()
+        except Exception:
+            return ""
+
     async def click(self, ref: str, human_like: bool = True) -> bool:
         """通过 @ref 点击元素。"""
         import random

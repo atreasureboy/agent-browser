@@ -367,6 +367,8 @@ _STATUS_BY_CODE: dict[str, int] = {
     "DAEMON_DRAINING": 503,
     # T65.2: ?strict=true 模式下 LLM 失败返 503 (retryable) — 默认 silent fallback 维持
     "LLM_UNAVAILABLE": 503,
+    # T32 (super_plan Round 2c): 安全守卫 — 危险动作需显式 confirm 才放行
+    "CONFIRM_REQUIRED": 409,
     # T65.7: Lease/Fence — BUSY 409 (有 holder 在用), FENCE_MISMATCH 409 (旧 token)
     "BUSY": 409,
     "BUSY_LOWER_PRIORITY": 409,

@@ -47,6 +47,19 @@ class SafetyCheck:
     risk_level: str = "safe"  # safe / warning / dangerous
 
 
+class SafetyGuardError(Exception):
+    """危险动作被守卫拦截 — 需要显式 confirm 才能放行.
+
+    classify_exception 把它映射为 error.code=CONFIRM_REQUIRED (409).
+    client/agent 看到此 code 后应向人类求证, 再以 confirm_destructive=true
+    重试 (或放弃).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "CONFIRM_REQUIRED"
+
+
 def check_action(action: str, args: dict[str, Any],
                   ref_label: Optional[str] = None) -> SafetyCheck:
     """检查单个 action 是否需要人类 confirm.

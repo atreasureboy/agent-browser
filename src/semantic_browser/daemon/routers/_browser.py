@@ -8,9 +8,42 @@ and utility endpoints (find, extract-topic, state/save, run-workflow).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from semantic_browser.daemon.routers import _register
+
+logger = logging.getLogger(__name__)
+
+
+# ── T32 safety guard (super_plan Round 2c) ───────────────────────────
+
+async def _guard_check(
+    daemon: Any, action: str, args: dict[str, Any], session: str | None = None,
+) -> None:
+    """Raise SafetyGuardError (→ CONFIRM_REQUIRED, HTTP 409) for destructive actions.
+
+    The caller confirms by passing ``confirm_destructive: true`` — the
+    daemon itself never prompts; the agent/client decides how to surface
+    the confirmation to a human.
+    """
+    if args.get("confirm_destructive"):
+        return
+    from semantic_browser.safety import SafetyGuardError, check_action
+    ref_label: str | None = None
+    if action in ("click", "type") and args.get("ref"):
+        try:
+            ctrl = await daemon.owner.aget_controller(session)
+            ref_label = await ctrl.get_ref_label(args["ref"]) or None
+        except Exception:
+            ref_label = None
+    check = check_action(action, args, ref_label=ref_label)
+    if check.needs_confirm:
+        logger.warning(
+            "safety-guard: %s blocked (risk=%s): %s",
+            action, check.risk_level, check.reason,
+        )
+        raise SafetyGuardError(check.reason)
 
 
 # ── Browser core operations ────────────────────────────────────────
@@ -53,23 +86,35 @@ def handle_read(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 
 def handle_click(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /click — click an element by ref."""
-    return daemon.owner.run(daemon._click(args["ref"], session=args.get("session")))
+    """POST /click — click an element by ref (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "click", args, session=args.get("session"))
+        return await daemon._click(args["ref"], session=args.get("session"))
+    return daemon.owner.run(_run())
 
 
 def handle_click_healed(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /click/healed — click with auto-healing selector fallback."""
-    return daemon.owner.run(daemon._click_healed(args["ref"]))
+    """POST /click/healed — click with auto-healing selector fallback (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "click", args)
+        return await daemon._click_healed(args["ref"])
+    return daemon.owner.run(_run())
 
 
 def handle_type(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /type — type text into an element by ref."""
-    return daemon.owner.run(daemon._type(args["ref"], args["text"], session=args.get("session")))
+    """POST /type — type text into an element by ref (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "type", args, session=args.get("session"))
+        return await daemon._type(args["ref"], args["text"], session=args.get("session"))
+    return daemon.owner.run(_run())
 
 
 def handle_type_healed(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /type/healed — type with auto-healing selector fallback."""
-    return daemon.owner.run(daemon._type_healed(args["ref"], args["text"]))
+    """POST /type/healed — type with auto-healing selector fallback (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "type", args)
+        return await daemon._type_healed(args["ref"], args["text"])
+    return daemon.owner.run(_run())
 
 
 def handle_hover(daemon: Any, args: dict[str, Any], req: Any) -> Any:
@@ -88,15 +133,21 @@ def handle_rightclick(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 
 def handle_drag(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /drag — drag from one element to another."""
-    return daemon.owner.run(daemon._drag(args["from_ref"], args["to_ref"]))
+    """POST /drag — drag from one element to another (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "drag", args)
+        return await daemon._drag(args["from_ref"], args["to_ref"])
+    return daemon.owner.run(_run())
 
 
 def handle_drag_html5(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /drag/html5 — HTML5 drag-and-drop simulation."""
-    return daemon.owner.run(daemon.owner.browser.controller.drag_html5(
-        args["from_ref"], args["to_ref"],
-    ))
+    """POST /drag/html5 — HTML5 drag-and-drop simulation (safety-guarded)."""
+    async def _run():
+        await _guard_check(daemon, "drag", args)
+        return await daemon.owner.browser.controller.drag_html5(
+            args["from_ref"], args["to_ref"],
+        )
+    return daemon.owner.run(_run())
 
 
 def handle_select_option(daemon: Any, args: dict[str, Any], req: Any) -> Any:
@@ -105,8 +156,22 @@ def handle_select_option(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 
 def handle_fill_form(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /fill-form — fill multiple form fields at once."""
-    return daemon.owner.run(daemon._fill_form(args["fields"]))
+    """POST /fill-form — fill multiple form fields at once (safety-guarded).
+
+    Each field value is checked; any destructive text blocks the whole fill.
+    """
+    fields = args["fields"]
+    if not isinstance(fields, dict):
+        raise ValueError("fields must be an object of ref -> text")
+
+    async def _run():
+        for ref, text in fields.items():
+            await _guard_check(
+                daemon, "type", {"ref": ref, "text": text,
+                                 "confirm_destructive": args.get("confirm_destructive")},
+            )
+        return await daemon._fill_form(fields)
+    return daemon.owner.run(_run())
 
 
 def handle_with_retry(daemon: Any, args: dict[str, Any], req: Any) -> Any:
@@ -128,7 +193,12 @@ def handle_with_retry(daemon: Any, args: dict[str, Any], req: Any) -> Any:
     # T99 (audit fix): SSRF guard for any action that may carry a url
     if "url" in action_args:
         daemon._check_url(action_args["url"], where=f"with_retry.{action_name}")
-    return daemon.owner.run(daemon._with_retry(action_name, action_args, max_retries))
+
+    async def _run():
+        if action_name in ("click", "type"):
+            await _guard_check(daemon, action_name, action_args)
+        return await daemon._with_retry(action_name, action_args, max_retries)
+    return daemon.owner.run(_run())
 
 
 def handle_set_files(daemon: Any, args: dict[str, Any], req: Any) -> Any:
@@ -467,12 +537,16 @@ def handle_keyboard_shortcut(daemon: Any, args: dict[str, Any], req: Any) -> Any
 
 
 def handle_keyboard_type(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """POST /keyboard/type — type text into the currently focused element."""
+    """POST /keyboard/type — type text into the currently focused element (safety-guarded)."""
     text = args["text"]
     delay_ms = int(args.get("delay_ms", 0))
-    return daemon.owner.run(daemon.owner.browser.controller.type_into_active(
-        text, delay_ms=delay_ms,
-    ))
+
+    async def _run():
+        await _guard_check(daemon, "type", args)
+        return await daemon.owner.browser.controller.type_into_active(
+            text, delay_ms=delay_ms,
+        )
+    return daemon.owner.run(_run())
 
 
 # ── History / graph operations ──────────────────────────────────────

@@ -102,6 +102,9 @@ def classify_exception(e: BaseException) -> dict[str, Any]:
     # Invalid URL hints
     if "Invalid URL" in msg or "invalid url" in msg.lower():
         return err(CODE_INVALID_URL, msg, retryable=False)
+    # Safety guard (CONFIRM_REQUIRED) — 危险动作需人类确认, 不可自动 retry
+    if type(e).__name__ == "SafetyGuardError":
+        return err(getattr(e, "code", "CONFIRM_REQUIRED"), msg, retryable=False)
     if isinstance(e, ValueError):
         # T58: SSRF error 是 ValueError 子类, 优先识别 (不在 else 走 MISSING_PARAM)
         cls_name = type(e).__name__

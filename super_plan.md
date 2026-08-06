@@ -3,6 +3,22 @@
 > 目标: 将项目从"个人项目质量"提升到"成熟开源项目标准"
 > 策略: 5 轮迭代，每轮聚焦一个维度，完成后审计再进入下一轮
 
+## 进度 (2026-08-06)
+
+- **Round 1**: ✅ 1a 已交付 (server.py dispatch 拆分); ✅ 1b 已交付
+  (controller.py 4489→152 + 6 mixin); 1c 表驱动 dispatch 已交付。
+  server.py 主体仍 ~3000 行 (生命周期/中间件), 进一步拆分收益递减, 暂缓。
+- **Round 2**: ✅ 2a circuit breaker 接入; ✅ 2b metering 接入;
+  ✅ 2c 安全守卫接入 daemon+MCP (CONFIRM_REQUIRED); ✅ 2d /v1/integrations。
+- **Round 3**: ✅ 3a app_config 集中全部 os.getenv。3b JSON 日志 / 3c
+  Prometheus 扩展 / 3d health 子检查 — 未启动 (现 /metrics 已有手写 registry,
+  /health 已有 context; 待后续)。
+- **Round 4**: MCP 工具 ~75。usage/lease/handoff/drain 等 MCP 包装未启动。
+- **Round 5**: ✅ Makefile + ruff (src/ 0 errors) + pytest markers + CI lint;
+  ✅ docs/ 站 15 篇 + README 83KB→21KB。
+- **额外审计修复**: `_safe_resolve_path` 潜伏 NameError、死代码清理、
+  文档漂移修复 (幻影 env 变量)。
+
 ---
 
 ## 审计发现总结

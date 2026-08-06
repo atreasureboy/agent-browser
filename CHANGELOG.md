@@ -1,3 +1,49 @@
+## 全面优化轮 (super_plan Round 1b / 2c / 2d / 3a / 5)
+
+**架构重构 (Round 1)**
+- `controller.py` 4489 行 → 152 行核心 + 6 个 mixin 模块
+  (navigation / interact / debug / headers / security_tools / _utils);
+  `BrowserController` 公开 API 不变, 模块级 helper 从 controller 再导出
+- `server.py` `_dispatch` 877 行拆为 `daemon/routers/` 表驱动分发
+  (此前已提交), 本轮补 `_integrations.py`
+
+**激活休眠模块 (Round 2)**
+- **安全守卫接入 daemon + MCP (2c)**: T32 `check_action` 之前只有
+  `sb_safety_check` 查询入口; 现在 /click、/click/healed、/type、
+  /type/healed、/drag、/drag/html5、/fill-form、/keyboard/type、
+  /with-retry(click|type) 与 MCP sb_click/sb_type 执行前全部过守卫.
+  click 目标经新 `BrowserController.get_ref_label()` 拿可读 label 再判.
+  拦截返 `CONFIRM_REQUIRED` (HTTP 409, retryable=false), 人类确认后
+  带 `confirm_destructive: true` 重发. 新增 `SafetyGuardError`,
+  `classify_exception` 统一映射
+- **集成适配器入口 (2d)**: 新增 `integration_catalog()` + daemon
+  `GET /v1/integrations`, LangChain/AutoGen/Aider 适配器从 0 入口变为
+  HTTP 可发现 (entry/installed/参数 schema). 修 langchain_adapter 重复 `__all__`
+
+**配置集中 (Round 3a)**
+- 新 `semantic_browser/app_config.py`: 全部 `os.getenv` 收拢
+  (llm_api_key/llm_base_url 按 provider 保留 fallback 链、tier model、
+  env_bool canonical 解析). 迁移 llm/providers、llm/service、
+  classifier/llm_enhanced、snapshot/vision、cli/main. env 变量名不变
+
+**审计修复**
+- 修复潜伏 NameError: `_safe_resolve_path` 用了未定义的 `_os_path`
+  (安全路径闸在任何显式路径参数下必炸) + 5 个回归测试
+- ruff 接入: src/ 973 → 0 errors (E/F/W, 4 条 style 例外有注释);
+  清死代码 (unused vars/imports、v1_routes、重复 `__all__`)
+- CI 加 ruff lint job; pytest marker 注册; Makefile (test/test-unit/lint/dist)
+
+**文档 (Round 5)**
+- README 83KB → 21KB: T40–T66 设计日志移入 `docs/design-log.md`;
+  修正文档漂移 (`SEMANTIC_QUERY_*` env 实际不存在 → 改为调用参数)
+- 新 `docs/` 站: index / installation / quickstart /
+  api(query, sessions, security, integrations) /
+  concepts(architecture, token-economy, security-model) /
+  guides(production) / reference(config, error-codes) 共 15 篇
+
+**测试**: 新增 tests/test_safety_guard.py (11, 真浏览器 e2e)、
+tests/test_app_config.py (24); 全套 1100+ passed.
+
 ## T118 — Profile-Coherent Stealth Fingerprint Layer
 
 **问题**: 之前 `USER_AGENTS` 混排 Firefox / Safari / Edge / Chrome, 但底层永远是 Chromium — 风控不是看 UA 是不是"真", 而是看 UA / `navigator.platform` / `navigator.languages` / sec-ch-ua-* / plugins / `window.chrome` 跨字段是否自洽. UA 说 Firefox 但 JS 引擎是 V8 + `window.chrome` 存在 = 三方矛盾, 反而**加分**给 anti-bot.

@@ -82,6 +82,7 @@ def build_route_table() -> dict[tuple[str, str], HandlerFn]:
     from semantic_browser.daemon.routers import _query      # noqa: F401
     from semantic_browser.daemon.routers import _agent      # noqa: F401
     from semantic_browser.daemon.routers import _discover   # noqa: F401
+    from semantic_browser.daemon.routers import _integrations  # noqa: F401
 
     table: dict[tuple[str, str], HandlerFn] = {}
     for method, path, handler in _ROUTES:

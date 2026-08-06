@@ -186,3 +186,64 @@ class TestProductionDeployValidation:
         pvc = next((d for d in docs if d.get("kind") == "PersistentVolumeClaim"), None)
         assert pvc is not None
         assert "1Gi" in str(pvc["spec"]["resources"]["requests"]["storage"])
+
+
+class TestIntegrationCatalog:
+    """Round 2d: adapter catalog + daemon /v1/integrations entry point."""
+
+    def test_catalog_shape(self):
+        from semantic_browser.integrations import integration_catalog
+        catalog = integration_catalog()
+        assert len(catalog) == 3
+        frameworks = {a["framework"] for a in catalog}
+        assert frameworks == {"langchain", "autogen", "aider"}
+        for a in catalog:
+            assert a["entry"].startswith("semantic_browser.integrations.")
+            assert isinstance(a["installed"], bool)
+            assert any(p["name"] == "query" and p["required"] for p in a["parameters"])
+
+    def test_daemon_endpoint(self):
+        """GET /v1/integrations 返 adapter 目录 + 计数."""
+        from tests.test_daemon import _http, _free_port, _reset_global_sb_db
+        import os
+        import subprocess
+        import sys
+        import time
+        from urllib.error import URLError
+
+        port = _free_port()
+        log_path = f"/tmp/tb-daemon-integ-{port}.log"
+        _reset_global_sb_db()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "semantic_browser.daemon.server", "--port", str(port)],
+            stdout=open(log_path, "wb"), stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+        base = f"http://127.0.0.1:{port}"
+        try:
+            for _ in range(60):
+                try:
+                    r = _http("GET", f"{base}/health")
+                    if r.get("ok") and r.get("data", {}).get("status") == "ok":
+                        break
+                except (URLError, ConnectionRefusedError, OSError):
+                    time.sleep(0.5)
+            else:
+                pytest.fail(f"daemon did not start; see {log_path}")
+            r = _http("GET", f"{base}/v1/integrations")
+            assert r["ok"] is True, r
+            data = r["data"]
+            assert data["count"] == 3
+            assert data["installed_count"] >= 1  # aider adapter has no extra deps
+            assert {a["framework"] for a in data["adapters"]} == {
+                "langchain", "autogen", "aider"}
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass

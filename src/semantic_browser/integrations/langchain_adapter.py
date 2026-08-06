@@ -166,6 +166,3 @@ else:
 
 
 __all__ = ["SemanticQueryTool"]
-
-
-__all__ = ["SemanticQueryTool"]

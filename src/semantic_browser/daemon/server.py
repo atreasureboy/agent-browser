@@ -779,6 +779,7 @@ class TransparentBrowserDaemon(_LeaseMixin):
         "/health", "/queue", "/stats", "/capacity", "/metrics", "/events",
         "/admin/drain", "/admin/drain/cancel", "/admin/degrade", "/admin/restore",
         "/v1/query/log", "/v1/query/cache/clear", "/v1/query/stats",
+        "/v1/integrations",
         # T91: /v1/query 类长操作也走 semaphore 限流, 不再持 op_lock —
         #      让多 agent 真并发 (op_lock 是粗粒度串行, 长 query 占着会让其他 op 都 503)
         "/v1/query", "/v1/query/stream",
@@ -1102,6 +1103,8 @@ class TransparentBrowserDaemon(_LeaseMixin):
                 path = "/v1/query/log"
             elif v1_path == "/query/cache/clear":
                 path = "/v1/query/cache/clear"
+            elif v1_path == "/integrations":
+                path = "/v1/integrations"
             elif v1_path.startswith("/sessions/"):
                 # 保留 lease 路径模式
                 path = v1_path

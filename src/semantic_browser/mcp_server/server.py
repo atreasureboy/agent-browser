@@ -237,6 +237,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     # T49: 增强 /health
     {"name": "sb_health", "description": "T49: 健康检查 + pid/host/port/uptime/page_url — agent 排查省一次 roundtrip.",
      "inputSchema": _schema({})},
+    # Interact tools — fill_form, drag, rightclick (daemon 有, MCP 缺)
+    {"name": "sb_fill_form", "description": "批量填表单字段 (ref→text dict). 含安全守卫 (同 sb_type).",
+     "inputSchema": _schema({"fields": {"type": "object"}, "confirm_destructive": {"type": "boolean"}}, ["fields"])},
+    {"name": "sb_drag", "description": "拖拽 from_ref→to_ref. target 含 trash/recycle/bin 会返 CONFIRM_REQUIRED.",
+     "inputSchema": _schema({"from_ref": {"type": "string"}, "to_ref": {"type": "string"}, "confirm_destructive": {"type": "boolean"}}, ["from_ref", "to_ref"])},
+    {"name": "sb_rightclick", "description": "右键点击 ref 元素.",
+     "inputSchema": _schema({"ref": {"type": "string"}}, ["ref"])},
+    # LLM service stats
+    {"name": "sb_llm_stats", "description": "LLM 服务统计 (call_counts per tier / models).",
+     "inputSchema": _schema({})},
+    # Memory management
+    {"name": "sb_memory_list", "description": "目标记忆列表 (最近 N 条).",
+     "inputSchema": _schema({"limit": {"type": "integer", "description": "默认 20"}})},
+    {"name": "sb_memory_clear", "description": "清空目标记忆.",
+     "inputSchema": _schema({})},
 ]
 
 
@@ -757,6 +772,30 @@ class MCPServer:
         if name == "sb_get_page_errors":
             engine = await self._ensure_started()
             return engine.controller.get_page_errors(limit=int(args.get("limit", 50)))
+        # Interaction tools (fill_form, drag, rightclick)
+        if name == "sb_fill_form":
+            engine = await self._ensure_started()
+            fields = args["fields"]
+            result = await engine.controller.fill_form(fields)
+            return {"results": result, "ok_count": sum(1 for v in result.values() if v), "total": len(result)}
+        if name == "sb_drag":
+            engine = await self._ensure_started()
+            ok = await engine.controller.drag(args["from_ref"], args["to_ref"])
+            return {"success": ok, "from_ref": args["from_ref"], "to_ref": args["to_ref"]}
+        if name == "sb_rightclick":
+            engine = await self._ensure_started()
+            ok = await engine.controller.rightclick(args["ref"])
+            return {"ref": args["ref"], "success": ok}
+        if name == "sb_llm_stats":
+            from semantic_browser.llm import get_default_service
+            return get_default_service().stats()
+        if name == "sb_memory_list":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            return {"entries": GoalMemory().list_recent(int(args.get("limit", 20)))}
+        if name == "sb_memory_clear":
+            from semantic_browser.memory.goal_memory import GoalMemory
+            GoalMemory().clear()
+            return {"cleared": True}
         # T57: daemon 级工具 — 走 HTTP 代理 (没配 daemon_url 时上面 _daemon_* 会 raise)
         if name == "sb_sessions_list":
             return self._daemon_get("/sessions")

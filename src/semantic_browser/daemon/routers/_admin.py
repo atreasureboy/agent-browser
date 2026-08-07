@@ -35,13 +35,46 @@ def handle_health(daemon: Any, args: dict[str, Any], req: Any) -> Any:
 
 
 def handle_healthz(daemon: Any, args: dict[str, Any], req: Any) -> Any:
-    """GET /healthz — liveness probe."""
+    """GET /healthz — liveness probe with component sub-checks (Round 3d)."""
     import os
-    return {
+    result = {
         "alive": True,
         "pid": os.getpid(),
         "uptime_seconds": round(_time.time() - daemon.started_at, 1),
+        "checks": {},
     }
+    # Browser check
+    try:
+        ctrl = daemon.owner.browser.controller
+        browser_obj = ctrl._browser
+        result["checks"]["browser"] = {
+            "status": "ok" if browser_obj is not None and browser_obj.is_connected() else "down",
+        }
+    except Exception:
+        result["checks"]["browser"] = {"status": "error"}
+    # Circuit breaker check
+    try:
+        from semantic_browser.daemon.circuit_breaker import CircuitBreakerRegistry
+        cb = getattr(daemon, "circuit_breaker", None)
+        if cb is not None:
+            open_circuits = [c.name for c in cb._breakers.values() if hasattr(c, 'state') and getattr(c, 'state', 'CLOSED') == 'OPEN']
+            result["checks"]["circuit_breaker"] = {
+                "status": "degraded" if open_circuits else "ok",
+                "open_circuits": len(open_circuits),
+            }
+    except Exception:
+        result["checks"]["circuit_breaker"] = {"status": "unknown"}
+    # LLM check
+    try:
+        from semantic_browser.llm import get_default_service
+        svc = get_default_service()
+        result["checks"]["llm"] = {
+            "status": "ok" if svc.is_available() else "unavailable",
+            "provider": svc.provider_name,
+        }
+    except Exception:
+        result["checks"]["llm"] = {"status": "unknown"}
+    return result
 
 
 def handle_readyz(daemon: Any, args: dict[str, Any], req: Any) -> Any:

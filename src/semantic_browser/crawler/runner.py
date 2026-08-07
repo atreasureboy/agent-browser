@@ -142,7 +142,7 @@ class Crawler:
         try:
             rows = self.browser.store.get_unvisited_links(domain, limit=200)
         except Exception as e:  # pragma: no cover - 防御性
-            logger.warning("读取未访问链接失败: %s", e)
+            logger.warning("load unvisited links failed: %s", e)
             return items
 
         for row in rows:
@@ -156,9 +156,9 @@ class Crawler:
                 continue
             seen.add(norm)
             items.append(_QueueItem(url=norm, depth=1))
-            logger.debug("续跑载入未访问链接: %s", norm)
+            logger.debug("resume: loaded unvisited link: %s", norm)
         if items:
-            logger.info("从记忆库续跑载入 %d 个未访问链接", len(items))
+            logger.info("resumed %d unvisited links from memory store", len(items))
         return items
 
     # ── 主入口 ───────────────────────────────────────────────
@@ -223,7 +223,7 @@ class Crawler:
 
                 # 深度限制
                 if item.depth > max_depth:
-                    logger.debug("跳过（深度超限 %d>%d）: %s", item.depth, max_depth, item.url)
+                    logger.debug("skip: depth %d>%d: %s", item.depth, max_depth, item.url)
                     result.skipped_urls.append(item.url)
                     continue
 
@@ -231,13 +231,13 @@ class Crawler:
 
                 # 域名过滤
                 if same_domain_only and not self._is_internal(url, seed_domain):
-                    logger.debug("跳过（非同域名）: %s", url)
+                    logger.debug("skip: cross-origin: %s", url)
                     result.skipped_urls.append(url)
                     continue
 
                 # 去重：内存或数据库已访问
                 if url in visited or url in db_visited:
-                    logger.debug("跳过（已访问）: %s", url)
+                    logger.debug("skip: already visited: %s", url)
                     continue
 
                 # 实际访问
@@ -272,7 +272,7 @@ class Crawler:
                     new_enqueued += 1
 
                 if new_enqueued:
-                    logger.debug("从 %s 入队 %d 个新链接", url, new_enqueued)
+                    logger.debug("enqueued %d new links from %s", url, new_enqueued)
 
                 # 标记这些链接已“被发现并访问来源”
                 # （MemoryStore 中的 visited 字段由 browse() 流程间接维护，
@@ -320,9 +320,9 @@ class Crawler:
                 if url:
                     visited.add(self._normalize(url))
         except Exception as e:  # pragma: no cover
-            logger.warning("读取已访问页面失败: %s", e)
+            logger.warning("load visited pages failed: %s", e)
         if visited:
-            logger.info("记忆库中 %s 域名已访问 %d 页", domain, len(visited))
+            logger.info("domain %s has %d visited pages", domain, len(visited))
         return visited
 
     async def _safe_browse(self, url: str) -> Optional[BrowseResult]:
@@ -330,7 +330,7 @@ class Crawler:
         try:
             return await self.browser.browse(url)
         except Exception as e:
-            logger.warning("访问失败 %s: %s", url, e)
+            logger.warning("visit failed %s: %s", url, e)
             return None
 
 

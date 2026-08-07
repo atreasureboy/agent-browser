@@ -104,6 +104,14 @@ _TOOL_ARGS: dict[str, dict] = {
     "sb_check_subdomain_takeover": {},
     # T47
     "sb_a11y_audit": {},
+    # Interaction (Round 4)
+    "sb_fill_form": {"fields": {"e1": "hello"}},
+    "sb_drag": {"from_ref": "e1", "to_ref": "e2"},
+    "sb_rightclick": {"ref": "e1"},
+    # LLM / Memory (Round 4)
+    "sb_llm_stats": {},
+    "sb_memory_list": {},
+    "sb_memory_clear": {},
     # T18 调试
     "sb_get_console": {},
     "sb_get_network": {},
@@ -166,6 +174,8 @@ def _build_fake_engine() -> MagicMock:
         "a11y_audit",
         # T18
         "get_console_messages", "get_network_requests", "get_page_errors",
+        # Round 4 interaction
+        "fill_form", "drag", "rightclick",
     ):
         mock = AsyncMock(return_value={}) if attr not in (
             "current_page", "get_websockets",
@@ -237,13 +247,14 @@ _ENGINE_TOOLS = [
         "sb_memory_lookup", "sb_memory_stats",
         "sb_sessions_list", "sb_sessions_create", "sb_sessions_delete",
         "sb_capacity", "sb_admin_degrade", "sb_admin_restore",
-        "sb_queue", "sb_health",
+        "sb_queue", "sb_health", "sb_llm_stats",
     )
 ]
 
 # 走 _ensure_engine() 但不碰 controller
 _ENGINE_ONLY_TOOLS = [
     "sb_graph", "sb_history", "sb_stats",
+    "sb_llm_stats",
 ]
 
 # 走 _daemon_* 路径
@@ -254,7 +265,7 @@ _DAEMON_TOOLS = [
 ]
 
 # 走 GoalMemory (无 controller, 无 engine)
-_MEMORY_TOOLS = ["sb_memory_lookup", "sb_memory_stats"]
+_MEMORY_TOOLS = ["sb_memory_lookup", "sb_memory_stats", "sb_memory_list", "sb_memory_clear"]
 
 
 # ── helpers ───────────────────────────────────────────────

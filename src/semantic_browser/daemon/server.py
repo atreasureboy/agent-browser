@@ -2940,8 +2940,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--drain-timeout", type=float, default=30.0,
                         help="T62: SIGTERM 后等在飞 op 完成的最长秒数 (fable §5.8)")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--json-log", action="store_true", help="emit structured JSON logs (production)")
+    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from semantic_browser.logging_config import setup_logging
+    setup_logging(
+        level="DEBUG" if args.verbose else args.log_level,
+        json_mode=args.json_log,
+        verbose=args.verbose,
+    )
 
     # T49: 启动前检查 PID 文件 + 端口占用 — 比 OSError 早一步给清晰错误
     pid_file = _pid_path(args.port)
